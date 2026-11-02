@@ -1,7 +1,10 @@
+import functools
 import hashlib
 import hmac
+import importlib.util
 import json as _json
 import os
+import socket
 import sqlite3
 import sys
 import time
@@ -12,20 +15,186 @@ import pytest_asyncio
 import yaml
 from httpx import ASGITransport, AsyncClient
 
-from tinyagentos.app import create_app
+from tinyagentos.app import create_app, PROJECT_DIR
 from tinyagentos.routes.desktop import SPA_DIR
+
+# Data-dir mutation guard: defined in tests/_data_guard_plugin.py (shared with
+# tests/test_xdist_data_mutation_guard.py) and re-bound here so pytest registers it.
+from _data_guard_plugin import (  # noqa: F401
+    _collect_data_mtimes,
+    _guard_data_dir_mutation,
+    pytest_sessionfinish,
+    pytest_testnodedown,
+)
 
 
 # ---------------------------------------------------------------------------
-# Test-mode CSRF bypass — the verify_csrf dependency is enforced globally
-# on all routers via register_all_routers().  Existing tests were written
-# before CSRF was enforced and do not include CSRF tokens.  Rather than
-# updating every test fixture, we monkey-patch verify_csrf to a no-op
-# during test runs.  The dedicated CSRF tests (test_csrf.py) import the
-# real function directly and test it in isolation.
+# opencode spawn guard — FORBID real `opencode serve` spawns from the test suite.
+#
+# An autouse fixture that makes a real opencode spawn impossible during tests:
+#   1. Monkeypatches `tinyagentos.opencode_runtime.resolve_opencode_binary` to
+#      return a non-existent path. In ensure_running, when config.binary is the
+#      default "opencode", the code does:
+#          binary = resolve_opencode_binary() or binary
+#      With a fake path (truthy), this uses the fake path and the spawn fails
+#      with FileNotFoundError, which ensure_running maps to
+#      OpenCodeBinaryNotFoundError.
+#   2. Sets `TAOS_OPENCODE_BIN` to the same non-existent path for consistency.
+#
+# Tests that deliberately exercise the spawn path with a fake binary (by passing
+# `binary=` to OpenCodeServerConfig) keep working because the code only calls
+# resolve_opencode_binary() when config.binary == "opencode". Explicit binary=
+# configs bypass the patched function entirely.
+#
+# Tests that test `resolve_opencode_binary` directly are excluded via the
+# `no_opencode_spawn_guard` marker so they can test the real resolution logic.
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(autouse=True)
+def _forbid_real_opencode_spawn(request):
+    """Make real opencode spawns impossible in all tests."""
+    # Skip for tests marked with no_opencode_spawn_guard (e.g. TestResolveOpencodeBinary).
+    if request.node.get_closest_marker("no_opencode_spawn_guard"):
+        yield
+        return
+
+    import tinyagentos.opencode_runtime as ocr
+
+    # Use a path that definitely does not exist. When resolve_opencode_binary()
+    # returns this, ensure_running's `binary = resolve_opencode_binary() or binary`
+    # uses it (since a non-empty string is truthy), and the spawn fails with
+    # FileNotFoundError, which ensure_running maps to OpenCodeBinaryNotFoundError.
+    fake_path = "/this/path/does/not/exist/opencode"
+
+    # 1. Force resolve_opencode_binary() to return the fake path.
+    # 2. Set TAOS_OPENCODE_BIN to the same fake path for consistency.
+    #    This env var is checked first by the real resolve_opencode_binary, but
+    #    since we patch the function directly, this is defensive.
+    with patch.object(ocr, "resolve_opencode_binary", lambda: fake_path), patch.dict(os.environ, {"TAOS_OPENCODE_BIN": fake_path}):
+        yield
+
+
+# ---------------------------------------------------------------------------
+# CSRF in tests — ON by default, opted OUT explicitly.
+#
+# This used to be inverted: an autouse fixture no-op'd `verify_csrf` for every
+# test file whose path did not contain the substring "test_csrf".  Measured on
+# dev at the time of the change: 788 test files, exactly ONE inside that
+# carve-out, so 787 ran against an app whose CSRF dependency did nothing, and
+# 223 of those issue POSTs.
+#
+# That is an over-privileged fixture: it grants the test more privilege than
+# the real caller has, so the test cannot observe the check the real caller
+# must satisfy.  It is what hid #2081 (the CSRF login lockout).  A first repro
+# written as an ordinary test returned 303 and PASSED, and the tell was that
+# the CONTROL passed identically — the shape you get when the input never
+# reaches the system under test.
+#
+# Two properties of the replacement matter:
+#
+#   * The default is the REAL implementation.  A test written tomorrow gets
+#     production behaviour without anyone remembering to ask for it, and a new
+#     CSRF regression is red by default rather than invisible by default.
+#   * Opting out is an explicit MARKER, not a filename.  The old carve-out was
+#     a substring match on the path, so renaming a file silently re-armed the
+#     bypass with no failure anywhere.  A marker cannot be triggered by
+#     accident, it is greppable, and `tests/test_csrf_bypass_debt.py` holds the
+#     list of modules that still use it so the debt cannot grow unnoticed.
+#
+# To opt a whole module out, put this at module scope:
+#
+#     pytestmark = pytest.mark.csrf_bypass
+#
+# Do NOT add it to silence a new red.  A red here is a route that the real
+# caller could not reach the way the test reaches it.
 # ---------------------------------------------------------------------------
 
 from starlette.requests import HTTPConnection as _HTTPConnection
+
+CSRF_BYPASS_MARKER = "csrf_bypass"
+
+# ---------------------------------------------------------------------------
+# skip_if_no_embed_backend — an opt-in skip for a test that CANNOT run without
+# an embedding backend.
+#
+#     @pytest.mark.skip_if_no_embed_backend
+#     def test_something(self): ...
+#
+#     pytestmark = pytest.mark.skip_if_no_embed_backend   # whole module
+#
+# There is no opt-out marker and no `-o` switch: not applying the marker IS the
+# opt-out, and that is the default for every test in the tree.
+#
+# The list of tests carrying it is meant to stay EMPTY, and
+# `tests/test_embed_backend_marker_debt.py` asserts that.  A skip marker is a
+# way to turn a red green without fixing it, so before adding one, check what
+# the test actually calls: a test driving an `AsyncMock(spec=httpx.AsyncClient)`,
+# a hand-built `_snapshot`, or a patched `_run_setup` never reaches a backend
+# and does not need the marker — marking it only deletes it from every CI row.
+# ---------------------------------------------------------------------------
+
+EMBED_BACKEND_MARKER = "skip_if_no_embed_backend"
+_EMBED_BACKEND_SKIP_REASON = "no embed backend: qmd unreachable and onnxruntime not installed"
+
+
+def _qmd_reachable(timeout: float = 0.25) -> bool:
+    """True when something is listening at the qmd URL the product would use.
+
+    A reachability probe, not an environment-variable read.  The previous
+    version of this check asked whether `TAOSMD_URL` was set to a non-default
+    value — a variable no module under `tinyagentos/` reads — so it answered
+    "no backend" on a box running qmd on the configured default, and "backend"
+    for a URL pointing at a host that does not exist.  Both answers are the
+    opposite of the capability the marker is asking about.
+    """
+    from urllib.parse import urlparse
+
+    from tinyagentos.config import DEFAULT_CONFIG
+
+    # The packaged default, not a loaded `config.yaml`: a test box's verdict
+    # must not depend on whichever config file happens to sit in this user's
+    # home directory, or the same commit skips different tests per machine.
+    parsed = urlparse(DEFAULT_CONFIG["qmd"]["url"])
+    host, port = parsed.hostname, parsed.port
+    if not host or not port:
+        return False
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+@functools.lru_cache(maxsize=1)
+def _is_embed_backend_available() -> bool:
+    """True when this box can produce an embedding.
+
+    Either backend suffices: a reachable qmd service, or the ONNX runtime.
+    The package to probe is `onnxruntime` (what executes a model), NOT `onnx`
+    (the model-format library) — taOS depends on the former and not the
+    latter, so probing `onnx` reports "no backend" on every developer box and
+    every CI row.
+
+    Cached for the whole process (``maxsize=1``): the body runs once per
+    interpreter, not once per collected item, so a qmd that starts after
+    collection is not seen until the next pytest run. That is deliberate: the
+    verdict for one run must be one verdict, or half a session skips and the
+    other half runs.
+
+    The reachability probe is a TCP connect to qmd's configured host:port. Any
+    listener on that port satisfies it; a foreign service squatting the default
+    port makes the marked tests run and fail loudly on the protocol mismatch
+    rather than skip. That direction (a false run) is the one we can see in CI;
+    a false skip is the one this gate exists to end.
+    """
+    return _qmd_reachable() or importlib.util.find_spec("onnxruntime") is not None
+
+
+def pytest_collection_modifyitems(items):
+    """Skip items marked skip_if_no_embed_backend when no backend can serve them."""
+    for item in items:
+        if item.get_closest_marker(EMBED_BACKEND_MARKER) and not _is_embed_backend_available():
+            item.add_marker(pytest.mark.skip(reason=_EMBED_BACKEND_SKIP_REASON))
 
 
 def _noop_verify_csrf(conn: _HTTPConnection) -> None:
@@ -36,14 +205,33 @@ def _noop_verify_csrf(conn: _HTTPConnection) -> None:
     return
 
 
+# The header-echoing hook lives in its own module so that the ~11 test modules
+# building their own AsyncClient can import it without a bare
+# `from conftest import ...` -- `tests/` is not a package and several
+# conftest.py files exist, so that import binds whichever one is on sys.path
+# first (card `tsk-xplzqy`).  Re-exported here under the old private names so
+# the shared `client` fixture below reads unchanged.
+from taos_test_csrf import (  # noqa: E402
+    TEST_CSRF_TOKEN as _TEST_CSRF_TOKEN,
+    csrf_event_hooks,
+    echo_csrf_cookie_into_header as _echo_csrf_cookie_into_header,
+)
+
+
 @pytest.fixture(autouse=True)
 def _bypass_csrf_in_tests(request):
-    """Replace verify_csrf with a no-op in the module under test.
+    """Run against the REAL verify_csrf unless the test opts out.
 
-    Skips patching when the test file is test_csrf.py so those tests
-    exercise the real implementation.
+    Opt out with ``@pytest.mark.csrf_bypass`` on the test, its class, or the
+    module (``pytestmark``).  ``get_closest_marker`` sees all three.
+
+    The patch must be in place BEFORE the app is built: `register_all_routers`
+    does ``from ... import verify_csrf`` and freezes the resulting object into
+    ``Depends(...)`` at ``include_router`` time, so patching the module
+    attribute after ``create_app`` changes nothing.  Wrapping the whole test —
+    as this fixture does — is what makes it take effect.
     """
-    if "test_csrf" in str(request.node.fspath):
+    if request.node.get_closest_marker(CSRF_BYPASS_MARKER) is None:
         yield
         return
 
@@ -222,6 +410,131 @@ def _patch_aiosqlite_daemon_threads():
     _core.Connection.__init__ = _patched_init
 
 
+# ---------------------------------------------------------------------------
+# Core-dependency integrity guard.
+#
+# A stale or incomplete package install -- an empty directory left on sys.path
+# that Python treats as a PEP 420 namespace package, or a partially-written
+# artifact -- makes a module importable but missing its public API.  anyio
+# calls sniffio.current_async_library on every async test; a partial sniffio
+# raises AttributeError instead of ModuleNotFoundError, so the failure
+# surfaces as 500+ identical tracebacks attributed to whichever PR happened
+# to run (see tsk-2nvear).
+#
+# This guard catches the shape at session start with a single loud error and
+# prints name==version, __file__ / __path__ / __spec__ /
+# submodule_search_locations / the resolved package set so the cause is
+# observable, not asserted. Both candidate causes (stale install vs. version
+# bump) are named; the version discriminates.
+#
+# Each entry maps a module name to the attributes that MUST be present on it
+# whenever the module is importable.  A module that is genuinely absent
+# (ModuleNotFoundError) is fine -- code paths that need it already guard the
+# import.  Only the importable-but-attribute-less shape is a defect.
+# ---------------------------------------------------------------------------
+
+_CORE_DEP_CONTRACTS: dict[str, tuple[str, ...]] = {
+    "sniffio": ("current_async_library", "AsyncLibraryNotFoundError"),
+    "anyio": ("run", "create_task_group", "from_thread"),
+    "httpx": ("AsyncClient", "Client", "Response"),
+    "httpcore": ("ConnectionPool", "AsyncConnectionPool", "Response"),
+    "idna": ("encode", "decode"),
+    "certifi": ("where",),
+    "pydantic": ("BaseModel", "TypeAdapter"),
+    "sqlcipher3": ("dbapi2", "connect"),
+    "fastapi": ("FastAPI", "APIRouter"),
+}
+
+
+def _check_core_deps(
+    contracts: dict[str, tuple[str, ...]] | None = None,
+) -> list[tuple[str, tuple[str, ...], object]]:
+    """Return a list of importable-but-attribute-less core dependencies.
+
+    Each problem is a ``(module_name, missing_attrs, module)`` tuple. An empty
+    list means every module is either absent (fine) or fully present (fine).
+    """
+    if contracts is None:
+        contracts = _CORE_DEP_CONTRACTS
+    import importlib
+
+    problems: list[tuple[str, tuple[str, ...], object]] = []
+    for mod_name, required_attrs in contracts.items():
+        try:
+            mod = importlib.import_module(mod_name)
+        except ModuleNotFoundError:
+            continue
+        missing = tuple(a for a in required_attrs if not hasattr(mod, a))
+        if missing:
+            problems.append((mod_name, missing, mod))
+    return problems
+
+
+def _module_version(mod_name: str) -> str:
+    """Return the installed distribution version for *mod_name*, or
+    ``"unknown"`` if no matching distribution is found."""
+    import importlib.metadata
+    try:
+        return importlib.metadata.version(mod_name)
+    except importlib.metadata.PackageNotFoundError:
+        return "unknown"
+
+
+def _verify_core_deps() -> None:
+    """Fail loudly at session start if a core dependency is
+    importable-but-attribute-less.
+
+    Prints ``name==version``, ``__file__``, ``__path__``, ``__spec__``,
+    and ``submodule_search_locations`` for each reported module so the
+    cause is observable, not asserted.
+    """
+    import importlib.metadata
+
+    problems = _check_core_deps()
+    if not problems:
+        return
+
+    lines = [
+        "CORE DEP GUARD: importable-but-attribute-less dependencies detected.",
+        "Observation: an importable module lacks an attribute its contract",
+        "requires. Candidate causes: a stale or partial install (empty",
+        "namespace package on sys.path) or a version bump that moved or",
+        "removed the API. The version and import path discriminate between",
+        "them; both are reported below so neither cause is assumed.",
+        "",
+        "Diagnosis:",
+    ]
+    for mod_name, missing_attrs, mod in problems:
+        version = _module_version(mod_name)
+        spec = getattr(mod, "__spec__", None)
+        search_locs = (
+            getattr(spec, "submodule_search_locations", None) if spec else None
+        )
+        lines.append(f"  module: {mod_name}=={version}")
+        lines.append(f"    missing attributes: {', '.join(missing_attrs)}")
+        lines.append(f"    __file__ = {getattr(mod, '__file__', None)!r}")
+        lines.append(f"    __path__ = {getattr(mod, '__path__', None)!r}")
+        lines.append(f"    __spec__ = {spec!r}")
+        lines.append(f"    submodule_search_locations = {search_locs!r}")
+    dists = sorted(
+        (f"{(d.metadata['Name'] or 'unknown')}=={d.version}"
+         for d in importlib.metadata.distributions()),
+        key=lambda s: s.lower(),
+    )
+    lines.append("")
+    lines.append("Installed packages:")
+    for dist in dists:
+        lines.append(f"  {dist}")
+    raise RuntimeError("\n".join(lines))
+
+
+# THE canonical `pytest_configure` for tests/.  Do not add a second one: two
+# module-level `def pytest_configure` in one file is last-wins rebinding, not
+# additive registration, so the earlier body never runs and its next edit is a
+# silent no-op in CI.  Markers are declared in `pyproject.toml` under
+# `[tool.pytest.ini_options] markers`, not here.
+# `tests/test_embed_backend_marker_debt.py` asserts this file defines the hook
+# exactly once.
 def pytest_configure(config):
     """Stub the SPA bundle so the test suite doesn't depend on a real
     `npm run build`. Two tests need actual files on disk to exercise
@@ -247,6 +560,12 @@ def pytest_configure(config):
     # CI, not just on 3.14.  The SIGSEGV on 3.14 macOS has the same root
     # cause.  daemon=True is safe for all supported versions.
     _patch_aiosqlite_daemon_threads()
+
+    # Fail loudly if a core transitive dependency is importable but
+    # attribute-less (stale namespace package, incomplete install).
+    # Catches the sniffio/anyio breakage shape before it turns into 500+
+    # opaque AttributeErrors scattered across unrelated tests.
+    _verify_core_deps()
 
 
 @pytest.fixture
@@ -356,6 +675,10 @@ async def client(app, tmp_data_dir):
     if receipt_store._db is not None:
         await receipt_store.close()
     await receipt_store.init()
+    task_strikes = app.state.task_strikes
+    if task_strikes._db is not None:
+        await task_strikes.close()
+    await task_strikes.init()
     project_task_store = app.state.project_task_store
     if project_task_store._db is not None:
         await project_task_store.close()
@@ -368,6 +691,14 @@ async def client(app, tmp_data_dir):
     if project_notes_store._db is not None:
         await project_notes_store.close()
     await project_notes_store.init()
+    project_lists_store = app.state.project_lists_store
+    if project_lists_store._db is not None:
+        await project_lists_store.close()
+    await project_lists_store.init()
+    project_list_entries_store = app.state.project_list_entries_store
+    if project_list_entries_store._db is not None:
+        await project_list_entries_store.close()
+    await project_list_entries_store.init()
     routine_store = app.state.routine_store
     if routine_store._db is not None:
         await routine_store.close()
@@ -384,6 +715,10 @@ async def client(app, tmp_data_dir):
     if coding_session_store._db is not None:
         await coding_session_store.close()
     await coding_session_store.init()
+    container_request_store = app.state.container_request_store
+    if container_request_store._db is not None:
+        await container_request_store.close()
+    await container_request_store.init()
     app.state.projects_root.mkdir(parents=True, exist_ok=True)
     canvas_store = app.state.canvas_store
     if canvas_store._db is not None:
@@ -405,6 +740,10 @@ async def client(app, tmp_data_dir):
     if song_store._db is not None:
         await song_store.close()
     await song_store.init()
+    lora_store = app.state.lora_store
+    if lora_store._db is not None:
+        await lora_store.close()
+    await lora_store.init()
     design_docs = app.state.design_docs
     if design_docs._db is not None:
         await design_docs.close()
@@ -427,6 +766,10 @@ async def client(app, tmp_data_dir):
     if device_store._db is not None:
         await device_store.close()
     await device_store.init()
+    device_pair_requests = app.state.device_pair_requests
+    if device_pair_requests._db is not None:
+        await device_pair_requests.close()
+    await device_pair_requests.init()
     council_roles = app.state.council_roles
     if council_roles._db is not None:
         await council_roles.close()
@@ -442,6 +785,23 @@ async def client(app, tmp_data_dir):
         if user_shares._db is not None:
             await user_shares.close()
         await user_shares.init()
+    else:
+        from tinyagentos.user_shares_store import UserSharesStore
+        user_shares = UserSharesStore(tmp_data_dir / "user_shares.db")
+        await user_shares.init()
+        app.state.user_shares = user_shares
+    # sharing_grants store (account-to-account app sharing) is lifespan-owned;
+    # tests that bypass the lifespan must init it so routes can consult it.
+    sharing_grants = getattr(app.state, "sharing_grants", None)
+    if sharing_grants is not None:
+        if sharing_grants._db is not None:
+            await sharing_grants.close()
+        await sharing_grants.init()
+    else:
+        from tinyagentos.sharing_grants import SharingGrantStore
+        sharing_grants = SharingGrantStore(tmp_data_dir / "sharing_grants.db")
+        await sharing_grants.init()
+        app.state.sharing_grants = sharing_grants
     # BrowserApp v2 stores
     from tinyagentos.routes.desktop_browser.store import BrowserStore, BrowserCookieStore
     _browser_store = BrowserStore(tmp_data_dir / "browser.sqlite3")
@@ -473,6 +833,12 @@ async def client(app, tmp_data_dir):
         transport=transport,
         base_url="http://test",
         cookies={"taos_session": _token},
+        # Supplies the CSRF half of a signed-in browser's state on mutating
+        # requests -- see _echo_csrf_cookie_into_header. Without it this client
+        # is authenticated but holds no CSRF cookie, a state no real browser is
+        # ever in, and every mutating request 403s for a reason that has
+        # nothing to do with the route under test.
+        event_hooks=csrf_event_hooks(),
     ) as c:
         yield c
     await canvas_store.close()
@@ -499,12 +865,15 @@ async def client(app, tmp_data_dir):
     await office_docs.close()
     await web_sites.close()
     await song_store.close()
+    await lora_store.close()
     await design_docs.close()
     await coding_session_store.close()
     await feedback_store.close()
     await client_log_store.close()
     await project_element_store.close()
     await project_notes_store.close()
+    await project_lists_store.close()
+    await project_list_entries_store.close()
     await app.state.qmd_client.close()
     await app.state.http_client.aclose()
     await _browser_store.close()
@@ -513,6 +882,9 @@ async def client(app, tmp_data_dir):
     await app.state.council_members.close()
     if user_shares is not None:
         await user_shares.close()
+    sharing_grants = getattr(app.state, "sharing_grants", None)
+    if sharing_grants is not None:
+        await sharing_grants.close()
 
 
 def create_test_qmd_db(db_path):
@@ -667,6 +1039,9 @@ async def client_with_qmd(app_with_qmd):
         transport=transport,
         base_url="http://test",
         cookies={"taos_session": _token},
+        # Same reason as the `client` fixture above: this is a signed-in
+        # browser, so every mutating request needs the double-submit header.
+        event_hooks=csrf_event_hooks(),
     ) as c:
         yield c
     await canvas_store.close()

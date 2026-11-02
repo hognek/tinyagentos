@@ -7,7 +7,7 @@ import time
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from httpx import AsyncClient
+from httpx import ASGITransport, AsyncClient
 
 
 # ---------------------------------------------------------------------------
@@ -165,9 +165,112 @@ async def test_unregister_worker(client, app):
 
 
 @pytest.mark.asyncio
-async def test_unregister_unknown_worker(client):
+async def test_unregister_worker_clears_agent_pin(client, app):
+    import json as _json
+    key = await pair_worker(client, app, "pin-worker", "http://10.0.0.7:9000")
+    reg_body = _json.dumps({"name": "pin-worker", "url": "http://10.0.0.7:9000"}).encode()
+    await client.post(
+        "/api/cluster/workers",
+        content=reg_body,
+        headers={**sign_worker_request(key, "pin-worker", "POST", "/api/cluster/workers", reg_body), "content-type": "application/json"},
+    )
+    # Seed an agent pinned to this worker
+    app.state.config.agents.append({
+        "name": "pinned-agent",
+        "host": "10.0.0.5",
+        "qmd_index": "test",
+        "remote": "pin-worker",
+        "placement_source": "user",
+        "status": "running",
+    })
+    resp = await client.delete("/api/cluster/workers/pin-worker")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["status"] == "removed"
+    assert data["unpinned_agents"] == ["pinned-agent"]
+    agent = next(a for a in app.state.config.agents if a["name"] == "pinned-agent")
+    assert "remote" not in agent
+    assert "placement_source" not in agent
+    assert agent["host"] == ""
+    assert agent["status"] == "failed"
+    assert "pin-worker" in agent["placement_error"]
+    await app.state.cluster_pairing.close()
+
+
+@pytest.mark.asyncio
+async def test_unregister_other_worker_keeps_pin(client, app):
+    import json as _json
+    key_a = await pair_worker(client, app, "keep-a", "http://10.0.0.7:9000")
+    reg_a = _json.dumps({"name": "keep-a", "url": "http://10.0.0.7:9000"}).encode()
+    await client.post(
+        "/api/cluster/workers",
+        content=reg_a,
+        headers={**sign_worker_request(key_a, "keep-a", "POST", "/api/cluster/workers", reg_a), "content-type": "application/json"},
+    )
+    key_b = await pair_worker(client, app, "keep-b", "http://10.0.0.8:9000", code="other-code-a")
+    reg_b = _json.dumps({"name": "keep-b", "url": "http://10.0.0.8:9000"}).encode()
+    await client.post(
+        "/api/cluster/workers",
+        content=reg_b,
+        headers={**sign_worker_request(key_b, "keep-b", "POST", "/api/cluster/workers", reg_b), "content-type": "application/json"},
+    )
+    # Seed an agent pinned to keep-a
+    app.state.config.agents.append({
+        "name": "pinned-agent",
+        "host": "10.0.0.5",
+        "qmd_index": "test",
+        "remote": "keep-a",
+        "placement_source": "user",
+        "status": "running",
+    })
+    resp = await client.delete("/api/cluster/workers/keep-b")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["unpinned_agents"] == []
+    agent = next(a for a in app.state.config.agents if a["name"] == "pinned-agent")
+    assert agent["remote"] == "keep-a"
+    assert agent["placement_source"] == "user"
+    assert agent["host"] == "10.0.0.5"
+    await app.state.cluster_pairing.close()
+
+
+@pytest.mark.asyncio
+async def test_offline_worker_keeps_pin(client, app):
+    import json as _json
+    key = await pair_worker(client, app, "down-worker", "http://10.0.0.9:9000")
+    reg_body = _json.dumps({"name": "down-worker", "url": "http://10.0.0.9:9000"}).encode()
+    await client.post(
+        "/api/cluster/workers",
+        content=reg_body,
+        headers={**sign_worker_request(key, "down-worker", "POST", "/api/cluster/workers", reg_body), "content-type": "application/json"},
+    )
+    # Seed an agent pinned to this worker
+    app.state.config.agents.append({
+        "name": "pinned-agent",
+        "host": "10.0.0.5",
+        "qmd_index": "test",
+        "remote": "down-worker",
+        "placement_source": "user",
+        "status": "running",
+    })
+    # Mark the worker offline directly (NOT unregistered) -- agent pin must survive
+    cluster = app.state.cluster_manager
+    worker = cluster.get_worker("down-worker")
+    assert worker is not None
+    worker.status = "offline"
+    agent = next(a for a in app.state.config.agents if a["name"] == "pinned-agent")
+    assert agent["remote"] == "down-worker"
+    assert agent["placement_source"] == "user"
+    assert agent["host"] == "10.0.0.5"
+    await app.state.cluster_pairing.close()
+
+
+@pytest.mark.asyncio
+async def test_unregister_unknown_worker(client, app):
+    await app.state.cluster_pairing.init()
     resp = await client.delete("/api/cluster/workers/ghost")
     assert resp.status_code == 404
+    await app.state.cluster_pairing.close()
 
 
 @pytest.mark.asyncio
@@ -618,6 +721,20 @@ async def _fake_sleep(seconds):
     pass
 
 
+async def _poll_job_status(client, job_id: str, timeout: float = 5.0) -> dict:
+    """Poll GET /api/cluster/workers/update-all/<job_id> until completed or timeout."""
+    import asyncio as _asyncio
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        resp = await client.get(f"/api/cluster/workers/update-all/{job_id}")
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        if data.get("status") in ("completed", "failed"):
+            return data
+        await _asyncio.sleep(0.05)
+    raise AssertionError(f"Job {job_id} did not complete within {timeout}s")
+
+
 @pytest.mark.asyncio
 async def test_update_all_workers_happy_path(client, app, monkeypatch):
     """Two online workers: both succeed via restart-disconnect, re-registration wait passes."""
@@ -630,9 +747,6 @@ async def test_update_all_workers_happy_path(client, app, monkeypatch):
 
     async def _mock_do(cluster, worker):
         call_order.append(worker.name)
-        # Simulate the drain→deploy step: set worker to draining, then return success.
-        # The re-registration loop will poll and break once status is "online".
-        # In the real helper, drain_worker sets draining; we simulate that here.
         worker.status = "draining"
         return {
             "success": True,
@@ -642,13 +756,11 @@ async def test_update_all_workers_happy_path(client, app, monkeypatch):
             "drain_cancelled": False,
         }
 
-    # Simulate re-registration: after the first poll, the worker comes back online.
     original_get_worker = app.state.cluster_manager.get_worker
 
     def _get_worker(name):
         w = original_get_worker(name)
         if w is not None and w.status == "draining":
-            # Simulate re-registration: worker comes back online
             w.status = "online"
         return w
 
@@ -660,12 +772,15 @@ async def test_update_all_workers_happy_path(client, app, monkeypatch):
     )
 
     resp = await client.post("/api/cluster/workers/update-all")
-    assert resp.status_code == 200, resp.text
+    assert resp.status_code == 202, resp.text
     data = resp.json()
-    assert sorted(data["updated"]) == ["w1", "w2"]
-    assert data["failed"] == []
-    assert data["total_targets"] == 2
-    # Verify sequential: w1 must be processed before w2
+    assert "job_id" in data
+    job_id = data["job_id"]
+
+    final = await _poll_job_status(client, job_id)
+    assert sorted(final["updated"]) == ["w1", "w2"]
+    assert final["failed"] == []
+    assert final["total_targets"] == 2
     assert call_order == ["w1", "w2"]
 
 
@@ -695,7 +810,6 @@ async def test_update_all_workers_one_fails_others_continue(client, app, monkeyp
             "drain_cancelled": False,
         }
 
-    # Simulate re-registration for w2
     original_get_worker = app.state.cluster_manager.get_worker
 
     def _get_worker(name):
@@ -712,14 +826,17 @@ async def test_update_all_workers_one_fails_others_continue(client, app, monkeyp
     )
 
     resp = await client.post("/api/cluster/workers/update-all")
-    assert resp.status_code == 200, resp.text
+    assert resp.status_code == 202, resp.text
     data = resp.json()
-    assert data["updated"] == ["w2"]
-    assert len(data["failed"]) == 1
-    assert data["failed"][0]["name"] == "w1"
-    assert "unreachable" in data["failed"][0]["error"]
-    assert data["total_targets"] == 2
-    # w1 must be processed before w2
+    assert "job_id" in data
+    job_id = data["job_id"]
+
+    final = await _poll_job_status(client, job_id)
+    assert final["updated"] == ["w2"]
+    assert len(final["failed"]) == 1
+    assert final["failed"][0]["name"] == "w1"
+    assert "unreachable" in final["failed"][0]["error"]
+    assert final["total_targets"] == 2
     assert call_order == ["w1", "w2"]
 
 
@@ -738,7 +855,6 @@ async def test_update_all_workers_skips_local(client, app, monkeypatch):
         worker.status = "draining"
         return {"success": True, "worker": worker.name, "drain_cancelled": False}
 
-    # Simulate re-registration
     original_get_worker = app.state.cluster_manager.get_worker
 
     def _get_worker(name):
@@ -755,12 +871,13 @@ async def test_update_all_workers_skips_local(client, app, monkeypatch):
     )
 
     resp = await client.post("/api/cluster/workers/update-all")
-    assert resp.status_code == 200, resp.text
+    assert resp.status_code == 202, resp.text
     data = resp.json()
-    assert sorted(data["updated"]) == ["r1", "r2"]
-    # local must appear in skipped, not updated
-    assert "local" in data["skipped"]
-    assert "local" not in data["updated"]
+    assert "job_id" in data
+    final = await _poll_job_status(client, data["job_id"])
+    assert sorted(final["updated"]) == ["r1", "r2"]
+    assert "local" in final["skipped"]
+    assert "local" not in final["updated"]
 
 
 @pytest.mark.asyncio
@@ -774,7 +891,6 @@ async def test_update_all_workers_skips_offline(client, app, monkeypatch):
         worker.status = "draining"
         return {"success": True, "worker": worker.name, "drain_cancelled": False}
 
-    # Simulate re-registration
     original_get_worker = app.state.cluster_manager.get_worker
 
     def _get_worker(name):
@@ -791,17 +907,19 @@ async def test_update_all_workers_skips_offline(client, app, monkeypatch):
     )
 
     resp = await client.post("/api/cluster/workers/update-all")
-    assert resp.status_code == 200, resp.text
+    assert resp.status_code == 202, resp.text
     data = resp.json()
-    assert data["updated"] == ["online-1"]
-    assert "online-2" in data["skipped"]
+    assert "job_id" in data
+    final = await _poll_job_status(client, data["job_id"])
+    assert final["updated"] == ["online-1"]
+    assert "online-2" in final["skipped"]
 
 
 @pytest.mark.asyncio
 async def test_update_all_workers_no_online_workers(client, app):
     """When no online remote workers exist, return empty with a message."""
     resp = await client.post("/api/cluster/workers/update-all")
-    assert resp.status_code == 200, resp.text
+    assert resp.status_code == 202, resp.text
     data = resp.json()
     assert data["updated"] == []
     assert data["failed"] == []
@@ -815,7 +933,6 @@ async def test_update_all_workers_draining_excluded_from_skipped(client, app, mo
     """Draining workers are not counted as skipped -- they are mid-update."""
     import asyncio as _asyncio
     await _register_workers(app, "w1", "w2")
-    # Set w2 to draining -- it should NOT appear in skipped
     app.state.cluster_manager._workers["w2"].status = "draining"  # noqa: SLF001
 
     async def _mock_do(cluster, worker):
@@ -838,12 +955,13 @@ async def test_update_all_workers_draining_excluded_from_skipped(client, app, mo
     )
 
     resp = await client.post("/api/cluster/workers/update-all")
-    assert resp.status_code == 200, resp.text
+    assert resp.status_code == 202, resp.text
     data = resp.json()
-    assert data["updated"] == ["w1"]
-    # w2 is draining -- NOT skipped
-    assert "w2" not in data["skipped"]
-    assert data["total_targets"] == 1  # only w1 was online
+    assert "job_id" in data
+    final = await _poll_job_status(client, data["job_id"])
+    assert final["updated"] == ["w1"]
+    assert "w2" not in final["skipped"]
+    assert final["total_targets"] == 1
 
 
 @pytest.mark.asyncio
@@ -883,13 +1001,15 @@ async def test_update_all_workers_helper_exception_isolated(client, app, monkeyp
     )
 
     resp = await client.post("/api/cluster/workers/update-all")
-    assert resp.status_code == 200, resp.text
+    assert resp.status_code == 202, resp.text
     data = resp.json()
-    assert data["updated"] == ["w2"]
-    assert len(data["failed"]) == 1
-    assert data["failed"][0]["name"] == "w1"
-    assert "RuntimeError" in data["failed"][0]["error"]
-    assert data["total_targets"] == 2
+    assert "job_id" in data
+    final = await _poll_job_status(client, data["job_id"])
+    assert final["updated"] == ["w2"]
+    assert len(final["failed"]) == 1
+    assert final["failed"][0]["name"] == "w1"
+    assert "RuntimeError" in final["failed"][0]["error"]
+    assert final["total_targets"] == 2
     assert call_order == ["w1", "w2"]
 
 
@@ -912,7 +1032,6 @@ async def test_update_all_workers_re_register_timeout(client, app, monkeypatch):
             "drain_cancelled": False,
         }
 
-    # get_worker always returns "draining" -- simulates worker never coming back
     monkeypatch.setattr(_asyncio, "sleep", _fake_sleep)
     monkeypatch.setattr(
         "tinyagentos.routes.cluster._do_single_worker_update",
@@ -920,13 +1039,62 @@ async def test_update_all_workers_re_register_timeout(client, app, monkeypatch):
     )
 
     resp = await client.post("/api/cluster/workers/update-all")
-    assert resp.status_code == 200, resp.text
+    assert resp.status_code == 202, resp.text
     data = resp.json()
-    # Both workers should still be listed as updated -- the timeout just logs a warning
-    assert sorted(data["updated"]) == ["w1", "w2"]
-    assert data["failed"] == []
-    assert data["total_targets"] == 2
+    assert "job_id" in data
+    final = await _poll_job_status(client, data["job_id"], timeout=2)
+    assert sorted(final["updated"]) == ["w1", "w2"]
+    assert final["failed"] == []
+    assert final["total_targets"] == 2
     assert call_order == ["w1", "w2"]
+
+
+@pytest.mark.asyncio
+async def test_register_returns_409_when_controller_fenced(client, app):
+    """A fenced controller must refuse registration with 409, not claim success."""
+    import json as _json
+    key = await pair_worker(client, app, "fenced-worker", "http://10.0.0.1:9000")
+    app.state.cluster_manager._fenced = True
+    reg_body = _json.dumps({
+        "name": "fenced-worker",
+        "url": "http://10.0.0.1:9000",
+        "capabilities": ["chat"],
+    }).encode()
+    resp = await client.post(
+        "/api/cluster/workers",
+        content=reg_body,
+        headers={**sign_worker_request(key, "fenced-worker", "POST", "/api/cluster/workers", reg_body), "content-type": "application/json"},
+    )
+    assert resp.status_code == 409, resp.text
+    assert "fenced" in resp.json().get("error", "").lower()
+    workers = (await client.get("/api/cluster/workers")).json()
+    assert not any(w["name"] == "fenced-worker" for w in workers)
+    app.state.cluster_manager._fenced = False
+    await app.state.cluster_pairing.close()
+
+
+@pytest.mark.asyncio
+async def test_register_returns_409_when_generation_mismatch(client, app):
+    """A worker echoing a stale generation must be refused with 409."""
+    import json as _json
+    key = await pair_worker(client, app, "stale-gen-worker", "http://10.0.0.2:9000")
+    app.state.cluster_manager._generation = 999
+    reg_body = _json.dumps({
+        "name": "stale-gen-worker",
+        "url": "http://10.0.0.2:9000",
+        "capabilities": ["chat"],
+        "generation": 1,
+    }).encode()
+    resp = await client.post(
+        "/api/cluster/workers",
+        content=reg_body,
+        headers={**sign_worker_request(key, "stale-gen-worker", "POST", "/api/cluster/workers", reg_body), "content-type": "application/json"},
+    )
+    assert resp.status_code == 409, resp.text
+    assert "generation" in resp.json().get("error", "").lower()
+    workers = (await client.get("/api/cluster/workers")).json()
+    assert not any(w["name"] == "stale-gen-worker" for w in workers)
+    await app.state.cluster_pairing.close()
 
 
 @pytest.mark.asyncio
@@ -940,3 +1108,308 @@ async def test_update_all_workers_admin_gate_rejected(app, tmp_data_dir):
             headers={"content-type": "application/json"},
         )
         assert resp.status_code in (401, 403)
+
+
+@pytest.mark.asyncio
+async def test_generation_echo_and_layer2_protection(client, app):
+    """End-to-end: generation echo enables layer-2 split-brain protection.
+
+    Before the fix: generation is absent from register/heartbeat responses,
+    so the worker never echoes it, self._generation stays None, and the
+    split-brain protection in manager.py:110-115, 294-299 never fires.
+
+    After the fix: the controller echoes the current generation in both
+    responses.  The worker can read it and send it back on heartbeats.
+    When the controller's generation advances (e.g. via
+    increment_generation()), a heartbeat carrying the stale generation
+    is rejected by the layer-2 guard.
+    """
+    import json as _json
+
+    from tinyagentos.cluster.worker_protocol import WorkerInfo
+
+    # Initialise the worker registry store so persistence + generation
+    # counter are available (taOS #640).
+    await app.state.cluster_manager._registry_store.init()
+
+    # Pair and register a worker
+    key = await pair_worker(client, app, "gen-echo-worker", "http://192.168.1.1:9000")
+
+    # ---- Register: verify generation is echoed ----
+    reg_body = _json.dumps({"name": "gen-echo-worker", "url": "http://192.168.1.1:9000"}).encode()
+    headers = sign_worker_request(key, "gen-echo-worker", "POST", "/api/cluster/workers", reg_body)
+    resp = await client.post("/api/cluster/workers", content=reg_body, headers={**headers, "content-type": "application/json"})
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["status"] == "registered", data
+    assert "generation" in data, f"Generation not echoed in register response: {data}"
+    reg_generation = data["generation"]
+
+    # ---- Heartbeat: verify generation is echoed back ----
+    hb_body = _json.dumps({"name": "gen-echo-worker", "load": 0.3}).encode()
+    headers = sign_worker_request(key, "gen-echo-worker", "POST", "/api/cluster/heartbeat", hb_body)
+    resp = await client.post("/api/cluster/heartbeat", content=hb_body, headers={**headers, "content-type": "application/json"})
+    assert resp.status_code == 200, resp.text
+    hb_data = resp.json()
+    assert hb_data["status"] == "ok", hb_data
+    assert hb_data.get("generation") == reg_generation, (
+        f"Generation not echoed in heartbeat response: got {hb_data.get('generation')}, "
+        f"expected {reg_generation}"
+    )
+
+    # ---- Layer-2 protection: bump generation, send stale generation, verify rejection ----
+    # Advance the controller's generation counter in the store so the previously-
+    # valid generation is now stale.
+    await app.state.cluster_manager._registry_store.increment_generation()
+    await app.state.cluster_manager._registry_store.current_generation()
+    # Sync the in-memory generation so the split-brain guard fires.
+    app.state.cluster_manager._generation = await app.state.cluster_manager._registry_store.current_generation()
+
+    # Send heartbeat with the old (now-stale) generation - layer-2 guard should reject it.
+    stale_hb_body = _json.dumps({"name": "gen-echo-worker", "load": 0.3, "generation": reg_generation}).encode()
+    headers = sign_worker_request(key, "gen-echo-worker", "POST", "/api/cluster/heartbeat", stale_hb_body)
+    resp = await client.post("/api/cluster/heartbeat", content=stale_hb_body, headers={**headers, "content-type": "application/json"})
+    # manager.heartbeat returns False when generation mismatch; route returns 404.
+    assert resp.status_code == 404, f"Expected 404 (generation mismatch rejection), got {resp.status_code}: {resp.text}"
+    assert "not registered" in resp.json().get("error", ""), f"Unexpected error message: {resp.json()}"
+    await app.state.cluster_pairing.close()
+
+
+@pytest.mark.asyncio
+async def test_register_worker_null_ram_mb_does_not_crash_list_workers(client, app):
+    """A registration payload with ram_mb=null must not cause list_workers
+    to 500 via worker_tier_id doing None // 1024."""
+    import json as _json
+
+    key = await pair_worker(client, app, "null-ram-worker", "http://10.0.0.1:9000")
+    reg_body = _json.dumps({
+        "name": "null-ram-worker",
+        "url": "http://10.0.0.1:9000",
+        "hardware": {"ram_mb": None, "cpu": {"arch": "x86_64"}},
+    }).encode()
+    resp = await client.post(
+        "/api/cluster/workers",
+        content=reg_body,
+        headers={**sign_worker_request(key, "null-ram-worker", "POST", "/api/cluster/workers", reg_body), "content-type": "application/json"},
+    )
+    assert resp.status_code == 200, resp.text
+
+    resp = await client.get("/api/cluster/workers")
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    w = next((w for w in data if w["name"] == "null-ram-worker"), None)
+    assert w is not None
+    assert w["tier_id"] not in ("", "unknown"), f"tier_id should be derived, got {w['tier_id']!r}"
+    await app.state.cluster_pairing.close()
+
+
+@pytest.mark.asyncio
+async def test_update_all_workers_returns_202_with_job_id_and_completes_in_background(client, app, monkeypatch):
+    """Two fake workers whose update takes 2s each: POST returns <1s with a job
+    id and the status route reports completion afterwards (R2-24)."""
+    import asyncio as _asyncio
+
+    await _register_workers(app, "w1", "w2")
+
+    async def _mock_do(cluster, worker):
+        await _asyncio.sleep(2)
+        worker.status = "draining"
+        return {
+            "success": True,
+            "worker": worker.name,
+            "status": "updating",
+            "previous_status": "online",
+            "drain_cancelled": False,
+        }
+
+    # Make re-registration instant so the background job can finish quickly.
+    original_get_worker = app.state.cluster_manager.get_worker
+
+    def _get_worker(name):
+        w = original_get_worker(name)
+        if w is not None and w.status == "draining":
+            w.status = "online"
+        return w
+
+    monkeypatch.setattr(app.state.cluster_manager, "get_worker", _get_worker)
+    monkeypatch.setattr(
+        "tinyagentos.routes.cluster._do_single_worker_update",
+        _mock_do,
+    )
+
+    start = time.time()
+    resp = await client.post("/api/cluster/workers/update-all")
+    elapsed = time.time() - start
+
+    assert resp.status_code == 202, resp.text
+    data = resp.json()
+    assert "job_id" in data, f"Expected job_id in response, got: {data}"
+    job_id = data["job_id"]
+
+    assert elapsed < 1.0, (
+        f"POST /api/cluster/workers/update-all took {elapsed:.2f}s, expected <1s"
+    )
+
+    deadline = time.time() + 15
+    final_status = None
+    while time.time() < deadline:
+        status_resp = await client.get(f"/api/cluster/workers/update-all/{job_id}")
+        assert status_resp.status_code == 200, status_resp.text
+        final_status = status_resp.json()
+        if final_status.get("status") in ("completed", "failed"):
+            break
+        await _asyncio.sleep(0.2)
+
+    assert final_status is not None
+    assert final_status["status"] == "completed", final_status
+    assert sorted(final_status["updated"]) == ["w1", "w2"]
+    assert final_status["failed"] == []
+    assert final_status["total_targets"] == 2
+
+
+@pytest.mark.asyncio
+async def test_update_all_workers_status_unknown_job_returns_404(client, app):
+    """GET /api/cluster/workers/update-all/<unknown> returns 404."""
+    resp = await client.get("/api/cluster/workers/update-all/does-not-exist")
+    assert resp.status_code == 404, resp.text
+
+
+@pytest.mark.asyncio
+async def test_unauthenticated_get_workers_returns_minimal_projection(client, app):
+    """Unauthenticated GET /api/cluster/workers must not expose sensitive fields.
+
+    Red-test for S2-15: an unauthenticated caller must not receive url,
+    worker_url, host_lan_ip, hardware, models, backends, kernel, version,
+    live_token, or any other identifying/hardware detail.
+    """
+    import json as _json
+
+    # Register a worker with full sensitive data via the admin client.
+    key = await pair_worker(client, app, "secret-worker", "http://10.0.0.1:9000")
+    reg_body = _json.dumps({
+        "name": "secret-worker",
+        "url": "http://10.0.0.1:9000",
+        "platform": "linux",
+        "capabilities": ["chat", "embed"],
+        "hardware": {
+            "cpu": {"model": "Ryzen 9", "arch": "x86_64"},
+            "ram_gb": 64,
+            "os": {"kernel": "6.1.0", "distro": "ubuntu", "version": "24.04"},
+        },
+        "models": ["llama3"],
+        "host_lan_ip": "192.168.1.50",
+        "worker_url": "http://secret-worker:9000",
+        "backends": [{"name": "llama-cpp", "models": [{"name": "llama3"}]}],
+        "live_token": True,
+    }).encode()
+    resp = await client.post(
+        "/api/cluster/workers",
+        content=reg_body,
+        headers={**sign_worker_request(key, "secret-worker", "POST", "/api/cluster/workers", reg_body), "content-type": "application/json"},
+    )
+    assert resp.status_code == 200, resp.text
+
+    # Hit the endpoint with a completely unauthenticated client (no cookies).
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+    ) as anon_client:
+        resp = await anon_client.get("/api/cluster/workers")
+        assert resp.status_code == 200, resp.text
+        workers = resp.json()
+        assert len(workers) == 1
+        w = workers[0]
+
+        # Minimal projection must be present.
+        assert w["name"] == "secret-worker"
+        assert w["status"] == "online"
+        assert "tier_id" in w
+
+        # Sensitive fields must NOT be present.
+        sensitive_fields = [
+            "url",
+            "worker_url",
+            "host_lan_ip",
+            "hardware",
+            "models",
+            "backends",
+            "capabilities",
+            "kernel",
+            "version",
+            "live_token",
+            "revoked",
+            "blocked",
+            "last_heartbeat",
+            "load",
+            "platform",
+            "potential_capabilities",
+            "kv_cache_quant_support",
+            "kv_cache_quant_k_support",
+            "kv_cache_quant_v_support",
+            "kv_cache_quant_boundary_layer_protect",
+            "storage_cap_bytes",
+            "storage_used_bytes",
+            "bytes_deduped_total",
+            "worker_lxc_image_version",
+            "degraded",
+            "degraded_reason",
+            "free_vram_mb",
+            "used_vram_mb",
+            "available_models",
+            "resources",
+            "registered_at",
+            "generation",
+            "tls_cert_provider",
+            "signing_key",
+        ]
+        for field in sensitive_fields:
+            assert field not in w, f"sensitive field {field} leaked in unauthenticated response"
+
+    await app.state.cluster_pairing.close()
+
+
+@pytest.mark.asyncio
+async def test_admin_get_workers_returns_full_record(client, app):
+    """Authenticated admin GET /api/cluster/workers returns the full record."""
+    import json as _json
+
+    key = await pair_worker(client, app, "admin-worker", "http://10.0.0.2:9000")
+    reg_body = _json.dumps({
+        "name": "admin-worker",
+        "url": "http://10.0.0.2:9000",
+        "platform": "linux",
+        "capabilities": ["chat"],
+        "hardware": {
+            "cpu": {"model": "Ryzen 9", "arch": "x86_64"},
+            "ram_gb": 64,
+            "os": {"kernel": "6.1.0", "distro": "ubuntu", "version": "24.04"},
+        },
+        "models": ["llama3"],
+        "host_lan_ip": "192.168.1.51",
+        "worker_url": "http://admin-worker:9000",
+        "backends": [{"name": "llama-cpp", "models": [{"name": "llama3"}]}],
+        "live_token": True,
+    }).encode()
+    resp = await client.post(
+        "/api/cluster/workers",
+        content=reg_body,
+        headers={**sign_worker_request(key, "admin-worker", "POST", "/api/cluster/workers", reg_body), "content-type": "application/json"},
+    )
+    assert resp.status_code == 200, resp.text
+
+    # The admin client has a session cookie, so it must receive the full record.
+    resp = await client.get("/api/cluster/workers")
+    assert resp.status_code == 200, resp.text
+    workers = resp.json()
+    assert len(workers) == 1
+    w = workers[0]
+    assert w["name"] == "admin-worker"
+    assert w["url"] == "http://10.0.0.2:9000"
+    assert w["host_lan_ip"] == "192.168.1.51"
+    assert w["hardware"] is not None
+    assert w["models"] == ["llama3"]
+    assert w["backends"] is not None
+    assert w["live_token"] is True
+    assert w["status"] == "online"
+
+    await app.state.cluster_pairing.close()

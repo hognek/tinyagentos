@@ -16,6 +16,7 @@ from pathlib import Path
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
+from tinyagentos.routes.decisions import SERVER_RAISED_KEY
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +28,8 @@ _bg_receipt_tasks: set = set()
 
 
 def _is_admin_or_local_token(request: Request) -> bool:
-    """True if the caller is an admin session or presented the host's local token.
+    """True if the caller is an admin session, presented the host's local token,
+    or is the native taOS agent presenting its scoped registry JWT.
 
     Skill EXECUTION (unlike the read-only discovery GET) must never be reachable
     by a plain non-admin user session -- built-in skills include ``code_exec``,
@@ -35,19 +37,23 @@ def _is_admin_or_local_token(request: Request) -> bool:
     supplied code, i.e. host RCE (GHSA-h24f-gp4c-8qjm). The legitimate callers
     are: (a) an admin session, or (b) a deployed agent presenting the
     ``TAOS_LOCAL_TOKEN`` local token (see ``deployer.py`` + ``AuthManager.
-    validate_local_token``).
+    validate_local_token``), or (c) the native taOS agent presenting its
+    scoped registry JWT (via == "registry_jwt_native_agent").
 
     ``AuthMiddleware`` (tinyagentos/auth_middleware.py) sets both signals on
     ``request.state``: ``is_admin`` is True for an admin session AND for a
     local token that maps to the primary user, while ``via == "local_token"``
     is set for a valid local token even in the pre-onboarding edge case where
-    there is no primary user yet (so ``is_admin`` is False there). Checking
-    both keeps agent tool-calls working in every state the middleware allows,
-    without ever accepting a bare non-admin user session.
+    there is no primary user yet (so ``is_admin`` is False there). The native
+    agent's registry JWT sets ``via == "registry_jwt_native_agent"`` and
+    ``user_id`` to the owner's user_id. Checking all three keeps agent
+    tool-calls working in every state the middleware allows, without ever
+    accepting a bare non-admin user session.
     """
     if getattr(request.state, "is_admin", False):
         return True
-    return getattr(request.state, "via", None) == "local_token"
+    via = getattr(request.state, "via", None)
+    return via == "local_token" or via == "registry_jwt_native_agent" or via == "registry_jwt_deployed_agent"
 
 
 # ---------------------------------------------------------------------------
@@ -79,7 +85,8 @@ def _resolve_agent_workspace(request: Request, args: dict) -> Path:
     rebuild or framework swap. See ``docs/design/framework-agnostic-runtime.md``.
     """
     agent_name = (
-        args.get("agent_name")
+        getattr(request.state, "agent_name", None)
+        or args.get("agent_name")
         or request.query_params.get("agent_name")
         or "default"
     )
@@ -153,17 +160,47 @@ async def _skill_list_files(args: dict, request: Request) -> dict:
 async def _skill_web_search(args: dict, request: Request) -> dict:
     """Search the web via SearXNG (if available)."""
     import httpx
+    import os
 
     query = args.get("query", "")
     max_results = args.get("max_results", 5)
+
+    base_url = os.environ.get("TAOS_SEARXNG_URL", "").strip()
+    if not base_url:
+        store = getattr(request.app, "state", None)
+        installed_apps = getattr(store, "installed_apps", None) if store else None
+        if installed_apps is not None:
+            try:
+                runtime = await installed_apps.get_runtime_location("searxng")
+                if runtime and runtime.get("runtime_port"):
+                    host = runtime.get("runtime_host", "127.0.0.1")
+                    base_url = f"http://{host}:{runtime['runtime_port']}"
+            except Exception:
+                pass
+
+    if not base_url:
+        base_url = "http://localhost:8888"
+
+    base_url = base_url.rstrip("/")
+
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.get(
-                f"http://localhost:8888/search?q={query}&format=json"
+                base_url + "/search",
+                params={"q": query, "format": "json"},
             )
             if resp.status_code == 200:
                 data = resp.json()
-                return {"results": data.get("results", [])[:max_results]}
+                results = data.get("results", [])[:max_results]
+                if not results and data.get("unresponsive_engines"):
+                    return {
+                        "results": [],
+                        "error": (
+                            "Web search returned zero results: unresponsive engines: "
+                            + ", ".join(data.get("unresponsive_engines", []))
+                        ),
+                    }
+                return {"results": results}
     except Exception:
         pass
     return {"error": "Web search not configured. Install SearXNG."}
@@ -238,6 +275,7 @@ async def _skill_image_generation(args: dict, request: Request) -> dict:
             model=args.get("model") or None,
             guidance_scale=float(args.get("guidance_scale", 7.5)),
             negative_prompt=args.get("negative_prompt", ""),
+            seed=args.get("seed"),
         )
         return result
     except Exception as exc:
@@ -426,14 +464,25 @@ async def _skill_notes_add_entry(args: dict, request: Request) -> dict:
         return {"error": str(exc)}
 
 
-async def _skill_notes_set_done(args: dict, request: Request) -> dict:
-    """Mark a list task done/not-done on a shared doc the agent belongs to."""
-    try:
-        from tinyagentos.tools.notes_tools import execute_notes_set_done
+async def _skill_todo_list_lists(args: dict, request: Request) -> dict:
+    """List non-archived todo lists the calling agent has access to."""
+    from tinyagentos.tools.todo_tools import execute_todo_list_lists
 
-        return await execute_notes_set_done(args, request)
-    except Exception as exc:
-        return {"error": str(exc)}
+    return await execute_todo_list_lists(args, request)
+
+
+async def _skill_todo_add_item(args: dict, request: Request) -> dict:
+    """Append an item to a todo list the calling agent has access to."""
+    from tinyagentos.tools.todo_tools import execute_todo_add_item
+
+    return await execute_todo_add_item(args, request)
+
+
+async def _skill_todo_set_done(args: dict, request: Request) -> dict:
+    """Mark a todo item done/not-done on a list the agent has access to."""
+    from tinyagentos.tools.todo_tools import execute_todo_set_done
+
+    return await execute_todo_set_done(args, request)
 
 
 SKILL_IMPLEMENTATIONS = {
@@ -463,7 +512,9 @@ SKILL_IMPLEMENTATIONS = {
     "export_storybook": _skill_export_storybook,
     "notes_list_shared_docs": _skill_notes_list_shared_docs,
     "notes_add_entry": _skill_notes_add_entry,
-    "notes_set_done": _skill_notes_set_done,
+    "todo_list_lists": _skill_todo_list_lists,
+    "todo_add_item": _skill_todo_add_item,
+    "todo_set_done": _skill_todo_set_done,
 }
 
 
@@ -480,6 +531,12 @@ async def list_tools(request: Request, agent_name: str):
     format matches the OpenAI / MCP tool definition so adapters can pass it
     straight through to framework tool registries.
     """
+    credential_agent = getattr(request.state, "agent_name", None)
+    if credential_agent and agent_name != credential_agent:
+        return JSONResponse(
+            {"error": "forbidden: agent_name does not match credential"},
+            status_code=403,
+        )
     skill_store = request.app.state.skills
     skills = await skill_store.get_agent_skills(agent_name)
 
@@ -488,18 +545,24 @@ async def list_tools(request: Request, agent_name: str):
         schema = skill.get("tool_schema") or {}
         if not schema:
             continue
+        skill_id = skill["id"]
+        # Only advertise skills that have a wired implementation — orphaned
+        # rows (seeded with INSERT OR IGNORE, then removed from the default
+        # set) survive in the skills table but would 501 on call.
+        if skill_id not in SKILL_IMPLEMENTATIONS:
+            continue
         tools.append(
             {
                 "type": "function",
                 "function": {
-                    "name": schema.get("name", skill["id"]),
+                    "name": schema.get("name", skill_id),
                     "description": schema.get(
                         "description", skill.get("description", "")
                     ),
                     "parameters": schema.get("input_schema", {}),
                 },
-                "skill_id": skill["id"],
-                "exec_url": f"/api/skill-exec/{skill['id']}/call",
+                "skill_id": skill_id,
+                "exec_url": f"/api/skill-exec/{skill_id}/call",
             }
         )
 
@@ -517,7 +580,10 @@ def _capture_tool_receipt(request: Request, skill_id: str, args: dict, result) -
         from tinyagentos.receipts import emit_tool_receipt
 
         store = getattr(request.app.state, "receipt_store", None)
-        agent = (args.get("agent_name") or "").strip()
+        agent = (
+            getattr(request.state, "agent_name", None)
+            or (args.get("agent_name") or "").strip()
+        )
         if store is None or not agent:
             return
         # agent_name is identity, not a tool argument; keep it out of tool_args.
@@ -593,9 +659,13 @@ async def _check_execution_policy(
 
     policies = getattr(request.app.state, "execution_policies", None)
     if policies is None:
-        # Not wired in this deployment; fail open rather than break every
-        # skill call over an additive, not-yet-present store.
-        return None
+        # The startup wiring in app.py sets app.state.execution_policies
+        # unconditionally, so an absent store here signals a misconfigured
+        # app. Deny rather than silently allow.
+        return JSONResponse(
+            {"error": "execution_policies not configured"},
+            status_code=403,
+        )
 
     effect = await policies.effective_effect(agent_name, action_class)
     if effect == "allow":
@@ -635,6 +705,7 @@ async def _check_execution_policy(
                 type="approve_deny",
                 priority="blocking",
                 metadata={
+                    SERVER_RAISED_KEY: True,
                     "kind": "execution_gate",
                     "agent_name": agent_name,
                     "action_class": action_class,
@@ -672,10 +743,21 @@ async def execute_skill(skill_id: str, request: Request):
 
     body = await request.json()
     args = body.get("args", {})
-    # Propagate agent_name from the request body into args so file-read
-    # and file-write resolve the right per-agent workspace.
-    if "agent_name" in body and "agent_name" not in args:
-        args["agent_name"] = body["agent_name"]
+
+    # Agent identity must come from the CREDENTIAL, not the body.
+    # Local-token callers are bound to a single agent at deploy time; a
+    # deployed agent passing another agent's handle must be rejected.
+    credential_agent = getattr(request.state, "agent_name", None)
+    body_agent = body.get("agent_name")
+    if credential_agent:
+        if body_agent and body_agent != credential_agent:
+            return JSONResponse(
+                {"error": "forbidden: agent_name does not match credential"},
+                status_code=403,
+            )
+        args["agent_name"] = credential_agent
+    elif body_agent:
+        args["agent_name"] = body_agent
 
     skill_store = request.app.state.skills
     skill = await skill_store.get_skill(skill_id)
@@ -683,6 +765,28 @@ async def execute_skill(skill_id: str, request: Request):
         return JSONResponse(
             {"error": f"Skill {skill_id} not found"}, status_code=404
         )
+
+    # Deployed-agent assignment guard: a deployed agent may only execute skills
+    # assigned to it. This applies to BOTH the registry-JWT deployed-agent path
+    # (via == "registry_jwt_deployed_agent") and a per-agent BOUND local token
+    # (via == "local_token" with request.state.agent_name set, i.e. the token is
+    # bound to a single agent at deploy time). The same check body is reused for
+    # both: reject any skill not in the agent's assigned set with a 403.
+    # An UNBOUND local token (via == "local_token", no agent_name -- the host/CLI
+    # token), admin sessions, and registry_jwt_native_agent stay unrestricted.
+    via = getattr(request.state, "via", None)
+    credential_agent = getattr(request.state, "agent_name", None)
+    if (
+        via == "registry_jwt_deployed_agent"
+        or (via == "local_token" and credential_agent)
+    ):
+        if credential_agent:
+            assigned = await skill_store.get_agent_skills(credential_agent)
+            assigned_ids = {s["id"] for s in assigned}
+            if skill_id not in assigned_ids:
+                return JSONResponse(
+                    {"error": "forbidden: skill not assigned to agent"}, status_code=403
+                )
 
     impl = SKILL_IMPLEMENTATIONS.get(skill_id)
     if not impl:

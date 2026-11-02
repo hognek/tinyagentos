@@ -1,8 +1,34 @@
 from __future__ import annotations
+import sqlite3
 from pathlib import Path
-import aiosqlite
+from enum import Enum
 
-from tinyagentos.db_migrations import apply_wal_pragmas_async, run_migrations_async
+
+class Engine(Enum):
+    """Database engine selection."""
+    SQLITE = "sqlite"
+    POSTGRES = "postgres"
+
+
+class PendingCapExceeded(Exception):
+    """A store refused an insert because a per-key pending cap is already full.
+
+    Raised by a ``create()`` that enforces the cap INSIDE its INSERT statement
+    rather than leaving the caller to count first.  A count-then-insert cap is
+    bypassable by exactly the traffic caps exist to stop: every request in a
+    concurrent burst reads the same pre-insert count, every one of them passes
+    the check, and every one of them inserts.
+
+    ``pending`` is read back after the refusal, so it is a description for the
+    error message, not the value the decision was made on -- that comparison
+    happened atomically in SQL.  Routes map this to 429.
+    """
+
+    def __init__(self, *, key: str, cap: int, pending: int):
+        self.key = key
+        self.cap = cap
+        self.pending = pending
+        super().__init__(f"{pending} pending at cap {cap} for {key!r}")
 
 
 class BaseStore:
@@ -31,14 +57,35 @@ class BaseStore:
     SCHEMA: str = ""
     # List of (version: int, sql_or_callable) pairs. See db_migrations.py.
     MIGRATIONS: list = []
+    # Database engine: SQLITE (default) or POSTGRES
+    ENGINE: Engine = Engine.SQLITE
+    # Open the sqlite connection in autocommit mode (isolation_level=None), so
+    # the driver never opens an implicit transaction that an error path could
+    # leave dangling on the connection.  A store that sets this MUST wrap every
+    # multi-statement write in an explicit transaction -- see
+    # tinyagentos/projects/tx.py, which does exactly that for the eight stores
+    # sharing projects.db.
+    AUTOCOMMIT: bool = False
 
-    def __init__(self, db_path: Path):
+    def __init__(self, db_path: Path, engine: Engine | None = None):
         self.db_path = db_path
-        self._db: aiosqlite.Connection | None = None
+        self.engine = engine if engine is not None else self.ENGINE
+        self._db = None
 
     async def init(self) -> None:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._db = await aiosqlite.connect(str(self.db_path))
+
+        if self.engine == Engine.POSTGRES:
+            await self._init_postgres()
+        else:
+            await self._init_sqlite()
+
+    async def _init_sqlite(self) -> None:
+        import aiosqlite
+        from tinyagentos.db_migrations import apply_wal_pragmas_async, run_migrations_async
+
+        connect_kwargs = {"isolation_level": None} if self.AUTOCOMMIT else {}
+        self._db = await aiosqlite.connect(str(self.db_path), **connect_kwargs)
         await apply_wal_pragmas_async(self._db)
         if self.SCHEMA:
             await self._db.executescript(self.SCHEMA)
@@ -48,6 +95,9 @@ class BaseStore:
                                        namespace=self.__class__.__name__)
         await self._post_init()
 
+    async def _init_postgres(self) -> None:
+        raise NotImplementedError("Postgres engine not yet implemented")
+
     async def _post_init(self) -> None:
         """Override in subclasses for seeding data after schema creation."""
         pass
@@ -56,3 +106,37 @@ class BaseStore:
         if self._db:
             await self._db.close()
             self._db = None
+
+    async def _insert_with_retry(
+        self,
+        sql: str,
+        params: tuple,
+        id_index: int,
+        new_id_fn,
+        max_attempts: int = 5,
+    ) -> str:
+        params_list = list(params)
+        for attempt in range(max_attempts):
+            try:
+                await self._db.execute(sql, params_list)
+                return params_list[id_index]
+            except sqlite3.IntegrityError as exc:
+                msg = str(exc)
+                # Only retry on UNIQUE constraint failures against the id
+                # column (the column we can regenerate via new_id_fn).  A
+                # collision on any other UNIQUE index (e.g. a compound key
+                # on non-id columns) cannot be resolved by retrying with a
+                # new id, so those IntegrityErrors propagate unchanged.
+                if (
+                    "UNIQUE constraint failed:" in msg
+                    # The sqlite3 error message appends the column name;
+                    # ".id" catches every PRIMARY KEY / UNIQUE index whose
+                    # name ends in ".id".  This is deliberate: loosening
+                    # it would retry collisions we cannot fix, silently
+                    # masking data-integrity bugs.
+                    and msg.rstrip().endswith(".id")
+                ):
+                    params_list[id_index] = new_id_fn()
+                    continue
+                raise
+        raise sqlite3.IntegrityError("unique id collision after max retries")

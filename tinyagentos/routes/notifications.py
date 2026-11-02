@@ -1,17 +1,44 @@
 from __future__ import annotations
 
+import html
 import json
 import time
 from typing import Any
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, field_validator
 
+from tinyagentos.notifications import VALID_LEVELS
+
 from tinyagentos.auth import get_current_user
+from tinyagentos.agent_token_auth import check_agent_scope_for_project, registry_agent_caller
+from tinyagentos.rate_limit import MovingWindowLimiter
 from tinyagentos.routes.auth import _require_admin
 
 router = APIRouter()
+
+# Per-canonical_id rate limit for agent notification posts: 10 per 10 minutes.
+_AGENT_NOTIF_WINDOW_SECS = 600
+_AGENT_NOTIF_MAX_PER_WINDOW = 10
+_agent_notif_limiter = MovingWindowLimiter(_AGENT_NOTIF_MAX_PER_WINDOW, _AGENT_NOTIF_WINDOW_SECS)
+_agent_notif_rate_hits = _agent_notif_limiter.hits
+
+
+def _notif_user_id(request: Request) -> str:
+    """Resolve the calling user the way the rest of the app does.
+
+    AuthMiddleware sets ``request.state.user_id`` for BOTH the session cookie
+    and the local token (``Authorization: Bearer <token>``, which it maps to
+    the primary user), so browser sessions, ``taosctl`` and host scripts all
+    resolve here. A cookie-only dependency such as ``get_current_user`` would
+    401 every local-token caller. Same idiom as ``routes/event_stream.py`` and
+    ``routes/desktop_control.py``.
+    """
+    uid = getattr(request.state, "user_id", None)
+    if not uid:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    return str(uid)
 
 
 def _format_ts(ts: int) -> str:
@@ -29,7 +56,17 @@ def _format_ts(ts: int) -> str:
 @router.get("/api/notifications")
 async def list_notifications(request: Request, unread_only: bool = False):
     store = request.app.state.notifications
-    items = await store.list(unread_only=unread_only)
+    # tsk-f75p3z: a registry JWT is accepted here (it used to 401), resolved
+    # like _authorize_task_actor: a session wins, otherwise the Bearer must
+    # carry notifications_write.  An agent reads back ONLY what it posted
+    # (source ``agent:<canonical_id>``, stamped server-side by
+    # create_notification), with the recipient's read flag, never the user's
+    # other notifications.
+    agent_cid = await registry_agent_caller(request, "notifications_write")
+    if agent_cid is not None:
+        return await store.list(unread_only=unread_only, source=f"agent:{agent_cid}")
+    user_id = _notif_user_id(request)
+    items = await store.list(unread_only=unread_only, user_id=user_id)
     # Return HTML for HTMX requests, JSON otherwise
     if request.headers.get("hx-request"):
         if not items:
@@ -38,10 +75,14 @@ async def list_notifications(request: Request, unread_only: bool = False):
         for item in items:
             cls = "notif-item unread" if not item["read"] else "notif-item"
             level_icon = {"warning": "&#x26A0;&#xFE0F;", "error": "&#x274C;", "info": "&#x2139;&#xFE0F;"}.get(item["level"], "")
+            # title and message are agent-supplied (the reason from
+            # POST /api/broker/request lands here verbatim), so escape them at the HTML sink; the
+            # JSON branch below still returns the raw text. level_icon is a
+            # fixed entity literal and cls is derived from a bool.
             html_parts.append(
                 f'<div class="{cls}">'
-                f'<div class="notif-title">{level_icon} {item["title"]}</div>'
-                f'<div class="notif-meta">{item["message"]} &middot; {_format_ts(item["timestamp"])}</div>'
+                f'<div class="notif-title">{level_icon} {html.escape(item["title"])}</div>'
+                f'<div class="notif-meta">{html.escape(item["message"])} &middot; {_format_ts(item["timestamp"])}</div>'
                 f'</div>'
             )
         return HTMLResponse("".join(html_parts))
@@ -58,14 +99,95 @@ class CreateNotificationRequest(BaseModel):
 
 @router.post("/api/notifications")
 async def create_notification(request: Request, body: CreateNotificationRequest):
-    """Admin-only: create a notification through the internal store.
+    """Create a notification through the internal store.
 
-    Lets orchestrators and lead agents signal that a doc or PR is ready for
-    review without a raw DB insert, which would skip SSE and web-push delivery.
+    Human path (session/local token): admin-only via _require_admin.
+    Agent path (registry JWT with notifications_write grant): the route
+    verifies the JWT + grant + project binding. Delivery goes through the
+    same store.add path so SSE and web-push fire.
     """
+    # Check for the agent bearer token first so the dual-auth contract is
+    # explicit: either path is valid, but the route decides which one applies.
+    agent_cid = None
+    auth_header = request.headers.get("authorization", "")
+    if auth_header.lower().startswith("bearer "):
+        presented = auth_header[7:].strip()
+        if presented:
+            try:
+                agent_cid = await check_agent_scope_for_project(
+                    request, "notifications_write", body.data.get("project_id") if body.data else None
+                )
+            except HTTPException:
+                # Bad token, missing grant, or project mismatch: fall through
+                # to the human path (which will 401/403 on its own merits).
+                agent_cid = None
+
+    if agent_cid is not None:
+        # Agent path: rate-limit per canonical_id.
+        if not _agent_notif_limiter.check(agent_cid):
+            retry = _agent_notif_limiter.retry_after(agent_cid)
+            return JSONResponse(
+                {"error": "rate_limited", "retry_after": retry},
+                status_code=429,
+                headers={"Retry-After": str(max(1, int(retry)))},
+            )
+
+        # Enforce caps only on the agent path (after agent_cid is resolved).
+        if len(body.title) > 120:
+            raise HTTPException(status_code=422, detail="title must be at most 120 characters")
+        if len(body.message) > 1000:
+            raise HTTPException(status_code=422, detail="message must be at most 1000 characters")
+        if body.data is not None and len(json.dumps(body.data).encode("utf-8")) > 4096:
+            raise HTTPException(status_code=422, detail="data must be at most 4 KB serialized")
+
+        # Level: agents may post info|warning only.
+        if body.level not in ("info", "warning"):
+            raise HTTPException(
+                status_code=400,
+                detail=f"agent may only post level info or warning, got {body.level!r}",
+            )
+
+        # Resolve the recipient user_id from the grant, NOT from the body.
+        project_id = body.data.get("project_id") if body.data else None
+        if project_id is not None:
+            project = await request.app.state.project_store.get_project(project_id)
+            if project is None:
+                raise HTTPException(status_code=400, detail="project_id not found")
+            user_id = project.get("user_id") or ""
+            if not user_id:
+                raise HTTPException(status_code=409, detail="project has no owner to notify")
+        else:
+            admins = [u for u in request.app.state.auth.list_users() if u.get("is_admin")]
+            if not admins:
+                raise HTTPException(status_code=409, detail="no admin to receive an OS-level notification")
+            user_id = admins[0]["id"]
+
+        # Source comes from the grant, NOT the body.
+        source = f"agent:{agent_cid}"
+        # Stamp from_agent on the data payload.
+        data = dict(body.data) if body.data else {}
+        data["from_agent"] = agent_cid
+
+        store = request.app.state.notifications
+        await store.add(
+            title=body.title,
+            message=body.message,
+            level=body.level,
+            source=source,
+            data=data,
+            user_id=user_id,
+        )
+        return {"ok": True}
+
+    # Human path (session/local token): unchanged.
     ok, err = _require_admin(request)
     if not ok:
         return err
+    if body.level not in VALID_LEVELS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"level must be one of {sorted(VALID_LEVELS)}",
+        )
     store = request.app.state.notifications
     await store.add(
         title=body.title,
@@ -79,44 +201,164 @@ async def create_notification(request: Request, body: CreateNotificationRequest)
 
 @router.get("/api/notifications/count", response_class=HTMLResponse)
 async def notification_count(request: Request):
+    user_id = _notif_user_id(request)
     store = request.app.state.notifications
-    count = await store.unread_count()
+    count = await store.unread_count(user_id=user_id)
     return f"<span class='notif-badge' data-count='{count}'>{count if count else ''}</span>"
 
 
 @router.get("/api/notifications/archived")
 async def list_archived_notifications(request: Request):
     """History view: dismissed notifications, newest first (nothing deleted)."""
+    user_id = _notif_user_id(request)
     store = request.app.state.notifications
-    return await store.list_archived()
+    return await store.list_archived(user_id=user_id)
+
+
+@router.get("/api/notifications/history")
+async def list_notification_history(request: Request):
+    """Searchable notification history with filters and keyset paging.
+
+    Query params:
+      q: search title or message (literal % and _ via ESCAPE)
+      source: repeatable, filter by source
+      level: repeatable, filter by level
+      since: epoch seconds, lower bound on timestamp
+      until: epoch seconds, upper bound on timestamp
+      state: all | unread | read | archived | active (default all)
+      before: opaque cursor "<timestamp>:<id>" for keyset paging (strictly older)
+      limit: page size 1..200 (default 50)
+    Returns: {"items": [...], "next_before": "<cursor>" or null}
+    """
+    user_id = _notif_user_id(request)
+    store = request.app.state.notifications
+
+    q = request.query_params.get("q")
+    sources = request.query_params.getlist("source")
+    levels = request.query_params.getlist("level")
+    since_raw = request.query_params.get("since")
+    until_raw = request.query_params.get("until")
+    state = request.query_params.get("state", "all")
+    before = request.query_params.get("before")
+    limit_raw = request.query_params.get("limit", "50")
+
+    try:
+        since = int(since_raw) if since_raw is not None else None
+        until = int(until_raw) if until_raw is not None else None
+        limit = int(limit_raw)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="invalid numeric parameter")
+
+    if state not in ("all", "unread", "read", "archived", "active"):
+        raise HTTPException(status_code=400, detail="invalid state")
+
+    if before is not None:
+        try:
+            before_ts, before_id = before.split(":", 1)
+            int(before_ts)
+            int(before_id)
+        except (ValueError, AttributeError):
+            raise HTTPException(status_code=400, detail="invalid cursor")
+
+    limit = max(1, min(limit, 200))
+
+    items = await store.search(
+        user_id=user_id,
+        q=q,
+        sources=sources if sources else None,
+        levels=levels if levels else None,
+        since=since,
+        until=until,
+        state=state,
+        before=before,
+        limit=limit,
+    )
+
+    next_before = None
+    if items and len(items) == limit:
+        last = items[-1]
+        next_before = f"{last['timestamp']}:{last['id']}"
+
+    return {"items": items, "next_before": next_before}
+
+
+@router.get("/api/notifications/history/sources")
+async def list_notification_history_sources(request: Request):
+    """Distinct notification sources visible to the calling user, sorted."""
+    user_id = _notif_user_id(request)
+    store = request.app.state.notifications
+    sources = await store.history_sources(user_id=user_id)
+    return {"sources": sources}
 
 
 @router.post("/api/notifications/{notif_id}/read")
 async def mark_read(request: Request, notif_id: int):
+    user_id = _notif_user_id(request)
     store = request.app.state.notifications
-    await store.mark_read(notif_id)
+    affected = await store.mark_read(notif_id, user_id=user_id)
+    if affected == 0:
+        raise HTTPException(status_code=404, detail="notification not found")
     return {"ok": True}
 
 
 @router.post("/api/notifications/{notif_id}/archive")
 async def archive_notification(request: Request, notif_id: int):
     """Dismiss a notification by archiving it; it stays in the History view."""
+    user_id = _notif_user_id(request)
     store = request.app.state.notifications
-    await store.archive(notif_id)
+
+    # Server-side guard: do not archive bells for still-pending requests.
+    # Load the row first to check its source and request_id.
+    row = await store.get(notif_id)
+    if row is not None:
+        # Verify the notification belongs to the calling user (or is a broadcast)
+        row_user_id = row.get("user_id")
+        if row_user_id is not None and row_user_id != user_id:
+            # Not the owner and not a broadcast: treat as not found
+            raise HTTPException(status_code=404, detail="notification not found")
+
+        source = row.get("source")
+        data = row.get("data") or {}
+        request_id = data.get("request_id")
+
+        if source == "agent_scope_requests" and request_id is not None:
+            scope_store = getattr(request.app.state, "agent_scope_requests", None)
+            if scope_store is not None:
+                req = await scope_store.get(str(request_id))
+                if req is not None and req.get("status") == "pending":
+                    # Request is still pending: mark read but do not archive.
+                    await store.mark_read(notif_id, user_id=user_id)
+                    return {"ok": True, "kept": "pending-request"}
+
+        elif source == "auth_requests" and request_id is not None:
+            auth_store = getattr(request.app.state, "auth_requests", None)
+            if auth_store is not None:
+                req = await auth_store.get(str(request_id))
+                if req is not None and req.get("status") == "pending":
+                    # Request is still pending: mark read but do not archive.
+                    await store.mark_read(notif_id, user_id=user_id)
+                    return {"ok": True, "kept": "pending-request"}
+
+    # Any other case: proceed with normal archive.
+    affected = await store.archive(notif_id, user_id=user_id)
+    if affected == 0:
+        raise HTTPException(status_code=404, detail="notification not found")
     return {"ok": True}
 
 
 @router.post("/api/notifications/read-all")
 async def mark_all_read(request: Request):
+    user_id = _notif_user_id(request)
     store = request.app.state.notifications
-    await store.mark_all_read()
-    return {"ok": True}
+    count = await store.mark_all_read(user_id=user_id)
+    return {"ok": True, "marked": count}
 
 
 @router.post("/api/notifications/mark-all-read")
 async def mark_all_read_counted(request: Request):
+    user_id = _notif_user_id(request)
     store = request.app.state.notifications
-    count = await store.mark_all_read()
+    count = await store.mark_all_read(user_id=user_id)
     return {"marked": count}
 
 

@@ -187,6 +187,52 @@ function loadReduceEffects(): boolean {
   }
 }
 
+// Per-device wallpaper fit preference: the right fit depends on the physical
+// screen's aspect ratio, so it must NOT be keyed to the user account. A stable
+// device id is minted once per browser profile and stored in localStorage;
+// the fit preference is then keyed on that id so switching devices never
+// overwrites another device's choice.
+const DEVICE_ID_KEY = "taos-wallpaper-device-id";
+function getDeviceId(): string {
+  let id = localStorage.getItem(DEVICE_ID_KEY);
+  if (!id) {
+    id = crypto.randomUUID();
+    localStorage.setItem(DEVICE_ID_KEY, id);
+  }
+  return id;
+}
+export const WALLPAPER_FIT_OPTIONS = ["fill", "fit", "stretch", "center", "tile"] as const;
+export type WallpaperFit = (typeof WALLPAPER_FIT_OPTIONS)[number];
+const WALLPAPER_FIT_KEY = "taos-wallpaper-fit:";
+function wallpaperFitKey(): string {
+  return WALLPAPER_FIT_KEY + getDeviceId();
+}
+export function loadWallpaperFit(): WallpaperFit {
+  try {
+    const raw = localStorage.getItem(wallpaperFitKey());
+    if (raw && WALLPAPER_FIT_OPTIONS.includes(raw as WallpaperFit)) return raw as WallpaperFit;
+  } catch {
+    // best-effort
+  }
+  return "fill";
+}
+
+// How the app-type indicator badge renders on app icons: a filled circular
+// chip ("badge"), a per-type outline ring ("outline"), or nothing ("off").
+// Persisted so a clean desktop survives a reload. Mirrors loadWallpaperFit.
+export const APP_TYPE_INDICATOR_OPTIONS = ["badge", "outline", "off"] as const;
+export type AppTypeIndicator = (typeof APP_TYPE_INDICATOR_OPTIONS)[number];
+const APP_TYPE_INDICATOR_KEY = "taos-app-type-indicator";
+export function loadAppTypeIndicator(): AppTypeIndicator {
+  try {
+    const raw = localStorage.getItem(APP_TYPE_INDICATOR_KEY);
+    if (raw && APP_TYPE_INDICATOR_OPTIONS.includes(raw as AppTypeIndicator)) return raw as AppTypeIndicator;
+  } catch {
+    // best-effort
+  }
+  return "badge";
+}
+
 interface ThemeStore {
   wallpaperId: string;
   wallpaperImage: string;
@@ -205,6 +251,8 @@ interface ThemeStore {
   wallpaperParams: WallpaperParams;
   showDesktopIcons: boolean;
   reduceEffects: boolean;
+  wallpaperFit: WallpaperFit;
+  appTypeIndicator: AppTypeIndicator;
   structure: Record<string, { variant?: string } & Record<string, unknown>>;
   effects: { module: string; params?: Record<string, unknown> }[];
 
@@ -220,13 +268,15 @@ interface ThemeStore {
   setWallpaper: (id: string) => void;
   toggleOverlayText: () => void;
   setWallpaperParam: (key: keyof WallpaperParams, value: number) => void;
+  setWallpaperFit: (fit: WallpaperFit) => void;
+  setAppTypeIndicator: (mode: AppTypeIndicator) => void;
   toggleDesktopIcons: () => void;
   setReduceEffects: (on: boolean) => void;
   getWallpapers: () => Wallpaper[];
   getWallpapersBySection: () => WallpaperSection[];
 }
 
-export const useThemeStore = create<ThemeStore>((set) => ({
+export const useThemeStore = create<ThemeStore>((set, get) => ({
   wallpaperId: DEFAULT_WP.id,
   wallpaperImage: DEFAULT_WP.image,
   wallpaperMobileImage: DEFAULT_WP.mobileImage ?? DEFAULT_WP.image,
@@ -242,6 +292,8 @@ export const useThemeStore = create<ThemeStore>((set) => ({
   wallpaperParams: loadWallpaperParams(),
   showDesktopIcons: true,
   reduceEffects: loadReduceEffects(),
+  wallpaperFit: loadWallpaperFit(),
+  appTypeIndicator: loadAppTypeIndicator(),
   structure: {},
   effects: [],
 
@@ -300,10 +352,28 @@ export const useThemeStore = create<ThemeStore>((set) => ({
     set({ reduceEffects: on });
   },
 
+  setWallpaperFit(fit) {
+    try {
+      localStorage.setItem(wallpaperFitKey(), fit);
+    } catch {
+      // best-effort
+    }
+    set({ wallpaperFit: fit });
+  },
+
+  setAppTypeIndicator(mode) {
+    try {
+      localStorage.setItem(APP_TYPE_INDICATOR_KEY, mode);
+    } catch {
+      // best-effort
+    }
+    set({ appTypeIndicator: mode });
+  },
+
   getWallpapers: () => WALLPAPERS,
 
   getWallpapersBySection: () => {
-    const state = useThemeStore.getState();
+    const state = get();
     // The theme's declared default wallpaper id, or the global fallback.
     const themeDefaultId =
       state.themeDefaultWallpaperId[state.activeThemeId] || "graphite";

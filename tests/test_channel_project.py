@@ -2,6 +2,7 @@ import pytest
 import pytest_asyncio
 
 from httpx import ASGITransport, AsyncClient
+from taos_test_csrf import csrf_event_hooks
 
 from tinyagentos.app import create_app
 
@@ -20,6 +21,10 @@ async def app(tmp_path):
     config_path.write_text(yaml.dump(config))
     (tmp_path / ".setup_complete").touch()
     _app = create_app(data_dir=tmp_path)
+    chat_messages = _app.state.chat_messages
+    if chat_messages._db is not None:
+        await chat_messages.close()
+    await chat_messages.init()
     chat_channels = _app.state.chat_channels
     if chat_channels._db is not None:
         await chat_channels.close()
@@ -40,6 +45,7 @@ async def client(app):
         transport=transport,
         base_url="http://test",
         cookies={"taos_session": _token},
+        event_hooks=csrf_event_hooks(),
     ) as c:
         yield c
 

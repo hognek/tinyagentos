@@ -5,6 +5,7 @@ import logging
 import os
 from typing import Any
 
+from tinyagentos.agent_loop import AgentLoop, LoopAction
 from tinyagentos.task_utils import _create_supervised_task
 
 logger = logging.getLogger(__name__)
@@ -34,10 +35,12 @@ class AgentChatRouter:
         # Holds in-flight ACP turn tasks so they aren't garbage-collected
         # before completing (asyncio keeps only weak refs to tasks).
         self._acp_tasks: set[asyncio.Task] = set()
-        # Per-agent lock so turns for the same agent run sequentially (a shared
-        # gateway session can't process two prompts at once) — concurrent
-        # across different agents. Preserves the bridge's queued-delivery order.
-        self._agent_locks: dict[str, asyncio.Lock] = {}
+        # Per-agent AgentLoop owns turn serialization: turns for the same
+        # agent run sequentially (a shared gateway session can't process two
+        # prompts at once) — concurrent across different agents. Messages
+        # arriving mid-turn are queued by the loop and driven by the current
+        # turn-holder at its safe point, preserving delivery order.
+        self._agent_loops: dict[str, AgentLoop] = {}
 
     async def close(self) -> None:
         # Cancel + drain any in-flight ACP turns so shutdown doesn't orphan them.
@@ -54,14 +57,74 @@ class AgentChatRouter:
     async def _run_acp_turn(
         self, agent_name: str, text: str, trace_id, record_reply,
     ) -> None:
-        """Drive one OpenClaw ACP turn under the agent's serialization lock."""
+        """Drive one OpenClaw ACP turn, serialized per agent by its AgentLoop."""
         from tinyagentos.openclaw_acp_runtime import drive_turn
 
-        lock = self._agent_locks.setdefault(agent_name, asyncio.Lock())
-        async with lock:
-            await drive_turn(
-                slug=agent_name, text=text, trace_id=trace_id, record_reply=record_reply,
-            )
+        chat_messages = self._state.chat_messages
+        chat_hub = self._state.chat_hub
+
+        loop = self._agent_loops.setdefault(agent_name, AgentLoop())
+        action = await loop.handle_message(text, msg_id=trace_id)
+        if action is LoopAction.QUEUED:
+            # Another turn is in flight for this agent; the current turn-holder
+            # drives this message at its safe point (drain below).
+            return
+
+        # Turn-holder: drive the turn, then iteratively (never recursively)
+        # drive every message queued while it ran. Each queued message keeps
+        # its own trace id.
+        pending: list[tuple[str, Any]] = [(text, trace_id)]
+        while pending:
+            cur_text, cur_trace = pending.pop(0)
+            # Stamp delivered for this trace_id right before driving the turn
+            if chat_messages:
+                try:
+                    msg = await chat_messages.get_message(cur_trace)
+                    if msg:
+                        receipt_row = await chat_messages.mark_delivered(cur_trace, agent_name)
+                        if receipt_row and chat_hub:
+                            channel_id = msg.get("channel_id")
+                            if channel_id:
+                                await chat_hub.broadcast(channel_id, {
+                                    "type": "receipt",
+                                    "seq": chat_hub.next_seq(),
+                                    "message_id": receipt_row["message_id"],
+                                    "agent_id": receipt_row["reader_id"],
+                                    "reader_type": receipt_row["reader_type"],
+                                    "delivered_at": receipt_row["delivered_at"],
+                                    "seen_at": receipt_row["seen_at"],
+                                })
+                except Exception:
+                    logger.exception("agent_chat_router: mark_delivered failed for %s", agent_name)
+            try:
+                await drive_turn(
+                    slug=agent_name, text=cur_text, trace_id=cur_trace,
+                    record_reply=record_reply,
+                )
+            except Exception as exc:  # noqa: BLE001
+                # Log like _route does: this task has no other supervisor, and
+                # a raise must not drop the messages queued behind the failed
+                # turn (they are still drained and driven below).
+                logger.warning(
+                    "acp turn for agent %s failed: %s",
+                    agent_name, exc, exc_info=True,
+                )
+            finally:
+                # MUST run even when drive_turn raises or the task is
+                # cancelled — skipping it would wedge the loop in WORKING
+                # forever and silence the agent.
+                queued = await loop.reach_safe_point()
+            for m in queued:
+                followup = await loop.handle_message(m.content, msg_id=m.id)
+                if followup is LoopAction.IMMEDIATE:
+                    pending.append((m.content, m.id))
+                # QUEUED here means this holder already restarted the turn
+                # with an earlier drained message (handle_message and the
+                # drain are atomic - the lock is never held across an await,
+                # so no other caller can interleave). The message sits in the
+                # loop's queue and this holder's next reach_safe_point
+                # re-drains it; WORKING always implies the current holder
+                # reaches another safe point.
 
     def dispatch(self, message: dict, channel: dict) -> None:
         """Fire-and-forget entry point. Runs routing in a supervised background task."""
@@ -173,6 +236,7 @@ class AgentChatRouter:
                     build_context_window,
                     history_token_budget,
                 )
+                from tinyagentos.chat.guest_agents import resolve_guest
                 from tinyagentos.cluster.model_resolver import _find_model_manifest
 
                 known_windows: list[int] = []
@@ -181,6 +245,9 @@ class AgentChatRouter:
                 for agent_name in recipients:
                     agent = find_agent(config, agent_name)
                     if agent is None:
+                        # A registry guest has no model: unknown window.
+                        if await resolve_guest(self._state, agent_name):
+                            any_unknown = True
                         continue
                     model_id = agent.get("model") or ""
                     if not model_id:
@@ -237,9 +304,14 @@ class AgentChatRouter:
                 if policy is not None and not policy.try_acquire(policy_key, agent_name, settings):
                     continue
             agent = find_agent(config, agent_name)
+            guest = None
             if agent is None:
-                continue
-            if agent.get("status") != "running":
+                from tinyagentos.chat.guest_agents import resolve_guest
+                guest = await resolve_guest(self._state, agent_name)
+                if guest is None:
+                    continue
+                agent = guest
+            if guest is None and agent.get("status") != "running":
                 await self._post_system_reply(
                     agent_name, channel["id"],
                     f"[router] agent '{agent_name}' is not running (status={agent.get('status') or 'unknown'}).",
@@ -252,7 +324,7 @@ class AgentChatRouter:
                 )
                 continue
 
-            if agent.get("framework") == "openclaw" and _openclaw_transport() == "acp":
+            if guest is None and agent.get("framework") == "openclaw" and _openclaw_transport() == "acp":
                 # Fork-free path: drive the OpenClaw turn over ACP instead of the
                 # legacy taos-bridge SSE. The agent's gateway session carries its
                 # own history + AGENTS.md, so we send the user message and stream

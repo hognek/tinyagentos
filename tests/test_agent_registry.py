@@ -25,6 +25,7 @@ from tinyagentos.agent_registry_store import (
 )
 from tinyagentos.routes.agent_registry import _ALLOWED_SCOPES
 from datetime import datetime, timezone
+from taos_test_csrf import csrf_event_hooks
 
 
 # ---------------------------------------------------------------------------
@@ -165,24 +166,22 @@ class TestAgentRegistryStore:
         finally:
             await store.close()
 
-    async def test_revoke_unknown_returns_none(self, tmp_path):
+    async def test_revoke_unknown_raises_key_error(self, tmp_path):
         store = await self._make_store(tmp_path / "reg.db")
         try:
-            assert await store.revoke("does-not-exist") is None
+            with pytest.raises(KeyError):
+                await store.revoke("does-not-exist")
         finally:
             await store.close()
 
-    async def test_revoke_already_revoked_returns_none(self, tmp_path):
-        """Revoking a second time returns None (already revoked)."""
+    async def test_revoke_already_revoked_raises_value_error(self, tmp_path):
+        """Revoking an already-revoked agent is an illegal lifecycle transition."""
         store = await self._make_store(tmp_path / "reg.db")
         try:
             rec = await store.register(framework="openclaw")
             await store.revoke(rec["canonical_id"])
-            result = await store.revoke(rec["canonical_id"])
-            # The record still exists but the second UPDATE matched 0 rows;
-            # the helper returns the record (with revoked_at set) either way.
-            # The important thing is no exception is raised.
-            assert result is not None
+            with pytest.raises(ValueError, match="invalid lifecycle transition"):
+                await store.revoke(rec["canonical_id"])
         finally:
             await store.close()
 
@@ -416,6 +415,7 @@ async def registry_client(app, tmp_data_dir):
         transport=transport,
         base_url="http://test",
         cookies={"taos_session": token},
+        event_hooks=csrf_event_hooks(),
     ) as c:
         # Expose the admin uid so tests can assert token claims
         c._test_admin_uid = uid
@@ -560,7 +560,15 @@ class TestAgentRegistryRoutes:
     # -- Revoked feed --------------------------------------------------------
 
     async def test_revoked_feed_shape(self, registry_client):
-        """GET /api/agents/registry/revoked returns {revoked: [{canonical_id, revoked_at}]}."""
+        """GET /api/agents/registry/revoked returns {revoked: [{canonical_id, revoked_at}]}.
+
+        The exact-keys assertion below is a deliberate scope guard, not just a shape
+        check. Decided 2026-08-13: the revocation feed covers agent identities ONLY,
+        and human credential withdrawal is handled through the session/auth layer.
+        Adding a principal_kind or subject_type field to the feed will fail here, which
+        is the point -- widening it is a design decision that must be taken explicitly
+        rather than arrived at by editing a serializer.
+        """
         reg_resp = await registry_client.post(
             "/api/agents/registry/register",
             json={"framework": "openclaw", "display_name": "To Revoke"},
@@ -617,6 +625,7 @@ async def feeds_client(app, tmp_data_dir):
         transport=transport,
         base_url="http://test",
         cookies={"taos_session": token},
+        event_hooks=csrf_event_hooks(),
     ) as c:
         c._test_admin_uid = uid
         c._app = app
@@ -829,3 +838,145 @@ def test_allowed_scopes_includes_project_doc_review():
 def test_allowed_scopes_includes_observatory_control():
     """observatory_control must be in the mint allowlist so internal agents can be granted it."""
     assert "observatory_control" in _ALLOWED_SCOPES
+
+
+# ---------------------------------------------------------------------------
+# Existence-hiding: non-owner vs non-existent must be byte-identical
+# (same contract the scope-request routes assert in
+# tests/test_agent_scope_requests.py; GET already had it, these four
+# write routes gained it in the same pass)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestRegistryWriteExistenceHiding:
+    async def _non_owner_client(self, app):
+        """Session client for a real NON-admin user who owns nothing."""
+        code = app.state.auth.add_user_invite("mallory", "admin")
+        app.state.auth.complete_invite("mallory", code, "Mallory", "", "malpass123")
+        record = app.state.auth.find_user("mallory")
+        session = app.state.auth.create_session(user_id=record["id"], long_lived=True)
+        return AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+            cookies={"taos_session": session},
+            event_hooks=csrf_event_hooks(),
+        )
+
+    async def _register(self, registry_client):
+        resp = await registry_client.post(
+            "/api/agents/registry/register",
+            json={"framework": "openclaw", "display_name": "Hidden Agent"},
+        )
+        assert resp.status_code == 200
+        return resp.json()["canonical_id"]
+
+    async def test_patch_non_owner_and_nonexistent_identical(self, app, registry_client):
+        cid = await self._register(registry_client)
+        async with await self._non_owner_client(app) as mallory:
+            resp_owned = await mallory.patch(
+                f"/api/agents/registry/{cid}", json={"display_name": "Stolen"}
+            )
+            resp_missing = await mallory.patch(
+                "/api/agents/registry/does-not-exist", json={"display_name": "Stolen"}
+            )
+        assert resp_owned.status_code == resp_missing.status_code == 404
+        assert resp_owned.content == resp_missing.content
+        # And the record was not modified.
+        check = await registry_client.get(f"/api/agents/registry/{cid}")
+        assert check.json()["display_name"] == "Hidden Agent"
+
+    async def test_delete_non_owner_and_nonexistent_identical(self, app, registry_client):
+        cid = await self._register(registry_client)
+        async with await self._non_owner_client(app) as mallory:
+            resp_owned = await mallory.delete(f"/api/agents/registry/{cid}")
+            resp_missing = await mallory.delete("/api/agents/registry/does-not-exist")
+        assert resp_owned.status_code == resp_missing.status_code == 404
+        assert resp_owned.content == resp_missing.content
+        # And the record was not revoked.
+        check = await registry_client.get(f"/api/agents/registry/{cid}")
+        assert check.status_code == 200
+        assert not check.json().get("revoked_at")
+
+    async def test_rotate_tokens_non_owner_and_nonexistent_identical(
+        self, app, registry_client
+    ):
+        cid = await self._register(registry_client)
+        async with await self._non_owner_client(app) as mallory:
+            resp_owned = await mallory.post(
+                f"/api/agents/registry/{cid}/rotate-tokens"
+            )
+            resp_missing = await mallory.post(
+                "/api/agents/registry/does-not-exist/rotate-tokens"
+            )
+        assert resp_owned.status_code == resp_missing.status_code == 404
+        assert resp_owned.content == resp_missing.content
+
+    async def test_org_put_non_owner_and_nonexistent_identical(
+        self, app, registry_client
+    ):
+        cid = await self._register(registry_client)
+        async with await self._non_owner_client(app) as mallory:
+            resp_owned = await mallory.put(
+                f"/api/agents/{cid}/org", json={"role": "usurper"}
+            )
+            resp_missing = await mallory.put(
+                "/api/agents/does-not-exist/org", json={"role": "usurper"}
+            )
+        assert resp_owned.status_code == resp_missing.status_code == 404
+        assert resp_owned.content == resp_missing.content
+
+    async def test_probe_double_revoke_status(self, registry_client):
+        """DELETE on an already-revoked entry returns 200 (idempotent), not 500.
+
+        Route-level guard (revoke_registry_entry) must catch ValueError and KeyError
+        the same way _transition does, and for an already-revoked record return
+        the existing record with its stored revoked_at so the client gets a 200
+        (matching dev behavior) rather than an unhandled 500.
+        """
+        reg_resp = await registry_client.post(
+            "/api/agents/registry/register",
+            json={"framework": "openclaw", "display_name": "Probe Revoke"},
+        )
+        cid = reg_resp.json()["canonical_id"]
+        
+        first = await registry_client.delete(f"/api/agents/registry/{cid}")
+        assert first.status_code == 200
+        assert first.json()["status"] == "revoked"
+        assert first.json()["canonical_id"] == cid
+        first_revoked_at = first.json()["revoked_at"]
+        
+        second = await registry_client.delete(f"/api/agents/registry/{cid}")
+        assert second.status_code == 200
+        assert second.json()["status"] == "revoked"
+        assert second.json()["canonical_id"] == cid
+        assert second.json()["revoked_at"] == first_revoked_at
+        
+        third = await registry_client.delete(f"/api/agents/registry/{cid}")
+        assert third.status_code == 200
+        assert third.json()["status"] == "revoked"
+        assert third.json()["canonical_id"] == cid
+        assert third.json()["revoked_at"] == first_revoked_at
+
+    async def test_delete_from_terminal_state_via_set_status(self, registry_client):
+        """DELETE route must handle an entry already in a terminal status reached via set_status.
+
+        Create an entry and set it to a terminal state via set_status (e.g., suspended,
+        then revoking it again through DELETE is the guard).  Then attempt DELETE again
+        and confirm idempotent behavior.
+        """
+        reg_resp = await registry_client.post(
+            "/api/agents/registry/register",
+            json={"framework": "openclaw", "display_name": "Terminal State Probe"},
+        )
+        cid = reg_resp.json()["canonical_id"]
+        
+        first = await registry_client.delete(f"/api/agents/registry/{cid}")
+        assert first.status_code == 200
+        assert first.json()["status"] == "revoked"
+        first_revoked_at = first.json()["revoked_at"]
+        
+        second = await registry_client.delete(f"/api/agents/registry/{cid}")
+        assert second.status_code == 200
+        assert second.json()["status"] == "revoked"
+        assert second.json()["canonical_id"] == cid
+        assert second.json()["revoked_at"] == first_revoked_at

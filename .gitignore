@@ -17,6 +17,7 @@ mac/launcher/.build/
 
 # User config — never commit (contains IPs, backend URLs, agent definitions)
 data/config.yaml
+data/demo_mode.json
 data/hardware.json
 data/installed.json
 data/.setup_complete
@@ -114,7 +115,6 @@ desktop/node_modules
 /package-lock.json
 /vitest.config.ts
 /vitest.config.js
-
 # Local-only operational playbook (contains LAN IP + ops detail; agents read it from the working tree)
 docs/AGENT_HANDOFF.md
 docs/audit/
@@ -131,6 +131,7 @@ data/pending-restart.json
 # Stray dev screenshot artifacts
 desktop-initial.png
 venv/
+data/hub/
 
 # Credential material must never be committable. An agent stored a registry
 # token at /opt/taos/secrets/ on 2026-07-27 - correct permissions, but inside the
@@ -152,6 +153,7 @@ data/.seeded-agent-tokens.json
 data/secrets.db*
 data/*.key
 data/*.token
+data/.litellm_master_key
 
 # Key material and secrets. Added 2026-07-27 after data/hub/identity.json was
 # committed to PR #2043 with signing_private and encryption_private in
@@ -176,3 +178,50 @@ identity.json
 # closes the shorter spelling, which is the one people actually type.
 # Verified against every tracked file on origin/dev: 0 become ignored.
 *creds*.json
+
+# Key material, third pass. Added 2026-08-26 after data/store_signing_key.json
+# - an Ed25519 PRIVATE KEY, auto-generated on first boot - was committed and
+# pushed on PR #2540. The 2026-07-27 patterns above all missed it by one
+# character: *.key matches a .key SUFFIX, not a _key.json stem; *_private.json
+# needs the literal word "private"; identity.json is a different filename. The
+# generator writes {"private_pem": ...} under a name none of them match.
+# Verified against every tracked file on origin/dev: 0 become ignored.
+*_key.json
+*_keypair.json
+
+# SQLite sidecars and per-install runtime state. Added 2026-08-26: 145 of these
+# rode into PR #2540 on a stray `git add`, which pushed the PR to 155 files -
+# past CodeRabbit's 100-file ceiling, so the bot review SILENTLY SKIPPED and
+# still reported a green check. Ignoring them removes the accident, and keeping
+# the PR small is what keeps the review real. Enumerated rather than a blanket
+# data/ rule, per the note above: a blanket rule trades a credential risk for a
+# data-loss-by-invisibility one.
+# Verified against every tracked file on origin/dev: 0 become ignored.
+data/*.db-shm
+data/*.db-wal
+data/*.sqlite3-shm
+data/*.sqlite3-wal
+data/apps/
+data/.install_id
+data/store_popularity.json
+
+# Registry signing-key lock sidecar. Added 2026-09-12: `data/*.pem` (above)
+# covers the key itself, but not the 0-byte `*.pem.lock` flock sidecar the
+# registry key writer creates beside it - so it rode into PR #2988 on a stray
+# `git add`, the same accident the note above describes. Enumerated, not a
+# blanket data/ rule, for the reason given there.
+# Verified against every tracked file on origin/dev: 0 become ignored.
+data/*.pem.lock
+
+# App install roots. Added 2026-10-09 after tsk-ujb6hp: the runtime path is
+# `data/apps/` (above), which is fully covered. But the DockerInstaller can be
+# pointed at an app_dir at the REPO ROOT (apps/...) - as a test run did - and
+# then `git add -A` swept a live 64-byte `.secret_key` into the branch as the
+# FIRST committed secret in the repo. The runtime rule does not reach that
+# path, so enumerate the generated artefacts the installer writes under an
+# app dir. Verified against every tracked file on origin/dev: 0 become
+# ignored (nothing is tracked under apps/ at all).
+apps/*/.secret_key
+apps/*/docker-compose.yaml
+apps/*/.env
+apps/*/.env.*

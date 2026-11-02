@@ -3,17 +3,17 @@
 # Runs once inside a fresh Debian bookworm LXC container.
 # Idempotent: safe to re-run on an already-provisioned container.
 #
-# Installs UPSTREAM OpenClaw from npm (openclaw@latest) — no fork. taOS drives
+# Installs UPSTREAM OpenClaw from npm (openclaw@0.2.0) — no fork. taOS drives
 # the agent over ACP (tinyagentos/openclaw_acp_runtime), so the legacy
 # taos-bridge channel is no longer installed/needed.
 set -euo pipefail
 
 # The pre-built taos-openclaw-base image warms Node + system deps + a recent
-# openclaw. We still always install openclaw@latest from npm (the base image's
+# openclaw. We still always install openclaw@0.2.0 from npm (the base image's
 # baked version may lag) and re-write per-deploy config/env + the systemd unit.
 # See tinyagentos/agent_image.py and .github/workflows/build-agent-images.yml.
 TAOS_BASE_IMAGE_PRESENT="${TAOS_BASE_IMAGE_PRESENT:-0}"
-echo "[openclaw] installing upstream OpenClaw (openclaw@latest from npm)"
+echo "[openclaw] installing upstream OpenClaw (openclaw@0.2.0 from npm)"
 
 # ---------------------------------------------------------------------------
 # 1. Node >= 22.19 via NodeSource (upstream OpenClaw's minimum; Debian default
@@ -36,8 +36,35 @@ _node_ok() {
   return 1
 }
 if ! _node_ok; then
-  echo "[openclaw] installing Node >=22.19 via NodeSource"
-  curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
+  echo "[openclaw] installing Node >=22.19 via NodeSource apt repo (direct)"
+  _fetch_and_verify() {
+    local url="$1"
+    local expected="$2"
+    local dest="$3"
+    if ! curl -fsSL -o "$dest" "$url"; then
+      echo "[openclaw] FATAL: failed to download $url" >&2
+      exit 1
+    fi
+    local actual
+    actual=$(sha256sum "$dest" | awk '{print $1}')
+    if [ "$actual" != "$expected" ]; then
+      echo "[openclaw] FATAL: hash mismatch for $url" >&2
+      echo "[openclaw] expected: $expected" >&2
+      echo "[openclaw] actual:   $actual" >&2
+      rm -f "$dest"
+      exit 1
+    fi
+  }
+  # Immutable NodeSource GPG key (measured 2026-09-06):
+  #   url: https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key
+  #   sha256sum: b42e0321dabdc24e892115da705cf061167eac12a317f23d329862d0aa0a271d
+  _fetch_and_verify "https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key" \
+    "b42e0321dabdc24e892115da705cf061167eac12a317f23d329862d0aa0a271d" \
+    /tmp/nodesource.gpg
+  gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg /tmp/nodesource.gpg
+  echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_22.x nodistro main" \
+    > /etc/apt/sources.list.d/nodesource.list
+  DEBIAN_FRONTEND=noninteractive apt-get update -qq
   DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends nodejs
 fi
 if ! command -v git >/dev/null 2>&1; then
@@ -55,9 +82,9 @@ fi
 # is needed.
 # ----------------------------------------------------------------------
 
-echo "[openclaw] installing openclaw@latest from npm (upstream)"
-if ! npm install -g --unsafe-perm openclaw@latest; then
-  echo "[openclaw] FATAL: 'npm install -g openclaw@latest' failed"
+echo "[openclaw] installing openclaw@0.2.0 from npm (upstream)"
+if ! npm install -g --unsafe-perm openclaw@0.2.0; then
+  echo "[openclaw] FATAL: 'npm install -g openclaw@0.2.0' failed"
   echo "[openclaw] check network connectivity to the npm registry from inside this container."
   exit 1
 fi

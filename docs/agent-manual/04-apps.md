@@ -6,7 +6,7 @@
 
 - **Messages**: the main chat. Talk to one agent (DM), several (group), or topic channels.
 - **Agents**: deploy or import agents (e.g. Hermes), configure, start, stop. Pick framework, model, and base images.
-- **Projects**: kanban boards and docs; agents can join a project's channel.
+- **Projects**: boards/docs; request access via auth-request.
 - **Files**: browse agent workspaces, user workspace, shared folders. Upload and download.
 - **Store**: one-click install of community apps. Each app gets its own container and a safe port.
 - **Models**: see and pull local models; pin cloud models.
@@ -17,4 +17,5 @@
 - **Activity**: live feed of everything agents do (tool calls, model calls, errors).
 - **Decisions**: your inbox for agent approvals and questions.
 - **Observatory**: watch the agent fleet; pause or throttle work lanes.
-- Other bundled apps (Library, Channels, Secrets, Tasks, Images, MCP, Guides and more); if you do not know one, guess from its name and point to Guides.
+- **Notifications**: the bell. Agents post to it with the `notifications_write` grant.
+- Other bundled apps (Library, Channels, Secrets, Routines, Images, MCP, Guides and more); if you do not know one, guess from its name and point to Guides.

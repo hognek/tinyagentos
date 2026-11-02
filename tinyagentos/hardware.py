@@ -84,10 +84,16 @@ class HardwareProfile:
     # what the VM has); these only contextualize it so users are not confused.
     wsl: bool = False
     mem_note: str = ""
+    # Device class: "mobile" for taOSmobile handsets, None otherwise.
+    # Set from config key "device.class: mobile" or detected via kiosk unit presence.
+    device_class: str | None = None
 
     @property
     def profile_id(self) -> str:
-        arch = "arm" if self.cpu.arch in ("aarch64", "armv7l") else "x86"
+        # "arm64" is what platform.machine() returns on macOS / Apple Silicon;
+        # without it an M1/M2 Mac was labelled x86 and missed the arm-* tiers.
+        # Matches the arch mapping in cluster/capabilities.py.
+        arch = "arm" if self.cpu.arch in ("aarch64", "armv7l", "arm64") else "x86"
         if self.npu.type != "none":
             accel = "npu"
         elif self.gpu.cuda:
@@ -100,6 +106,11 @@ class HardwareProfile:
             accel = "cpu"
         ram_gb = _snap_ram_to_canonical_gb(self.ram_mb)
         return f"{arch}-{accel}-{ram_gb}gb"
+
+    @property
+    def recommended_framework(self) -> str:
+        from tinyagentos.frameworks import recommended_framework
+        return recommended_framework(self.ram_mb, self.device_class)
 
     def save(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -120,6 +131,7 @@ class HardwareProfile:
             os=OsInfo(**data.get("os", {})),
             wsl=data.get("wsl", False),
             mem_note=data.get("mem_note", ""),
+            device_class=data.get("device_class"),
         )
 
 
@@ -196,6 +208,20 @@ def _detect_cpu() -> CpuInfo:
 
 
 def _detect_ram() -> int:
+    # macOS / Apple Silicon has no /proc/meminfo. hw.memsize reports total
+    # physical RAM in bytes, and unified memory means that is also the pool the
+    # GPU draws from. Without this branch ram_mb is 0 on a Mac, which collapses
+    # the RAM-derived profile tier and every capacity hint to "unknown".
+    if platform.system() == "Darwin":
+        try:
+            import subprocess
+            mem_bytes = int(subprocess.run(["sysctl", "-n", "hw.memsize"],
+                                           capture_output=True, text=True, timeout=5).stdout.strip())
+            total_mb = mem_bytes // (1024 * 1024)
+            if total_mb > 0:
+                return total_mb
+        except Exception:
+            pass
     try:
         meminfo = Path("/proc/meminfo").read_text()
         for line in meminfo.split("\n"):
@@ -460,6 +486,64 @@ def _amd_vram_for_model(model: str) -> int:
     return 0
 
 
+def _parse_rocminfo_gpu_model(info: str) -> str:
+    """Return the marketing name of the first GPU agent in ``rocminfo`` output.
+
+    ``rocminfo`` prints one block per HSA agent, the CPU agent first on most
+    systems, and ``Device Type`` comes after ``Marketing Name`` inside a
+    block. Reading the first ``Marketing Name`` therefore picks the CPU, so
+    each block is collected in full and the GPU block is selected before its
+    name is read.
+    """
+    blocks: list[dict[str, str]] = []
+    current: dict[str, str] = {}
+    for line in info.split("\n"):
+        stripped = line.strip()
+        if stripped.startswith("Agent ") and ":" not in stripped:
+            if current:
+                blocks.append(current)
+            current = {}
+            continue
+        low = stripped.lower()
+        if low.startswith("marketing name:"):
+            current["marketing"] = stripped.split(":", 1)[-1].strip()
+        elif low.startswith("device type:"):
+            current["device_type"] = stripped.split(":", 1)[-1].strip()
+        elif low.startswith("name:") and "gfx" in low:
+            current["gfx"] = stripped.split(":", 1)[-1].strip()
+    if current:
+        blocks.append(current)
+    for block in blocks:
+        if block.get("device_type", "").lower() == "gpu":
+            return block.get("marketing") or block.get("gfx", "")
+    # rocminfo builds without the Device Type field: a gfx name only ever
+    # appears on a GPU agent, so it is safe to fall back to one.
+    for block in blocks:
+        if block.get("gfx"):
+            return block.get("marketing") or block["gfx"]
+    return ""
+
+
+def _detect_amd_via_wsl() -> tuple[str, int]:
+    """Detect AMD GPU under WSL2 via /dev/dxg and rocminfo.
+
+    WSL2 exposes GPUs through the /dev/dxg paravirtualization device;
+    lspci shows nothing and /opt/rocm may not exist. rocminfo reports
+    the actual hardware. Returns (model_name, vram_mb), or ("", 0)
+    if no AMD GPU is found.
+    """
+    if not _detect_wsl():
+        return "", 0
+    if not Path("/dev/dxg").exists():
+        return "", 0
+    info = _run(["rocminfo"])
+    if not info or "amd" not in info.lower():
+        return "", 0
+    model = _parse_rocminfo_gpu_model(info)
+    vram_mb = _amd_vram_for_model(model) if model else 0
+    return model, vram_mb
+
+
 def _detect_gpu() -> GpuInfo:
     gpu = GpuInfo()
     # Apple Silicon — unified memory acts as VRAM, MLX-accelerated
@@ -520,34 +604,46 @@ def _detect_gpu() -> GpuInfo:
         gpu.vulkan = gpu.rocm
         gpu.vram_mb = _amd_vram_for_model(gpu.model)
     else:
-        # Check for integrated Mali (ARM) — multiple detection paths
-        mali_found = False
-        # Path 1: /sys/class/misc/mali0 (proprietary Mali driver)
-        if Path("/sys/class/misc/mali0").exists():
-            mali_found = True
-            # Try to get the specific Mali variant from device tree
-            compat_path = Path("/proc/device-tree/gpu@fb000000/compatible")
-            if compat_path.exists():
-                compat = compat_path.read_text(errors="replace").strip().strip("\x00")
-                # e.g. "arm,mali-bifrost" → "Mali-Bifrost"
-                if "mali" in compat.lower():
-                    variant = compat.split(",")[-1].replace("mali-", "Mali-").replace("mali", "Mali")
-                    gpu.type = "mali"
-                    gpu.model = f"{variant} (integrated)"
-            if not gpu.model:
-                gpu.type = "mali"
-                gpu.model = "Mali (integrated)"
-        # Path 2: /sys/class/drm/card*/device/driver contains mali or panfrost
-        if not mali_found:
-            drm_path = Path("/sys/class/drm")
-            if drm_path.exists():
-                for card in drm_path.glob("card*/device/driver"):
-                    driver = card.resolve().name if card.exists() else ""
-                    if "mali" in driver.lower() or "panfrost" in driver.lower():
+        # WSL2: lspci is empty but AMD GPU is visible via /dev/dxg +
+        # rocminfo (taOS #3228).
+        wsl_model, wsl_vram = _detect_amd_via_wsl()
+        if wsl_model:
+            gpu.type = "amd"
+            gpu.model = wsl_model
+            gpu.rocm = True
+            gpu.vram_mb = wsl_vram
+            # ROCm presence does not imply a working Vulkan driver under
+            # WSL2 (Vulkan needs a separate D3D12 driver), so gpu.vulkan is
+            # left to the independent capability check below.
+        # Check for integrated Mali (ARM) -- multiple detection paths
+        if not gpu.model:
+            mali_found = False
+            # Path 1: /sys/class/misc/mali0 (proprietary Mali driver)
+            if Path("/sys/class/misc/mali0").exists():
+                mali_found = True
+                # Try to get the specific Mali variant from device tree
+                compat_path = Path("/proc/device-tree/gpu@fb000000/compatible")
+                if compat_path.exists():
+                    compat = compat_path.read_text(errors="replace").strip().strip("\x00")
+                    # e.g. "arm,mali-bifrost" -> "Mali-Bifrost"
+                    if "mali" in compat.lower():
+                        variant = compat.split(",")[-1].replace("mali-", "Mali-").replace("mali", "Mali")
                         gpu.type = "mali"
-                        gpu.model = "Mali (integrated)"
-                        mali_found = True
-                        break
+                        gpu.model = f"{variant} (integrated)"
+                if not gpu.model:
+                    gpu.type = "mali"
+                    gpu.model = "Mali (integrated)"
+            # Path 2: /sys/class/drm/card*/device/driver contains mali or panfrost
+            if not mali_found:
+                drm_path = Path("/sys/class/drm")
+                if drm_path.exists():
+                    for card in drm_path.glob("card*/device/driver"):
+                        driver = card.resolve().name if card.exists() else ""
+                        if "mali" in driver.lower() or "panfrost" in driver.lower() or "panthor" in driver.lower():
+                            gpu.type = "mali"
+                            gpu.model = "Mali (integrated)"
+                            mali_found = True
+                            break
     # Check Vulkan availability
     if not gpu.vulkan and shutil.which("vulkaninfo"):
         result = _run(["vulkaninfo", "--summary"])
@@ -580,8 +676,23 @@ def _detect_disk() -> DiskInfo:
             if "nvme" in tran or "nvme" in name:
                 dtype = "nvme"
                 break
-            elif "mmc" in parts[0]:
-                dtype = "emmc" if "mmcblk" in parts[0] else "sd"
+            elif "mmc" in name:
+                # Distinguish eMMC vs microSD on mmcblk devices.
+                # eMMC exposes boot partitions (mmcblkXboot0, mmcblkXboot1) and
+                # an rpmb partition; microSD does not. Also check the device
+                # type attribute in sysfs (MMC vs SD).
+                dtype = "sd"
+                if _path_exists_safe(Path(f"/sys/block/{name}boot0")) or _path_exists_safe(Path(f"/sys/block/{name}boot1")) or _path_exists_safe(Path(f"/sys/block/{name}rpmb")):
+                    dtype = "emmc"
+                else:
+                    type_path = Path(f"/sys/block/{name}/device/type")
+                    if _path_exists_safe(type_path):
+                        try:
+                            dev_type = type_path.read_text().strip().upper()
+                            if dev_type == "MMC":
+                                dtype = "emmc"
+                        except OSError:
+                            pass
                 break
             elif rota == "0":
                 dtype = "ssd"
@@ -610,6 +721,37 @@ def _detect_os() -> OsInfo:
     return OsInfo(distro=distro, version=version, kernel=kernel)
 
 
+def _detect_device_class() -> str | None:
+    """Detect if this is a taOSmobile handset.
+
+    A taOSmobile handset is identified by the presence of BOTH the
+    taos-kiosk.service AND plasma-mobile.service systemd units. The kiosk unit
+    provides the taOS shell; the plasma unit is the stock KDE phone shell that
+    acts as the fallback. A desk runs the kiosk unit only and is NOT a handset.
+    """
+    try:
+        import subprocess
+        kiosk_result = subprocess.run(
+            ["systemctl", "cat", "taos-kiosk.service"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if kiosk_result.returncode != 0:
+            return None
+        plasma_result = subprocess.run(
+            ["systemctl", "cat", "plasma-mobile.service"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if plasma_result.returncode == 0:
+            return "mobile"
+    except (subprocess.SubprocessError, FileNotFoundError):
+        pass
+    return None
+
+
 def detect_hardware() -> HardwareProfile:
     """Detect all hardware and return a profile."""
     ram_mb = _detect_ram()
@@ -623,6 +765,7 @@ def detect_hardware() -> HardwareProfile:
             "memory= in C:\\Users\\<you>\\.wslconfig then run "
             "'wsl --shutdown'."
         )
+    device_class = _detect_device_class()
     return HardwareProfile(
         cpu=_detect_cpu(),
         ram_mb=ram_mb,
@@ -632,6 +775,7 @@ def detect_hardware() -> HardwareProfile:
         os=_detect_os(),
         wsl=wsl,
         mem_note=mem_note,
+        device_class=device_class,
     )
 
 

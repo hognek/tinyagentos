@@ -3,7 +3,7 @@ import json
 from pathlib import Path
 import pytest
 from unittest.mock import patch
-from tinyagentos.hardware import detect_hardware, get_hardware_profile, HardwareProfile
+from tinyagentos.hardware import detect_hardware, get_hardware_profile, HardwareProfile, CpuInfo
 from tinyagentos import hardware as hardware_mod
 from tinyagentos.hardware import _nvidia_vram_for_model, _amd_vram_for_model
 from tinyagentos.hardware import _soc_from_devicetree
@@ -33,7 +33,7 @@ class TestDetectHardware:
     def test_returns_hardware_profile(self):
         profile = detect_hardware()
         assert isinstance(profile, HardwareProfile)
-        assert profile.cpu.arch in ("aarch64", "x86_64", "armv7l")
+        assert profile.cpu.arch in ("aarch64", "arm64", "x86_64", "armv7l")
         assert profile.ram_mb > 0
         assert profile.disk.total_gb > 0
 
@@ -45,13 +45,105 @@ class TestDetectHardware:
         assert len(parts) >= 3
         assert parts[-1].endswith("gb")
 
+    def test_profile_id_treats_arm64_as_arm(self):
+        # macOS reports platform.machine() == "arm64". It must land in the arm-*
+        # tier; an M1 Mac previously produced "x86-cpu-8gb" and missed the
+        # arm-cpu-* catalog entries.
+        profile = HardwareProfile(cpu=CpuInfo(arch="arm64"), ram_mb=8192)
+        assert profile.profile_id.startswith("arm-")
+
+    def test_detect_ram_reads_hw_memsize_on_darwin(self, monkeypatch):
+        # macOS has no /proc/meminfo; total RAM comes from hw.memsize in bytes.
+        monkeypatch.setattr(hardware_mod.platform, "system", lambda: "Darwin")
+
+        class _Completed:
+            stdout = "17179869184\n"  # 16 GiB, in bytes
+
+        monkeypatch.setattr("subprocess.run", lambda *a, **k: _Completed())
+        assert hardware_mod._detect_ram() == 16384
+
+    def test_detect_ram_blank_memsize_does_not_raise(self, monkeypatch):
+        # A blank hw.memsize must not raise or return a bogus value: the probe
+        # falls through to the /proc path (absent on macOS -> 0; present on
+        # Linux -> the real figure). Either way the result must be a sane int.
+        monkeypatch.setattr(hardware_mod.platform, "system", lambda: "Darwin")
+
+        class _Completed:
+            stdout = "\n"
+
+        monkeypatch.setattr("subprocess.run", lambda *a, **k: _Completed())
+        result = hardware_mod._detect_ram()
+        assert isinstance(result, int)
+        assert result >= 0
+
     def test_npu_detection_returns_type(self):
         profile = detect_hardware()
         assert profile.npu.type in ("rknpu", "hailo", "coral", "qualcomm", "none")
 
     def test_gpu_detection_returns_type(self):
         profile = detect_hardware()
-        assert profile.gpu.type in ("nvidia", "amd", "mali", "intel", "none")
+        assert profile.gpu.type in ("nvidia", "amd", "mali", "intel", "apple", "none")
+
+    def test_gpu_panthor_driver_no_mali0(self, monkeypatch):
+        # Test that panthor driver is detected in path 2 even without /sys/class/misc/mali0
+        # Simulates the mainline panthor GPU driver scenario
+        # Mirror the _stub_environment mocking style from TestDetectNpuRknpuModernPaths
+
+        # panthor is a Linux DRM driver, so pin the platform to Linux. On a
+        # Darwin host _detect_gpu returns the Apple Silicon GPU before it ever
+        # reaches the DRM scan, and this simulated /sys tree would be ignored.
+        monkeypatch.setattr(hardware_mod.platform, "system", lambda: "Linux")
+
+        # Stub Path.exists: mali0 absent, /sys/class/drm present, card1/device/driver
+        # present; all else falls through to real Path.exists
+        real_path_exists = Path.exists
+        def fake_path_exists(self):
+            s = str(self)
+            if s == "/sys/class/misc/mali0":
+                return False  # mali0 absent (panthor scenario)
+            if s == "/sys/class/drm":
+                return True  # drm directory exists (panthor scenario)
+            if "card1/device/driver" in s:
+                return True  # test card driver exists (panthor scenario)
+            return real_path_exists(self)
+        monkeypatch.setattr(Path, "exists", fake_path_exists)
+
+        # Single _path_exists_safe that blocks NVIDIA probe
+        real_safe = hardware_mod._path_exists_safe
+        def fake_path_exists_safe(p):
+            s = str(p)
+            if "/proc/driver/nvidia/gpus" in s or s == "/proc/driver/nvidia":
+                return False  # block NVIDIA probe
+            return real_safe(p)
+        monkeypatch.setattr(hardware_mod, "_path_exists_safe", fake_path_exists_safe)
+
+        real_glob = Path.glob
+        def fake_glob(self, pattern):
+            if str(self) == "/sys/class/drm" and pattern == "card*/device/driver":
+                return [Path("/sys/class/drm/card1/device/driver")]
+            return real_glob(self, pattern)
+        monkeypatch.setattr(Path, "glob", fake_glob)
+
+        real_resolve = Path.resolve
+        driver_targets = {
+            "/sys/class/drm/card1/device/driver": "panthor",
+        }
+        def fake_resolve(self, *args, **kwargs):
+            key = str(self)
+            if key in driver_targets:
+                # Return path whose .name is the driver name
+                return Path(f"/sys/bus/platform/drivers/{driver_targets[key]}")
+            return real_resolve(self, *args, **kwargs)
+        monkeypatch.setattr(Path, "resolve", fake_resolve)
+
+        # Mock _run to prevent lspci NVIDIA/AMD detection
+        real_run = hardware_mod._run
+        def fake_run(*a, **k):
+            return ""
+        monkeypatch.setattr(hardware_mod, "_run", fake_run)
+
+        profile = detect_hardware()
+        assert profile.gpu.type == "mali"
 
     def test_save_and_load(self, tmp_path):
         profile = detect_hardware()
@@ -283,3 +375,243 @@ class TestWslDetection:
         assert "8GB" in prof.mem_note
         # ram_mb itself is left untouched (8GB really is what the VM has)
         assert prof.ram_mb == 8192
+
+
+class TestDiskTypeDetection:
+    """Test _detect_disk correctly distinguishes eMMC vs microSD on mmcblk."""
+
+    def test_mmcblk_with_boot_partitions_is_emmc(self, monkeypatch, tmp_path):
+        """mmcblk with boot0/rpmb partitions -> eMMC."""
+        monkeypatch.setattr(
+            "tinyagentos.hardware._run",
+            lambda *a, **k: "mmcblk0 1 mmc\n" if "lsblk" in a[0] else "",
+        )
+        real_exists = Path.exists
+        seen_paths = []
+        def fake_exists(self):
+            s = str(self)
+            seen_paths.append(s)
+            if s.endswith("/sys/block/mmcblk0boot0") or s.endswith("/sys/block/mmcblk0boot1") or s.endswith("/sys/block/mmcblk0rpmb"):
+                return True
+            if s.endswith("/sys/block/mmcblk0"):
+                return True
+            return real_exists(self)
+        monkeypatch.setattr(Path, "exists", fake_exists)
+        import shutil as sh
+        real_disk_usage = sh.disk_usage
+        def fake_disk_usage(path):
+            class DU:
+                total = 32 * (1024**3)
+                free = 16 * (1024**3)
+            return DU()
+        monkeypatch.setattr(sh, "disk_usage", fake_disk_usage)
+
+        disk = hardware_mod._detect_disk()
+        assert disk.type == "emmc"
+        for p in seen_paths:
+            assert not p.endswith("mmcblkboot0"), f"Wrong path queried: {p}"
+
+    def test_mmcblk_without_boot_partitions_is_sd(self, monkeypatch, tmp_path):
+        """mmcblk without boot partitions -> sd (microSD)."""
+        monkeypatch.setattr(
+            "tinyagentos.hardware._run",
+            lambda *a, **k: "mmcblk0 1 mmc\n" if "lsblk" in a[0] else "",
+        )
+        real_exists = Path.exists
+        seen_paths = []
+        def fake_exists(self):
+            s = str(self)
+            seen_paths.append(s)
+            if s.endswith("/sys/block/mmcblk0boot0") or s.endswith("/sys/block/mmcblk0boot1") or s.endswith("/sys/block/mmcblk0rpmb"):
+                return False
+            if s.endswith("/sys/block/mmcblk0"):
+                return True
+            if s.endswith("/sys/block/mmcblk0/device/type"):
+                return True
+            return real_exists(self)
+        monkeypatch.setattr(Path, "exists", fake_exists)
+        real_read_text = Path.read_text
+        def fake_read_text(self, *args, **kwargs):
+            if str(self) == "/sys/block/mmcblk0/device/type":
+                return "SD\n"
+            return real_read_text(self, *args, **kwargs)
+        monkeypatch.setattr(Path, "read_text", fake_read_text)
+
+        import shutil as sh
+        real_disk_usage = sh.disk_usage
+        def fake_disk_usage(path):
+            class DU:
+                total = 32 * (1024**3)
+                free = 16 * (1024**3)
+            return DU()
+        monkeypatch.setattr(sh, "disk_usage", fake_disk_usage)
+
+        disk = hardware_mod._detect_disk()
+        assert disk.type == "sd"
+        for p in seen_paths:
+            assert not p.endswith("mmcblkboot0"), f"Wrong path queried: {p}"
+
+    def test_mmcblk_sysfs_type_mmc_is_emmc(self, monkeypatch):
+        """mmcblk with sysfs type=MMC -> emmc (fallback when no boot partitions)."""
+        monkeypatch.setattr(
+            "tinyagentos.hardware._run",
+            lambda *a, **k: "mmcblk0 1 mmc\n" if "lsblk" in a[0] else "",
+        )
+        real_exists = Path.exists
+        def fake_exists(self):
+            s = str(self)
+            if "boot0" in s or "rpmb" in s:
+                return False
+            if s.endswith("/sys/block/mmcblk0"):
+                return True
+            if s.endswith("/sys/block/mmcblk0/device/type"):
+                return True
+            return real_exists(self)
+        monkeypatch.setattr(Path, "exists", fake_exists)
+        real_read_text = Path.read_text
+        def fake_read_text(self, *args, **kwargs):
+            if str(self) == "/sys/block/mmcblk0/device/type":
+                return "MMC\n"
+            return real_read_text(self, *args, **kwargs)
+        monkeypatch.setattr(Path, "read_text", fake_read_text)
+
+        import shutil as sh
+        def fake_disk_usage(path):
+            class DU:
+                total = 32 * (1024**3)
+                free = 16 * (1024**3)
+            return DU()
+        monkeypatch.setattr(sh, "disk_usage", fake_disk_usage)
+
+        disk = hardware_mod._detect_disk()
+        assert disk.type == "emmc"
+
+    def test_mmcblk_probe_permission_denied_falls_back_to_sd(self, monkeypatch):
+        """PermissionError on /sys/block/mmcblk0* probes falls back to sd."""
+        monkeypatch.setattr(
+            "tinyagentos.hardware._run",
+            lambda *a, **k: "mmcblk0 1 mmc\n" if "lsblk" in a[0] else "",
+        )
+        real_exists = Path.exists
+        def fake_exists(self):
+            s = str(self)
+            if s.startswith("/sys/block/mmcblk0"):
+                raise PermissionError(f"[Errno 13] Permission denied: '{s}'")
+            return real_exists(self)
+        monkeypatch.setattr(Path, "exists", fake_exists)
+
+        import shutil as sh
+        def fake_disk_usage(path):
+            class DU:
+                total = 32 * (1024**3)
+                free = 16 * (1024**3)
+            return DU()
+        monkeypatch.setattr(sh, "disk_usage", fake_disk_usage)
+
+        disk = hardware_mod._detect_disk()
+        assert disk.type == "sd"
+
+
+class TestRecommendedFrameworkProperty:
+    def test_low_ram_returns_picoclaw(self):
+        profile = HardwareProfile(ram_mb=4096)
+        assert profile.recommended_framework == "picoclaw"
+
+    def test_snapped_8gb_returns_picoclaw(self):
+        profile = HardwareProfile(ram_mb=7800)
+        assert profile.recommended_framework == "picoclaw"
+
+    def test_high_ram_returns_default(self):
+        profile = HardwareProfile(ram_mb=16384)
+        assert profile.recommended_framework == "hermes"
+
+    def test_mobile_device_class_returns_picoclaw_even_with_high_ram(self):
+        profile = HardwareProfile(ram_mb=16384, device_class="mobile")
+        assert profile.recommended_framework == "picoclaw"
+
+    def test_none_device_class_with_high_ram_returns_default(self):
+        profile = HardwareProfile(ram_mb=16384, device_class=None)
+        assert profile.recommended_framework == "hermes"
+
+    def test_unknown_device_class_with_high_ram_returns_default(self):
+        profile = HardwareProfile(ram_mb=16384, device_class="desktop")
+        assert profile.recommended_framework == "hermes"
+
+    def test_unknown_device_class_with_low_ram_returns_picoclaw(self):
+        profile = HardwareProfile(ram_mb=4096, device_class="desktop")
+        assert profile.recommended_framework == "picoclaw"
+
+
+class TestWsl2AmdDetection:
+    """WSL2 exposes AMD GPUs via /dev/dxg + rocminfo (taOS #3228)."""
+
+    def test_detects_amd_via_rocminfo(self, monkeypatch):
+        import tinyagentos.hardware as hw
+        monkeypatch.setattr(hw, "_detect_wsl", lambda: True)
+        monkeypatch.setattr(hw.Path, "exists", lambda self: str(self) == "/dev/dxg")
+        rocminfo_out = (
+            "ROCkets\n"
+            "  Name:                    gfx1100\n"
+            "  Marketing Name:          AMD Radeon RX 7900 XTX\n"
+            "  Vendor Name:             AMD\n"
+        )
+        monkeypatch.setattr(hw, "_run", lambda cmd: rocminfo_out if cmd == ["rocminfo"] else "")
+        model, vram = hw._detect_amd_via_wsl()
+        assert model == "AMD Radeon RX 7900 XTX"
+        assert vram > 0  # RX 7900 XTX is in the VRAM table
+
+    def test_selects_gpu_agent_when_cpu_agent_comes_first(self, monkeypatch):
+        import tinyagentos.hardware as hw
+        monkeypatch.setattr(hw, "_detect_wsl", lambda: True)
+        monkeypatch.setattr(hw.Path, "exists", lambda self: str(self) == "/dev/dxg")
+        rocminfo_out = (
+            "=====================\n"
+            "HSA Agents\n"
+            "=====================\n"
+            "Agent 1\n"
+            "---------------------\n"
+            "  Name:                    AMD Ryzen 9 7950X 16-Core Processor\n"
+            "  Marketing Name:          AMD Ryzen 9 7950X 16-Core Processor\n"
+            "  Vendor Name:             CPU\n"
+            "  Device Type:             CPU\n"
+            "\n"
+            "Agent 2\n"
+            "---------------------\n"
+            "  Name:                    gfx1100\n"
+            "  Marketing Name:          AMD Radeon RX 7900 XTX\n"
+            "  Vendor Name:             AMD\n"
+            "  Device Type:             GPU\n"
+        )
+        monkeypatch.setattr(hw, "_run", lambda cmd: rocminfo_out if cmd == ["rocminfo"] else "")
+        model, vram = hw._detect_amd_via_wsl()
+        assert model == "AMD Radeon RX 7900 XTX"
+        assert vram == 24576
+
+    def test_wsl_rocm_does_not_imply_vulkan(self, monkeypatch):
+        import tinyagentos.hardware as hw
+        monkeypatch.setattr(hw.platform, "system", lambda: "Linux")
+        monkeypatch.setattr(hw, "_detect_nvidia_via_proc", lambda: ("", False))
+        monkeypatch.setattr(hw, "_detect_amd_via_wsl",
+                            lambda: ("AMD Radeon RX 7900 XTX", 24576))
+        monkeypatch.setattr(hw, "_run", lambda cmd: "")
+        monkeypatch.setattr(hw.Path, "exists", lambda self: False)
+        monkeypatch.setattr(hw.shutil, "which", lambda name: None)
+        gpu = hw._detect_gpu()
+        assert gpu.type == "amd"
+        assert gpu.rocm is True
+        assert gpu.vulkan is False
+
+    def test_returns_empty_when_not_wsl(self, monkeypatch):
+        import tinyagentos.hardware as hw
+        monkeypatch.setattr(hw, "_detect_wsl", lambda: False)
+        model, vram = hw._detect_amd_via_wsl()
+        assert model == ""
+        assert vram == 0
+
+    def test_returns_empty_when_no_dxg(self, monkeypatch):
+        import tinyagentos.hardware as hw
+        monkeypatch.setattr(hw, "_detect_wsl", lambda: True)
+        monkeypatch.setattr(hw.Path, "exists", lambda self: False)
+        model, vram = hw._detect_amd_via_wsl()
+        assert model == ""
+        assert vram == 0

@@ -1,5 +1,14 @@
 import type { ComponentType } from "react";
 
+/**
+ * The kind of engine an app runs on. Powers the app-type indicator badge: a
+ * taOS app needs no badge (it IS the platform), while a Linux/Android/web/
+ * container/agent app gets a small corner chip so the user sees at a glance
+ * what is running under the hood. Built-in manifests omit this and default to
+ * "taos" (see appRuntime).
+ */
+export type AppRuntime = "taos" | "linux" | "android" | "web" | "container" | "agent";
+
 export interface AppManifest {
   id: string;
   name: string;
@@ -25,11 +34,13 @@ export interface AppManifest {
    */
   pwa?: boolean;
   /**
-   * Launcher tiering (issue #2143). Controls which apps the desktop launcher
-   * (launchpad, search) surfaces:
+   * Launcher tiering (issue #2143). Controls which apps the desktop launchpad
+   * (the default surface) surfaces, distinct from the searchable selection.
+   * The search palette uses a separate predicate (see `getSearchableApps`):
+   * default-surface apps plus installed optional apps plus tier-3 apps.
    *   1 - always shown (default for apps without an explicit tier)
    *   2 - shown, grouped under `group` (e.g. "System")
-   *   3 - hidden from launcher (lives in Settings)
+   *   3 - hidden from launcher (lives in Settings) but searchable
    *   4 - file handler (hidden from launcher, openable by id)
    *   5 - Store-optional, off by default
    */
@@ -39,9 +50,15 @@ export interface AppManifest {
   /** If true, the app is a file handler: hidden from the launcher but still
    *  openable by id (agents open them directly). */
   handler?: boolean;
+  /**
+   * The engine the app runs on. Omit to default to "taos" (built-in apps are
+   * taOS-native); set explicitly for userspace apps (see appRuntime) and for
+   * any third-party manifest that wants a non-taos badge.
+   */
+  runtime?: AppRuntime;
 }
 
-const apps: AppManifest[] = [
+export const apps: AppManifest[] = [
   // Platform apps
   { id: "messages", name: "Messages", icon: "message-circle", category: "platform", component: () => import("@/apps/MessagesApp").then((m) => ({ default: m.MessagesApp })), defaultSize: { w: 900, h: 600 }, minSize: { w: 400, h: 300 }, singleton: true, pinned: true, launchpadOrder: 1, pwa: true },
   { id: "mail", name: "Mail", icon: "mail", category: "platform", component: () => import("@/apps/MailApp").then((m) => ({ default: m.MailApp })), defaultSize: { w: 1200, h: 800 }, minSize: { w: 720, h: 480 }, singleton: true, pinned: true, launchpadOrder: 1.25 },
@@ -51,6 +68,7 @@ const apps: AppManifest[] = [
   { id: "store", name: "Store", icon: "shopping-bag", category: "platform", component: () => import("@/apps/StoreApp").then((m) => ({ default: m.StoreApp })), defaultSize: { w: 1000, h: 700 }, minSize: { w: 600, h: 400 }, singleton: true, pinned: true, launchpadOrder: 4 },
   { id: "guides", name: "Guides", icon: "book-open", category: "platform", component: () => import("@/apps/GuidesApp").then((m) => ({ default: m.GuidesApp })), defaultSize: { w: 900, h: 650 }, minSize: { w: 500, h: 400 }, singleton: true, pinned: false, launchpadOrder: 4.25 },
   { id: "settings", name: "Settings", icon: "settings", category: "platform", component: () => import("@/apps/SettingsApp").then((m) => ({ default: m.SettingsApp })), defaultSize: { w: 800, h: 550 }, minSize: { w: 500, h: 400 }, singleton: true, pinned: true, launchpadOrder: 5 },
+  { id: "notifications", name: "Notifications", icon: "bell", category: "platform", component: () => import("@/apps/NotificationsApp").then((m) => ({ default: m.NotificationsApp })), defaultSize: { w: 900, h: 600 }, minSize: { w: 500, h: 400 }, singleton: true, pinned: true, launchpadOrder: 5.5 },
   { id: "models", name: "Models", icon: "brain", category: "platform", component: () => import("@/apps/ModelsApp").then((m) => ({ default: m.ModelsApp })), defaultSize: { w: 900, h: 600 }, minSize: { w: 500, h: 400 }, singleton: true, pinned: false, launchpadOrder: 6, tier: 2, group: "System" },
   { id: "providers", name: "Providers", icon: "cloud", category: "platform", component: () => import("@/apps/ProvidersApp").then((m) => ({ default: m.ProvidersApp })), defaultSize: { w: 950, h: 640 }, minSize: { w: 600, h: 400 }, singleton: true, pinned: false, launchpadOrder: 6.5, tier: 3 },
   { id: "dashboard", name: "Activity", icon: "activity", category: "platform", component: () => import("@/apps/ActivityApp").then((m) => ({ default: m.ActivityApp })), defaultSize: { w: 1100, h: 720 }, minSize: { w: 600, h: 400 }, singleton: true, pinned: false, launchpadOrder: 7 },
@@ -60,8 +78,7 @@ const apps: AppManifest[] = [
   { id: "taos-agent", name: "taOS Agent", icon: "bot", category: "platform", component: () => import("@/apps/TaosAssistantWindow").then((m) => ({ default: m.TaosAssistantWindow })), defaultSize: { w: 420, h: 640 }, minSize: { w: 320, h: 420 }, singleton: false, pinned: false, launchpadOrder: 8.5 },
   { id: "channels", name: "Channels", icon: "radio", category: "platform", component: () => import("@/apps/ChannelsApp").then((m) => ({ default: m.ChannelsApp })), defaultSize: { w: 800, h: 500 }, minSize: { w: 450, h: 350 }, singleton: true, pinned: false, launchpadOrder: 9, tier: 3 },
   { id: "secrets", name: "Secrets", icon: "key-round", category: "platform", component: () => import("@/apps/SecretsApp").then((m) => ({ default: m.SecretsApp })), defaultSize: { w: 750, h: 500 }, minSize: { w: 400, h: 300 }, singleton: true, pinned: false, launchpadOrder: 10, tier: 2, group: "System" },
-  { id: "tasks", name: "Tasks", icon: "calendar-clock", category: "platform", component: () => import("@/apps/TasksApp").then((m) => ({ default: m.TasksApp })), defaultSize: { w: 800, h: 500 }, minSize: { w: 450, h: 350 }, singleton: true, pinned: false, launchpadOrder: 11 },
-  { id: "import", name: "Import", icon: "upload", category: "platform", component: () => import("@/apps/ImportApp").then((m) => ({ default: m.ImportApp })), defaultSize: { w: 700, h: 450 }, minSize: { w: 400, h: 300 }, singleton: true, pinned: false, launchpadOrder: 12 },
+  { id: "tasks", name: "Routines", icon: "calendar-clock", category: "platform", component: () => import("@/apps/TasksApp").then((m) => ({ default: m.TasksApp })), defaultSize: { w: 800, h: 500 }, minSize: { w: 450, h: 350 }, singleton: true, pinned: false, launchpadOrder: 11 },
   { id: "images", name: "Images", icon: "image", category: "platform", component: () => import("@/apps/ImagesApp").then((m) => ({ default: m.ImagesApp })), defaultSize: { w: 900, h: 600 }, minSize: { w: 500, h: 400 }, singleton: true, pinned: false, launchpadOrder: 13 },
   { id: "coding-studio", name: "Coding Studio", icon: "code-2", category: "studio", component: () => import("@/apps/CodingStudioApp").then((m) => ({ default: m.CodingStudioApp })), defaultSize: { w: 1080, h: 760 }, minSize: { w: 680, h: 540 }, singleton: true, pinned: false, launchpadOrder: 13.25, optional: true, tier: 5 },
   { id: "design-studio", name: "Design Studio", icon: "palette", category: "studio", component: () => import("@/apps/DesignStudioApp").then((m) => ({ default: m.DesignStudioApp })), defaultSize: { w: 1080, h: 720 }, minSize: { w: 680, h: 520 }, singleton: true, pinned: false, launchpadOrder: 13.26, optional: true, tier: 5 },
@@ -71,6 +88,7 @@ const apps: AppManifest[] = [
   { id: "web-studio", name: "Web Studio", icon: "layout-template", category: "studio", component: () => import("@/apps/WebStudioApp").then((m) => ({ default: m.WebStudioApp })), defaultSize: { w: 1120, h: 760 }, minSize: { w: 720, h: 540 }, singleton: true, pinned: false, launchpadOrder: 13.3, optional: true },
   { id: "video-studio", name: "Video Studio", icon: "clapperboard", category: "studio", component: () => import("@/apps/VideoStudioApp").then((m) => ({ default: m.VideoStudioApp })), defaultSize: { w: 1080, h: 720 }, minSize: { w: 680, h: 520 }, singleton: true, pinned: false, launchpadOrder: 13.31, optional: true },
   { id: "assistant-studio", name: "Assistant Studio", icon: "user-round", category: "studio", component: () => import("@/apps/AssistantStudioApp").then((m) => ({ default: m.AssistantStudioApp })), defaultSize: { w: 1080, h: 720 }, minSize: { w: 640, h: 480 }, singleton: true, pinned: false, launchpadOrder: 13.32, optional: true },
+  { id: "lora-studio", name: "LoRA Studio", icon: "layers", category: "studio", component: () => import("@/apps/LoRAStudioApp").then((m) => ({ default: m.LoRAStudioApp })), defaultSize: { w: 1080, h: 720 }, minSize: { w: 680, h: 480 }, singleton: true, pinned: false, launchpadOrder: 13.33 },
   { id: "library", name: "Library", icon: "book-open", category: "platform", component: () => import("@/apps/LibraryApp").then((m) => ({ default: m.LibraryApp })), defaultSize: { w: 1000, h: 650 }, minSize: { w: 550, h: 400 }, singleton: true, pinned: true, launchpadOrder: 13.5 },
   { id: "reddit", name: "Reddit", icon: "scroll-text", category: "platform", component: () => import("@/apps/RedditApp").then((m) => ({ default: m.RedditApp })), defaultSize: { w: 1000, h: 650 }, minSize: { w: 550, h: 400 }, singleton: true, pinned: false, launchpadOrder: 14, optional: true },
   { id: "youtube-library", name: "YouTube", icon: "play-circle", category: "platform", component: () => import("@/apps/YouTubeApp").then((m) => ({ default: m.YouTubeApp })), defaultSize: { w: 1050, h: 700 }, minSize: { w: 600, h: 450 }, singleton: true, pinned: false, launchpadOrder: 14.5, optional: true },
@@ -79,7 +97,7 @@ const apps: AppManifest[] = [
   { id: "agent-browsers", name: "Browsers", icon: "globe", category: "platform", component: () => import("@/apps/AgentBrowsersApp").then((m) => ({ default: m.AgentBrowsersApp })), defaultSize: { w: 1000, h: 650 }, minSize: { w: 550, h: 400 }, singleton: true, pinned: false, launchpadOrder: 16 },
   { id: "feedback", name: "Feedback", icon: "flag", category: "platform", component: () => import("@/apps/FeedbackApp").then((m) => ({ default: m.FeedbackApp })), defaultSize: { w: 700, h: 560 }, minSize: { w: 420, h: 400 }, singleton: true, pinned: false, launchpadOrder: 16.5 },
   { id: "decisions", name: "Decisions", icon: "inbox", category: "platform", component: () => import("@/apps/DecisionsApp").then((m) => ({ default: m.DecisionsApp })), defaultSize: { w: 640, h: 620 }, minSize: { w: 420, h: 400 }, singleton: true, pinned: false, launchpadOrder: 16.6 },
-  { id: "notification-archive", name: "Archive", icon: "archive", category: "platform", component: () => import("@/apps/NotificationArchiveApp").then((m) => ({ default: m.NotificationArchiveApp })), defaultSize: { w: 800, h: 600 }, minSize: { w: 500, h: 400 }, singleton: true, pinned: false, launchpadOrder: 16.65 },
+  { id: "notification-history", name: "Notification History", icon: "history", category: "platform", component: () => import("@/apps/NotificationHistoryApp").then((m) => ({ default: m.NotificationHistoryApp })), defaultSize: { w: 900, h: 600 }, minSize: { w: 500, h: 400 }, singleton: true, pinned: false, launchpadOrder: 16.64, tier: 3 },
   { id: "observatory", name: "Observatory", icon: "radar", category: "platform", component: () => import("@/apps/ObservatoryApp").then((m) => ({ default: m.ObservatoryApp })), defaultSize: { w: 620, h: 600 }, minSize: { w: 420, h: 400 }, singleton: true, pinned: false, launchpadOrder: 16.7, tier: 2, group: "System" },
   { id: "notes", name: "Notes", icon: "sticky-note", category: "platform", component: () => import("@/apps/NotesApp").then((m) => ({ default: m.NotesApp })), defaultSize: { w: 860, h: 620 }, minSize: { w: 520, h: 400 }, singleton: true, pinned: false, launchpadOrder: 16.8 },
   { id: "todo", name: "Todo", icon: "list-checks", category: "platform", component: () => import("@/apps/TodoApp").then((m) => ({ default: m.TodoApp })), defaultSize: { w: 860, h: 620 }, minSize: { w: 520, h: 400 }, singleton: true, pinned: false, launchpadOrder: 16.85 },
@@ -93,9 +111,9 @@ const apps: AppManifest[] = [
   // Single Browser app. The proxy vs real-Neko-streamed engine is a per-tab
   // toggle inside it (BrowserModeToggle / LiveBrowserView), not a separate app.
   { id: "browser", name: "Browser", icon: "globe", category: "os", component: () => import("@/apps/BrowserApp").then((m) => ({ default: m.BrowserApp })), defaultSize: { w: 1024, h: 700 }, minSize: { w: 600, h: 400 }, singleton: false, pinned: false, launchpadOrder: 23 },
-  { id: "media-player", name: "Media Player", icon: "play-circle", category: "os", component: () => import("@/apps/MediaPlayerApp").then((m) => ({ default: m.MediaPlayerApp })), defaultSize: { w: 800, h: 500 }, minSize: { w: 400, h: 300 }, singleton: false, pinned: false, launchpadOrder: 24 },
-  { id: "text-editor", name: "Text Editor", icon: "file-text", category: "os", component: () => import("@/apps/TextEditorApp").then((m) => ({ default: m.TextEditorApp })), defaultSize: { w: 800, h: 550 }, minSize: { w: 400, h: 300 }, singleton: false, pinned: false, launchpadOrder: 25 },
-  { id: "image-viewer", name: "Image Viewer", icon: "eye", category: "os", component: () => import("@/apps/ImageViewerApp").then((m) => ({ default: m.ImageViewerApp })), defaultSize: { w: 800, h: 600 }, minSize: { w: 400, h: 300 }, singleton: false, pinned: false, launchpadOrder: 26 },
+  { id: "media-player", name: "Media Player", icon: "play-circle", category: "os", component: () => import("@/apps/MediaPlayerApp").then((m) => ({ default: m.MediaPlayerApp })), defaultSize: { w: 800, h: 500 }, minSize: { w: 400, h: 300 }, singleton: false, pinned: false, launchpadOrder: 24, tier: 4, handler: true },
+  { id: "text-editor", name: "Text Editor", icon: "file-text", category: "os", component: () => import("@/apps/TextEditorApp").then((m) => ({ default: m.TextEditorApp })), defaultSize: { w: 800, h: 550 }, minSize: { w: 400, h: 300 }, singleton: false, pinned: false, launchpadOrder: 25, tier: 4, handler: true },
+  { id: "image-viewer", name: "Image Viewer", icon: "eye", category: "os", component: () => import("@/apps/ImageViewerApp").then((m) => ({ default: m.ImageViewerApp })), defaultSize: { w: 800, h: 600 }, minSize: { w: 400, h: 300 }, singleton: false, pinned: false, launchpadOrder: 26, tier: 4, handler: true },
   { id: "terminal", name: "Terminal", icon: "terminal", category: "os", component: () => import("@/apps/TerminalApp").then((m) => ({ default: m.TerminalApp })), defaultSize: { w: 800, h: 500 }, minSize: { w: 400, h: 250 }, singleton: false, pinned: false, launchpadOrder: 27 },
 
   // Games
@@ -158,8 +176,105 @@ export function getOptionalApps(): AppManifest[] {
  * optional apps the user has installed. `installedOptional` is the set of
  * installed optional app ids (from /api/apps/optional/installed).
  */
+/** What a dock pin launches: the app, plus the section it should open on. */
+export interface ResolvedPinnedId {
+  id: string;
+  section?: string;
+}
+
+/** Window props that put the launched app on the pin's section. */
+export type PinnedLaunchProps = { section?: string };
+
+/**
+ * Pin ids that are not app ids: retired launcher entries the dock may still
+ * hold, mapped to the app (and section) they open today.
+ *
+ * The dock stores *pin ids*, never these resolved targets. Rewriting a pin to
+ * its target throws the section away — `notifications` alone cannot say the
+ * pin meant the Archive tab — and the dock auto-save then persists the
+ * stripped id, so one reload destroys the pin for good (#2677). Resolution
+ * therefore happens where a pin is used: `pinnedAppId` for the icon,
+ * `pinnedLaunchProps` for the launch.
+ *
+ * `notification-archive` used to open the Notifications app on its Archive
+ * tab. That tab is gone (tsk-i5gygp): the pin now opens the standalone
+ * Notification History app, which needs no section.
+ */
+export const APP_REDIRECTS: Record<string, { appId: string; section?: string }> = {
+  "notification-archive": { appId: "notification-history" },
+};
+
+/**
+ * Whether an app belongs on the default surface: the desktop launcher's
+ * always-on grid AND the mobile home default grid. This is the single source
+ * of truth for the tier rule that landed in bfc40c1e6 -- reuse it here instead
+ * of hand-rolling a second predicate that can drift:
+ *   tier 1 (default) / 2 - shown on the default surface
+ *   tier 3            - hidden from the default surface, searchable
+ *   tier 4            - file handler, hidden from the default surface
+ *   tier 5            - Store-optional, hidden from the default surface
+ * Optional apps and file handlers are excluded here; optional apps only
+ * surface once installed (see getLaunchableApps).
+ */
+export function isDefaultSurfaceApp(app: AppManifest): boolean {
+  return (
+    !app.optional &&
+    app.handler !== true &&
+    (app.tier === undefined || app.tier <= 2)
+  );
+}
+
+/**
+ * Apps the desktop search should surface: every always-on app, installed
+ * optional apps, and tier-3 registry apps (providers, mcp, channels). Tier-3 apps remain hidden from the launcher grids
+ * and mobile home default surface; they are reachable here via search and
+ * still openable by direct id.
+ */
+export function getSearchableApps(installedOptional: Set<string>): AppManifest[] {
+  return getAllApps().filter(
+    (a) =>
+      !APP_REDIRECTS[a.id] && // Exclude redirected apps
+      (a.optional
+        ? installedOptional.has(a.id)
+        : (isDefaultSurfaceApp(a) || a.tier === 3)),
+  );
+}
+
 export function getLaunchableApps(installedOptional: Set<string>): AppManifest[] {
-  return getAllApps().filter((a) => !a.optional || installedOptional.has(a.id));
+  return getAllApps().filter(
+    (a) =>
+      isDefaultSurfaceApp(a) ||
+      (a.optional && installedOptional.has(a.id)),
+  );
+}
+
+/**
+ * Resolve a dock pin id to the app it launches, or undefined when no app
+ * (yet) claims it — a userspace app can register after the dock restores.
+ */
+export function resolvePinnedId(id: string): ResolvedPinnedId | undefined {
+  const redirect = APP_REDIRECTS[id];
+  const targetId = redirect?.appId ?? id;
+  if (!getApp(targetId)) return undefined;
+  return { id: targetId, ...(redirect?.section ? { section: redirect.section } : {}) };
+}
+
+/**
+ * The app id a pin renders and launches as. Unknown pins keep their own id so
+ * an app that registers later still lines up with the pin the user saved.
+ */
+export function pinnedAppId(id: string): string {
+  return resolvePinnedId(id)?.id ?? id;
+}
+
+/**
+ * The props a pin's launch must carry, or undefined when it opens the app's
+ * default view. Every launch site goes through this so a section can never be
+ * declared in APP_REDIRECTS and then quietly dropped on the way to the window.
+ */
+export function pinnedLaunchProps(id: string): PinnedLaunchProps | undefined {
+  const section = resolvePinnedId(id)?.section;
+  return section ? { section } : undefined;
 }
 
 const prefetched = new Set<string>();

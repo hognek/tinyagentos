@@ -9,6 +9,7 @@ import pytest
 
 from tinyagentos.agent_image import base_image_alias
 from tinyagentos.catalog.resolver import DeviceCapability
+from tinyagentos.installers.ollama_installer import OllamaInstaller, resolve_ollama_url
 
 
 # ---------------------------------------------------------------------------
@@ -971,6 +972,168 @@ class TestInstallV2:
 
 
 # ---------------------------------------------------------------------------
+# POST /api/store/install-v2 -- ollama / hailo-ollama remote target (#tsk-mlogef)
+# ---------------------------------------------------------------------------
+
+
+class TestResolveOllamaUrl:
+    """Unit tests for the resolve_ollama_url helper."""
+
+    @pytest.mark.parametrize("remote", [None, "", "local"])
+    def test_local_ollama_returns_default_host(self, remote, monkeypatch):
+        monkeypatch.delenv("OLLAMA_HOST", raising=False)
+        assert resolve_ollama_url(remote, "ollama") == "http://localhost:11434"
+
+    @pytest.mark.parametrize("remote", [None, "", "local"])
+    def test_local_hailo_ollama_returns_localhost_7836(self, remote, monkeypatch):
+        monkeypatch.delenv("TAOS_HAILO_OLLAMA_PORT", raising=False)
+        assert resolve_ollama_url(remote, "hailo-ollama") == "http://localhost:7836"
+
+    def test_remote_ollama_uses_worker_hostname(self, monkeypatch):
+        monkeypatch.delenv("OLLAMA_HOST", raising=False)
+        assert resolve_ollama_url("worker-x", "ollama") == "http://worker-x:11434"
+
+    def test_remote_hailo_ollama_uses_worker_hostname(self, monkeypatch):
+        monkeypatch.delenv("TAOS_HAILO_OLLAMA_PORT", raising=False)
+        assert resolve_ollama_url("worker-x", "hailo-ollama") == "http://worker-x:7836"
+
+    def test_remote_hailo_ollama_honours_port_override(self, monkeypatch):
+        monkeypatch.setenv("TAOS_HAILO_OLLAMA_PORT", "9000")
+        assert resolve_ollama_url("worker-x", "hailo-ollama") == "http://worker-x:9000"
+
+    def test_local_hailo_ollama_honours_port_override(self, monkeypatch):
+        monkeypatch.setenv("TAOS_HAILO_OLLAMA_PORT", "9000")
+        assert resolve_ollama_url(None, "hailo-ollama") == "http://localhost:9000"
+
+    def test_ollama_host_env_overrides_default_port(self, monkeypatch):
+        monkeypatch.setenv("OLLAMA_HOST", "http://ollama-box:1234")
+        assert resolve_ollama_url(None, "ollama") == "http://ollama-box:1234"
+
+
+class TestOllamaRemoteTargetInstall:
+    """Regression: install_app must pass target_remote through get_installer
+    to OllamaInstaller so the model lands on the selected worker, not the
+    controller's localhost daemon (tsk-mlogef).
+
+    These tests exercise the REAL get_installer call path -- only
+    OllamaInstaller.install is mocked (to avoid real HTTP), never get_installer
+    itself.
+    """
+
+    def _setup(self, client, manifest):
+        """Wire registry + installed_apps on the test app state."""
+        reg = _make_registry(manifest)
+        reg.mark_installed = MagicMock()
+        client._transport.app.state.registry = reg
+        client._transport.app.state.installed_apps = _make_installed_apps()
+        return reg
+
+    @pytest.mark.asyncio
+    async def test_hailo_ollama_remote_target_hits_remote_worker(self, client):
+        """target_remote='worker-x' with hailo-ollama backend must produce an
+        OllamaInstaller whose host is http://worker-x:7836, NOT localhost:7836."""
+        manifest = _make_model_manifest(backend_id="hailo-ollama")
+        self._setup(client, manifest)
+
+        cap = _cpu_cap(installed_backends=("hailo-ollama",))
+        captured: list[str] = []
+
+        async def _spy_install(self, app_id, install_config, **_):
+            captured.append(self.host)
+            return {"success": True, "app_id": app_id}
+
+        with patch(
+            "tinyagentos.routes.store_install.get_device_capability",
+            new=AsyncMock(return_value=cap),
+        ), patch.object(OllamaInstaller, "install", _spy_install):
+            resp = await client.post("/api/store/install-v2", json={
+                "manifest_id": "test-model",
+                "variant_id": "v1",
+                "target_remote": "worker-x",
+            })
+
+        assert resp.status_code == 200
+        assert captured == ["http://worker-x:7836"]
+
+    @pytest.mark.asyncio
+    async def test_plain_ollama_remote_target_hits_remote_worker(self, client):
+        """Same regression for the plain ollama backend -- host must be
+        http://worker-x:11434."""
+        manifest = _make_model_manifest(backend_id="ollama")
+        self._setup(client, manifest)
+
+        cap = _cpu_cap(installed_backends=("ollama",))
+        captured: list[str] = []
+
+        async def _spy_install(self, app_id, install_config, **_):
+            captured.append(self.host)
+            return {"success": True, "app_id": app_id}
+
+        with patch(
+            "tinyagentos.routes.store_install.get_device_capability",
+            new=AsyncMock(return_value=cap),
+        ), patch.object(OllamaInstaller, "install", _spy_install):
+            resp = await client.post("/api/store/install-v2", json={
+                "manifest_id": "test-model",
+                "variant_id": "v1",
+                "target_remote": "worker-x",
+            })
+
+        assert resp.status_code == 200
+        assert captured == ["http://worker-x:11434"]
+
+    @pytest.mark.asyncio
+    async def test_hailo_ollama_local_target_uses_localhost(self, client):
+        """Control: no target_remote means local install, host stays localhost:7836."""
+        manifest = _make_model_manifest(backend_id="hailo-ollama")
+        self._setup(client, manifest)
+
+        cap = _cpu_cap(installed_backends=("hailo-ollama",))
+        captured: list[str] = []
+
+        async def _spy_install(self, app_id, install_config, **_):
+            captured.append(self.host)
+            return {"success": True, "app_id": app_id}
+
+        with patch(
+            "tinyagentos.routes.store_install.get_device_capability",
+            new=AsyncMock(return_value=cap),
+        ), patch.object(OllamaInstaller, "install", _spy_install):
+            resp = await client.post("/api/store/install-v2", json={
+                "manifest_id": "test-model",
+                "variant_id": "v1",
+            })
+
+        assert resp.status_code == 200
+        assert captured == ["http://localhost:7836"]
+
+    @pytest.mark.asyncio
+    async def test_plain_ollama_local_target_uses_localhost(self, client):
+        """Control: no target_remote means local install, host stays localhost:11434."""
+        manifest = _make_model_manifest(backend_id="ollama")
+        self._setup(client, manifest)
+
+        cap = _cpu_cap(installed_backends=("ollama",))
+        captured: list[str] = []
+
+        async def _spy_install(self, app_id, install_config, **_):
+            captured.append(self.host)
+            return {"success": True, "app_id": app_id}
+
+        with patch(
+            "tinyagentos.routes.store_install.get_device_capability",
+            new=AsyncMock(return_value=cap),
+        ), patch.object(OllamaInstaller, "install", _spy_install):
+            resp = await client.post("/api/store/install-v2", json={
+                "manifest_id": "test-model",
+                "variant_id": "v1",
+            })
+
+        assert resp.status_code == 200
+        assert captured == ["http://localhost:11434"]
+
+
+# ---------------------------------------------------------------------------
 # GET /api/store/signing-pubkey
 # ---------------------------------------------------------------------------
 
@@ -1404,3 +1567,91 @@ class TestListInstalled:
         assert item["runtime_host"] is None
         assert item["runtime_port"] is None
         assert item["runtime_backend"] is None
+
+
+# ---------------------------------------------------------------------------
+# Install inputs via inputs object / top-level (legacy LXC path)
+# ---------------------------------------------------------------------------
+
+
+class TestInstallInputs:
+    @pytest.mark.asyncio
+    async def test_inputs_object_used_for_admin_password(self, client):
+        svc = _make_service_manifest("lxc-app", method="lxc")
+        reg = _make_registry(svc)
+        client._transport.app.state.registry = reg
+        client._transport.app.state.installed_apps = _make_installed_apps()
+
+        mock_lxc = MagicMock()
+        mock_lxc.install = AsyncMock(
+            return_value={"success": True, "host_port": 31000, "container": "taos-svc-lxc-app"},
+        )
+
+        with patch("tinyagentos.routes.store_install.LXCInstaller", return_value=mock_lxc):
+            resp = await client.post("/api/store/install-v2", json={
+                "app_id": "lxc-app",
+                "inputs": {"admin_password": "pw-from-inputs"},
+            })
+        assert resp.status_code == 200
+        assert mock_lxc.install.call_args.kwargs["admin_password"] == "pw-from-inputs"
+
+    @pytest.mark.asyncio
+    async def test_top_level_admin_password_still_works(self, client):
+        svc = _make_service_manifest("lxc-app", method="lxc")
+        reg = _make_registry(svc)
+        client._transport.app.state.registry = reg
+        client._transport.app.state.installed_apps = _make_installed_apps()
+
+        mock_lxc = MagicMock()
+        mock_lxc.install = AsyncMock(
+            return_value={"success": True, "host_port": 31000, "container": "taos-svc-lxc-app"},
+        )
+
+        with patch("tinyagentos.routes.store_install.LXCInstaller", return_value=mock_lxc):
+            resp = await client.post("/api/store/install-v2", json={
+                "app_id": "lxc-app",
+                "admin_password": "pw-top",
+            })
+        assert resp.status_code == 200
+        assert mock_lxc.install.call_args.kwargs["admin_password"] == "pw-top"
+
+    @pytest.mark.asyncio
+    async def test_inputs_array_rejected(self, client):
+        svc = _make_service_manifest("lxc-app", method="lxc")
+        reg = _make_registry(svc)
+        client._transport.app.state.registry = reg
+        client._transport.app.state.installed_apps = _make_installed_apps()
+
+        mock_lxc = MagicMock()
+        mock_lxc.install = AsyncMock(
+            return_value={"success": True, "host_port": 31000, "container": "taos-svc-lxc-app"},
+        )
+
+        with patch("tinyagentos.routes.store_install.LXCInstaller", return_value=mock_lxc):
+            resp = await client.post("/api/store/install-v2", json={
+                "app_id": "lxc-app",
+                "inputs": ["pw"],
+            })
+        assert resp.status_code == 400
+        assert resp.json().get("reason") == "invalid_inputs"
+        mock_lxc.install.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_inputs_non_string_value_rejected(self, client):
+        svc = _make_service_manifest("lxc-app", method="lxc")
+        reg = _make_registry(svc)
+        client._transport.app.state.registry = reg
+        client._transport.app.state.installed_apps = _make_installed_apps()
+
+        mock_lxc = MagicMock()
+        mock_lxc.install = AsyncMock(
+            return_value={"success": True, "host_port": 31000, "container": "taos-svc-lxc-app"},
+        )
+
+        with patch("tinyagentos.routes.store_install.LXCInstaller", return_value=mock_lxc):
+            resp = await client.post("/api/store/install-v2", json={
+                "app_id": "lxc-app",
+                "inputs": {"admin_password": 5},
+            })
+        assert resp.status_code == 400
+        assert resp.json().get("reason") == "invalid_inputs"

@@ -1,3 +1,4 @@
+import { useMemo } from "react";
 import {
   MessageCircle,
   Hash,
@@ -9,11 +10,13 @@ import {
   Archive,
   RotateCcw,
   Trash2,
+  Globe,
 } from "lucide-react";
 import { Button } from "@/components/ui";
 import { MessageAvatar } from "./MessageAvatar";
 import { A2aBusSection, type BusChannel } from "./A2aBusPanel";
-import type { Channel, LiveAgent, ArchivedAgentEntry, ProjectGroup, WsStatus } from "./types";
+import { MobileChatList } from "./MobileChatList";
+import type { Channel, LiveAgent, ArchivedAgentEntry, ProjectGroup, WsStatus, AgentPresence } from "./types";
 
 /* ------------------------------------------------------------------ */
 /*  Types                                                              */
@@ -61,8 +64,10 @@ export interface ChannelSidebarProps {
   onSelectBusChannel: (channel: string) => void;
   /** Relative time formatter. */
   formatRelativeTime: (ts: number | string, nowMs: number) => string;
-  /** Channel ids whose bound taostalk_agent is currently thinking (live badge). */
-  thinkingChannelIds: string[];
+  /** Per-channel agent presence: "live" | "working" | "idle", keyed by channel id. */
+  agentPresence: Record<string, AgentPresence>;
+  /** Whether agent roster (live + archived) has loaded successfully. */
+  agentRosterReady?: boolean;
 }
 
 /* ------------------------------------------------------------------ */
@@ -82,15 +87,13 @@ export function ChannelSidebar(props: ChannelSidebarProps) {
     onSelectChannel,
     unread,
     nowMs,
+    liveAgents,
+    archivedAgents,
     archivedChannels,
     archivedExpanded,
     onToggleArchived,
     scope,
     projectGroups,
-    projectsExpanded,
-    onToggleProjects,
-    projectChannelExpanded,
-    onToggleProjectChannel,
     onOpenAgentsApp,
     onRestoreArchivedChannel,
     onDeleteArchivedChannel,
@@ -98,260 +101,58 @@ export function ChannelSidebar(props: ChannelSidebarProps) {
     busSelected,
     onSelectBusChannel,
     formatRelativeTime,
-    thinkingChannelIds,
+    agentPresence,
+    agentRosterReady,
   } = props;
+
+  const agentNames = useMemo(
+    () => {
+      const names = new Set<string>();
+
+      for (const a of liveAgents) {
+        names.add(a.name);
+        if (a.display_name) names.add(a.display_name);
+      }
+
+      for (const a of archivedAgents) {
+        if (a.original?.name) names.add(a.original.name);
+        if (a.original?.display_name) names.add(a.original.display_name);
+        if (a.archived_slug) names.add(a.archived_slug);
+      }
+
+      return Array.from(names);
+    },
+    [liveAgents, archivedAgents],
+  );
+
+  const agentNamesToPass = agentRosterReady ? agentNames : undefined;
 
   if (isMobile) {
     return (
       <div style={{ padding: "8px 0 16px" }}>
-        {/* connection status */}
-        <ConnectionStatus wsStatus={wsStatus} />
+        {/* connection status: only shown while not connected */}
+        {wsStatus !== "connected" && <ConnectionStatus wsStatus={wsStatus} />}
 
         {allEmpty ? (
           <EmptyState onOpenAgentsApp={onOpenAgentsApp} />
         ) : (
-          sections.map((section) => (
-            <div key={section.label} style={{ marginBottom: 20 }}>
-              <button
-                type="button"
-                onClick={() => onToggleSection(section.label)}
-                aria-expanded={!collapsedSections[section.label]}
-                style={{
-                  fontSize: 12,
-                  textTransform: "uppercase" as const,
-                  letterSpacing: 0.5,
-                  color: "var(--color-shell-text-secondary)",
-                  padding: "0 20px 6px",
-                  fontWeight: 600,
-                  display: "flex",
-                  alignItems: "center",
-                  gap: 6,
-                  background: "none",
-                  border: "none",
-                  cursor: "pointer",
-                  width: "100%",
-                }}
-              >
-                <ChevronRight
-                  size={13}
-                  aria-hidden="true"
-                  style={{
-                    transition: "transform 0.15s",
-                    transform: collapsedSections[section.label] ? "none" : "rotate(90deg)",
-                  }}
-                />
-                {section.icon} {section.label}
-              </button>
-              {visibleInSection(section.items, section.label).length === 0 ? (
-                collapsedSections[section.label] ? null : (
-                  <div
-                    style={{
-                      padding: "0 20px",
-                      fontSize: 12,
-                      color: "var(--color-shell-text-tertiary)",
-                      fontStyle: "italic",
-                    }}
-                  >
-                    None yet
-                  </div>
-                )
-              ) : (
-                <div
-                  style={{
-                    margin: "0 12px",
-                    borderRadius: 16,
-                    background: "var(--color-shell-surface)",
-                    border: "1px solid var(--color-shell-border)",
-                    overflow: "hidden",
-                  }}
-                >
-                  {visibleInSection(section.items, section.label).map(
-                    (ch, idx, arr) => {
-                      const isA2A = ch.settings?.kind === "a2a";
-                      const agentMember =
-                        ch.type === "dm"
-                          ? (ch.members ?? []).find((m) => m !== "user")
-                          : undefined;
-                      const count = unread[ch.id] ?? 0;
-                      return (
-                        <button
-                          key={ch.id}
-                          type="button"
-                          onClick={() => onSelectChannel(ch.id)}
-                          aria-label={`Channel ${ch.name}`}
-                          title={
-                            isA2A
-                              ? "Agent coordination — mention @<slug> to hand off."
-                              : undefined
-                          }
-                          style={{
-                            display: "flex",
-                            alignItems: "center",
-                            gap: 12,
-                            width: "100%",
-                            padding: "11px 14px",
-                            background:
-                              selectedChannel === ch.id
-                                ? "var(--color-shell-surface-active)"
-                                : "none",
-                            border: "none",
-                            borderBottom:
-                              idx === arr.length - 1
-                                ? "none"
-                                : "1px solid var(--color-shell-border)",
-                            cursor: "pointer",
-                            color: "inherit",
-                            textAlign: "left" as const,
-                          }}
-                        >
-                          {agentMember ? (
-                            <MessageAvatar
-                              size={38}
-                              authorId={agentMember}
-                              displayName={agentMember}
-                              kind="agent"
-                            />
-                          ) : isA2A ? (
-                            <div
-                              style={{
-                                width: 38,
-                                height: 38,
-                                borderRadius: 11,
-                                display: "flex",
-                                alignItems: "center",
-                                justifyContent: "center",
-                                background: "var(--color-accent-soft)",
-                                border: "1px solid var(--color-accent-line)",
-                                color: "var(--color-accent-strong)",
-                                flexShrink: 0,
-                              }}
-                            >
-                              <Bot size={18} aria-hidden />
-                            </div>
-                          ) : (
-                            <div
-                              style={{
-                                width: 38,
-                                height: 38,
-                                borderRadius: 11,
-                                display: "flex",
-                                alignItems: "center",
-                                justifyContent: "center",
-                                background:
-                                  "var(--color-shell-surface-active)",
-                                color: "var(--color-shell-text-secondary)",
-                                flexShrink: 0,
-                              }}
-                            >
-                              {ch.type === "group" ? (
-                                <Users size={18} aria-hidden />
-                              ) : (
-                                <Hash size={18} aria-hidden />
-                              )}
-                            </div>
-                          )}
-                          <div style={{ flex: 1, minWidth: 0 }}>
-                            <div
-                              style={{
-                                display: "flex",
-                                alignItems: "baseline",
-                                gap: 8,
-                              }}
-                            >
-                               <span
-                                 style={{
-                                   flex: 1,
-                                   fontSize: 15,
-                                   fontWeight: count > 0 ? 700 : 600,
-                                   color: "var(--color-shell-text)",
-                                   overflow: "hidden",
-                                   textOverflow: "ellipsis",
-                                   whiteSpace: "nowrap",
-                                 }}
-                               >
-                                 {ch.name}
-                               </span>
-                               {thinkingChannelIds.includes(ch.id) && (
-                                 <span
-                                   className="relative inline-flex h-1.5 w-1.5 shrink-0"
-                                   role="img"
-                                   aria-label="Agent is thinking"
-                                 >
-                                   <span className="taos-status-pulse absolute inset-0 rounded-full bg-amber-400" />
-                                   <span className="relative inline-flex h-1.5 w-1.5 rounded-full bg-amber-400" />
-                                 </span>
-                               )}
-                               {ch.last_message_at && (
-                                <span
-                                  style={{
-                                    fontSize: 11,
-                                    color: "var(--color-shell-text-tertiary)",
-                                    flexShrink: 0,
-                                  }}
-                                >
-                                  {formatRelativeTime(ch.last_message_at, nowMs)}
-                                </span>
-                              )}
-                            </div>
-                            {ch.lastPreview && (
-                              <div
-                                style={{
-                                  fontSize: 13,
-                                  color: "var(--color-shell-text-secondary)",
-                                  overflow: "hidden",
-                                  textOverflow: "ellipsis",
-                                  whiteSpace: "nowrap",
-                                  marginTop: 1,
-                                }}
-                              >
-                                {ch.lastPreview}
-                              </div>
-                            )}
-                          </div>
-                          {count > 0 && (
-                            <span
-                              style={{
-                                background: "var(--color-unread)",
-                                color: "#fff",
-                                fontSize: 10,
-                                fontWeight: 700,
-                                borderRadius: 9999,
-                                minWidth: 18,
-                                height: 18,
-                                display: "flex",
-                                alignItems: "center",
-                                justifyContent: "center",
-                                padding: "0 5px",
-                                flexShrink: 0,
-                              }}
-                            >
-                              {count}
-                            </span>
-                          )}
-                        </button>
-                      );
-                    },
-                  )}
-                </div>
-              )}
-            </div>
-          ))
+          <>
+            <MobileChatList
+              sections={sections}
+              projectGroups={projectGroups}
+              selectedChannel={selectedChannel}
+              onSelectChannel={onSelectChannel}
+              unread={unread}
+              nowMs={nowMs}
+              formatRelativeTime={formatRelativeTime}
+              bus={bus}
+              busSelected={busSelected}
+              onSelectBusChannel={onSelectBusChannel}
+              agentNames={agentNamesToPass}
+            />
+          </>
         )}
-
-        {/* Projects section — mobile */}
-        <ProjectsSectionMobile
-          projectGroups={projectGroups}
-          projectsExpanded={projectsExpanded}
-          onToggleProjects={onToggleProjects}
-          projectChannelExpanded={projectChannelExpanded}
-          onToggleProjectChannel={onToggleProjectChannel}
-          selectedChannel={selectedChannel}
-          onSelectChannel={onSelectChannel}
-          unread={unread}
-          scope={scope}
-        />
-
-        {/* Archived channels — mobile */}
+        {/* Archived channels, mobile (always rendered, not gated by allEmpty) */}
         <ArchivedSection
           isMobile={true}
           archivedChannels={archivedChannels}
@@ -362,15 +163,6 @@ export function ChannelSidebar(props: ChannelSidebarProps) {
           onRestoreArchivedChannel={onRestoreArchivedChannel}
           onDeleteArchivedChannel={onDeleteArchivedChannel}
           archivedAgents={props.archivedAgents}
-        />
-
-        {/* External taOSmd coordination bus (read-only) */}
-        <A2aBusSection
-          channels={bus.channels}
-          available={bus.available}
-          loaded={bus.loaded}
-          selected={busSelected}
-          onSelect={onSelectBusChannel}
         />
       </div>
     );
@@ -403,11 +195,11 @@ export function ChannelSidebar(props: ChannelSidebarProps) {
       <div className="flex-1 overflow-y-auto py-1">
         {allEmpty ? (
           <div className="flex flex-col items-center justify-center h-full px-4 py-10 text-center gap-2.5">
-            <MessageCircle size={28} className="text-white/15" aria-hidden="true" />
-            <p className="text-[13px] font-medium text-white/60">
+            <MessageCircle size={28} className="text-shell-text-disabled" aria-hidden="true" />
+            <p className="text-[13px] font-medium text-shell-text-secondary">
               No conversations yet
             </p>
-            <p className="text-[11px] text-white/30">
+            <p className="text-[11px] text-shell-text-tertiary">
               Deploy an agent to start chatting
             </p>
             <Button
@@ -426,7 +218,7 @@ export function ChannelSidebar(props: ChannelSidebarProps) {
                 type="button"
                 onClick={() => onToggleSection(section.label)}
                 aria-expanded={!collapsedSections[section.label]}
-                className="w-full px-3 pt-3 pb-1 text-[10px] font-semibold uppercase tracking-wider text-white/30 hover:text-white/50 flex items-center gap-1.5 transition-colors"
+                className="w-full px-3 pt-3 pb-1 text-[10px] font-semibold uppercase tracking-wider text-shell-text-tertiary hover:text-shell-text-secondary flex items-center gap-1.5 transition-colors"
               >
                 <ChevronRight
                   size={11}
@@ -439,7 +231,7 @@ export function ChannelSidebar(props: ChannelSidebarProps) {
               </button>
               {!collapsedSections[section.label] &&
                 section.items.length === 0 && (
-                  <div className="px-3 py-1 text-[11px] text-white/20 italic">
+                  <div className="px-3 py-1 text-[11px] text-shell-text-tertiary italic">
                     None yet
                   </div>
                 )}
@@ -459,7 +251,7 @@ export function ChannelSidebar(props: ChannelSidebarProps) {
                       aria-pressed={selectedChannel === ch.id}
                       className={`w-full flex items-center gap-2.5 px-2.5 py-2 rounded-[10px] text-left transition-colors ${
                         selectedChannel === ch.id
-                          ? "bg-shell-surface-active"
+                          ? "bg-shell-surface-active border-l-2 border-accent-line"
                           : "hover:bg-shell-surface-hover"
                       }`}
                       aria-label={`Channel ${ch.name}`}
@@ -484,31 +276,27 @@ export function ChannelSidebar(props: ChannelSidebarProps) {
                         <span className="shrink-0 grid place-items-center w-[30px] h-[30px] rounded-[9px] bg-shell-surface-active text-shell-text-secondary">
                           {ch.type === "group" ? (
                             <Users size={15} aria-hidden />
+                          ) : ch.type === "dm-remote" ? (
+                            <Globe size={15} data-lucide="globe" aria-hidden />
                           ) : (
                             <Hash size={15} aria-hidden />
                           )}
                         </span>
                       )}
-                       <span
-                         className={`truncate flex-1 text-[14px] tracking-tight ${
-                           count > 0
-                             ? "font-bold text-shell-text"
-                             : "font-semibold text-shell-text"
-                         }`}
-                       >
-                         {ch.name}
-                       </span>
-                       {thinkingChannelIds.includes(ch.id) && (
-                         <span
-                           className="relative inline-flex h-1.5 w-1.5 shrink-0"
-                           role="img"
-                           aria-label="Agent is thinking"
-                         >
-                           <span className="taos-status-pulse absolute inset-0 rounded-full bg-amber-400" />
-                           <span className="relative inline-flex h-1.5 w-1.5 rounded-full bg-amber-400" />
-                         </span>
-                       )}
-                       {count > 0 && (
+                        <span
+                          className={`truncate flex-1 text-[14px] tracking-tight ${
+                            count > 0
+                              ? "font-bold text-shell-text"
+                              : "font-semibold text-shell-text"
+                          }`}
+                        >
+                          {ch.name}
+                        </span>
+                        {(() => {
+                          const presence = agentPresence[ch.id];
+                          return presence ? <PresenceDot presence={presence} /> : null;
+                        })()}
+                      {count > 0 && (
                         <span className="shrink-0 bg-unread text-white text-[10px] font-bold rounded-full min-w-[18px] h-[18px] flex items-center justify-center px-1 tabular-nums">
                           {count}
                         </span>
@@ -524,12 +312,12 @@ export function ChannelSidebar(props: ChannelSidebarProps) {
         {/* Projects section — desktop */}
         {!scope?.projectId && projectGroups.length > 0 && (
           <details className="px-3 mt-2">
-            <summary className="cursor-pointer text-[10px] font-semibold uppercase tracking-wider text-white/30 py-1">
+            <summary className="cursor-pointer text-[10px] font-semibold uppercase tracking-wider text-shell-text-tertiary py-1">
               Projects
             </summary>
             {projectGroups.map((g) => (
               <details key={g.id} className="ml-2 mt-1">
-                <summary className="cursor-pointer text-xs text-white/60 py-1">
+                <summary className="cursor-pointer text-xs text-shell-text-secondary py-1">
                   {g.name}
                 </summary>
                 <div className="ml-2 mt-0.5">
@@ -547,8 +335,8 @@ export function ChannelSidebar(props: ChannelSidebarProps) {
                       }
                       className={`w-full text-left text-xs py-1 px-2 rounded flex items-center gap-1.5 ${
                         selectedChannel === ch.id
-                          ? "bg-white/10"
-                          : "hover:bg-white/5"
+                          ? "bg-shell-surface-active border-l-2 border-accent-line"
+                          : "hover:bg-shell-surface-hover"
                       }`}
                     >
                       {ch.settings?.kind === "a2a" && (
@@ -561,7 +349,11 @@ export function ChannelSidebar(props: ChannelSidebarProps) {
                           }}
                         />
                       )}
-                      {ch.name}
+                      <span className="truncate flex-1">{ch.name}</span>
+                      {(() => {
+                        const presence = agentPresence[ch.id];
+                        return presence ? <PresenceDot presence={presence} /> : null;
+                      })()}
                     </button>
                   ))}
                 </div>
@@ -597,7 +389,41 @@ export function ChannelSidebar(props: ChannelSidebarProps) {
 }
 
 /* ------------------------------------------------------------------ */
-/*  Internal sub-components                                            */
+/*  Presence dot                                                        */
+/* ------------------------------------------------------------------ */
+
+/**
+* Small status dot shown next to agent DM channel names in the sidebar.
+* - working: amber with a pulse animation (agent is actively generating).
+* - live:   emerald solid (agent is running and available).
+* - idle:   muted gray (agent is paused, stopped, or otherwise unavailable).
+*/
+function PresenceDot({ presence }: { presence: AgentPresence }) {
+  const is = (presence === "live") ? (
+    <span
+      className="relative inline-flex h-1.5 w-1.5 shrink-0 rounded-full bg-emerald-400"
+      role="img"
+      aria-label="Agent is live"
+    />
+  ) : presence === "working" ? (
+    <span
+      className="relative inline-flex h-1.5 w-1.5 shrink-0"
+      role="img"
+      aria-label="Agent is working"
+    >
+      <span className="taos-status-pulse absolute inset-0 rounded-full bg-amber-400" />
+      <span className="relative inline-flex h-1.5 w-1.5 rounded-full bg-amber-400" />
+    </span>
+  ) : (
+    <span
+      className="relative inline-flex h-1.5 w-1.5 shrink-0 rounded-full bg-shell-text-tertiary"
+      role="img"
+      aria-label="Agent is idle"
+    />
+  );
+  return is;
+}
+
 /* ------------------------------------------------------------------ */
 
 function ConnectionStatus({ wsStatus }: { wsStatus: WsStatus }) {
@@ -684,206 +510,6 @@ function EmptyState({ onOpenAgentsApp }: { onOpenAgentsApp: () => void }) {
       >
         Open Agents
       </button>
-    </div>
-  );
-}
-
-function ProjectsSectionMobile({
-  projectGroups,
-  projectsExpanded,
-  onToggleProjects,
-  projectChannelExpanded,
-  onToggleProjectChannel,
-  selectedChannel,
-  onSelectChannel,
-  unread,
-  scope,
-}: {
-  projectGroups: ProjectGroup[];
-  projectsExpanded: boolean;
-  onToggleProjects: () => void;
-  projectChannelExpanded: Record<string, boolean>;
-  onToggleProjectChannel: (projectId: string) => void;
-  selectedChannel: string | null;
-  onSelectChannel: (id: string) => void;
-  unread: Record<string, number>;
-  scope?: { projectId?: string };
-}) {
-  if (scope?.projectId || projectGroups.length === 0) return null;
-
-  return (
-    <div style={{ marginBottom: 20 }}>
-      <button
-        type="button"
-        onClick={onToggleProjects}
-        aria-expanded={projectsExpanded}
-        aria-controls="projects-section-mobile"
-        style={{
-          fontSize: 12,
-          textTransform: "uppercase" as const,
-          letterSpacing: 0.5,
-          color: "var(--color-shell-text-secondary)",
-          padding: "0 20px 6px",
-          fontWeight: 600,
-          display: "flex",
-          alignItems: "center",
-          gap: 6,
-          background: "none",
-          border: "none",
-          cursor: "pointer",
-          width: "100%",
-        }}
-      >
-        <ChevronRight
-          size={12}
-          style={{
-            transition: "transform 0.15s",
-            transform: projectsExpanded ? "rotate(90deg)" : "none",
-            color: "var(--color-shell-text-tertiary)",
-          }}
-          aria-hidden="true"
-        />
-        Projects ({projectGroups.length})
-      </button>
-      <div
-        id="projects-section-mobile"
-        style={{ display: projectsExpanded ? "block" : "none" }}
-      >
-        {projectGroups.map((g) => {
-          const isOpen = projectChannelExpanded[g.id] !== false;
-          return (
-            <div key={g.id} style={{ marginBottom: 12 }}>
-              <button
-                type="button"
-                onClick={() => onToggleProjectChannel(g.id)}
-                aria-expanded={isOpen}
-                aria-controls={`project-section-mobile-${g.id}`}
-                style={{
-                  fontSize: 11,
-                  color: "var(--color-shell-text-secondary)",
-                  padding: "0 20px 4px",
-                  fontWeight: 600,
-                  display: "flex",
-                  alignItems: "center",
-                  gap: 6,
-                  background: "none",
-                  border: "none",
-                  cursor: "pointer",
-                  width: "100%",
-                }}
-              >
-                <ChevronRight
-                  size={10}
-                  style={{
-                    transition: "transform 0.15s",
-                    transform: isOpen ? "rotate(90deg)" : "none",
-                    color: "var(--color-shell-text-tertiary)",
-                  }}
-                  aria-hidden="true"
-                />
-                {g.name}
-              </button>
-              <div
-                id={`project-section-mobile-${g.id}`}
-                style={{ display: isOpen ? "block" : "none" }}
-              >
-                <div
-                  style={{
-                    margin: "0 12px",
-                    borderRadius: 16,
-                    background: "rgba(255,255,255,0.05)",
-                    border: "1px solid rgba(255,255,255,0.08)",
-                    overflow: "hidden",
-                  }}
-                >
-                  {g.channels.map((ch, idx, arr) => (
-                    <button
-                      key={ch.id}
-                      type="button"
-                      onClick={() => onSelectChannel(ch.id)}
-                      aria-label={`Channel ${ch.name}`}
-                      title={
-                        ch.settings?.kind === "a2a"
-                          ? "Agent coordination — mention @<slug> to hand off."
-                          : undefined
-                      }
-                      style={{
-                        display: "flex",
-                        alignItems: "center",
-                        gap: 10,
-                        width: "100%",
-                        padding: "14px 16px",
-                        background:
-                          selectedChannel === ch.id
-                            ? "var(--color-shell-surface-active)"
-                            : "none",
-                        border: "none",
-                        borderBottom:
-                          idx === arr.length - 1
-                            ? "none"
-                            : "1px solid var(--color-shell-border)",
-                        cursor: "pointer",
-                        color: "inherit",
-                        textAlign: "left" as const,
-                      }}
-                    >
-                      {ch.settings?.kind === "a2a" && (
-                        <Bot
-                          size={14}
-                          aria-hidden
-                          style={{
-                            color: "var(--color-shell-text-secondary)",
-                            flexShrink: 0,
-                          }}
-                        />
-                      )}
-                      <span
-                        style={{
-                          flex: 1,
-                          fontSize: 15,
-                          fontWeight: 400,
-                          color: "var(--color-shell-text)",
-                          overflow: "hidden",
-                          textOverflow: "ellipsis",
-                          whiteSpace: "nowrap",
-                        }}
-                      >
-                        {ch.name}
-                      </span>
-                      {(unread[ch.id] ?? 0) > 0 && (
-                        <span
-                          style={{
-                            background: "var(--color-unread)",
-                            color: "#fff",
-                            fontSize: 10,
-                            fontWeight: 700,
-                            borderRadius: 9999,
-                            minWidth: 18,
-                            height: 18,
-                            display: "flex",
-                            alignItems: "center",
-                            justifyContent: "center",
-                            padding: "0 4px",
-                          }}
-                        >
-                          {unread[ch.id]}
-                        </span>
-                      )}
-                      <ChevronRight
-                        size={16}
-                        style={{
-                          color: "var(--color-shell-text-tertiary)",
-                          flexShrink: 0,
-                        }}
-                      />
-                    </button>
-                  ))}
-                </div>
-              </div>
-            </div>
-          );
-        })}
-      </div>
     </div>
   );
 }
@@ -994,6 +620,10 @@ function ArchivedSection({
                           ? "var(--color-shell-surface-active)"
                           : "none",
                       border: "none",
+                      borderLeft:
+                        selectedChannel === ch.id
+                          ? "3px solid var(--color-accent-line)"
+                          : "none",
                       cursor: "pointer",
                       color: "inherit",
                       textAlign: "left" as const,
@@ -1077,7 +707,7 @@ function ArchivedSection({
       <button
         type="button"
         onClick={onToggleArchived}
-        className="flex items-center gap-1.5 px-3 pt-2 pb-1 text-[10px] font-semibold uppercase tracking-wider text-white/25 hover:text-white/40 transition-colors w-full text-left"
+        className="flex items-center gap-1.5 px-3 pt-2 pb-1 text-[10px] font-semibold uppercase tracking-wider text-shell-text-hint hover:text-shell-text-subtle-hover transition-colors w-full text-left"
         aria-expanded={archivedExpanded}
         aria-controls="archived-channels-desktop"
       >
@@ -1110,12 +740,14 @@ function ArchivedSection({
                   selectedChannel === ch.id ? "secondary" : "ghost"
                 }
                 onClick={() => onSelectChannel(ch.id)}
-                className="flex-1 justify-start h-auto py-1.5 pl-3 pr-1 text-[13px] rounded-none font-normal min-w-0"
+                className={`flex-1 justify-start h-auto py-1.5 pl-3 pr-1 text-[13px] rounded-none font-normal min-w-0 ${
+                  selectedChannel === ch.id ? "border-l-2 border-accent-line" : ""
+                }`}
                 aria-label={`Archived channel ${ch.name}`}
               >
                 <Archive
                   size={11}
-                  className="shrink-0 mr-1.5 text-white/40"
+                  className="shrink-0 mr-1.5 text-shell-text-tertiary"
                   aria-hidden="true"
                 />
                 <span className="truncate flex-1 text-left">{ch.name}</span>
@@ -1135,8 +767,8 @@ function ArchivedSection({
                   }
                   className={`p-1 rounded transition-colors ${
                     hasAgent
-                      ? "text-white/30 hover:text-emerald-400 hover:bg-emerald-500/10 cursor-pointer"
-                      : "text-white/15 cursor-not-allowed"
+                      ? "text-shell-text-tertiary hover:text-emerald-400 hover:bg-emerald-500/10 cursor-pointer"
+                      : "text-shell-text-disabled cursor-not-allowed"
                   }`}
                 >
                   <RotateCcw size={12} aria-hidden="true" />
@@ -1146,7 +778,7 @@ function ArchivedSection({
                   onClick={() => onDeleteArchivedChannel(ch.id)}
                   aria-label={`Permanently delete archived channel ${ch.name}`}
                   title="Delete permanently"
-                  className="p-1 rounded text-white/30 hover:text-red-400 hover:bg-red-500/10 transition-colors cursor-pointer"
+                  className="p-1 rounded text-shell-text-tertiary hover:text-red-400 hover:bg-red-500/10 transition-colors cursor-pointer"
                 >
                   <Trash2 size={12} aria-hidden="true" />
                 </button>

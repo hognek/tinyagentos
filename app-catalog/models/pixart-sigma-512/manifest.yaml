@@ -1,7 +1,7 @@
 id: pixart-sigma-512
 name: PixArt-Σ 512
 type: model
-version: 1.0
+version: "1.0"
 capabilities:
 - image-generation
 description: Efficient DiT model — OpenRAIL++ licensed, strong prompt adherence, 0.6B
@@ -15,7 +15,7 @@ variants:
   size_mb: 1200
   min_ram_mb: 4096
   download_url: https://huggingface.co/PixArt-alpha/PixArt-Sigma-XL-2-512-MS/resolve/main/transformer/diffusion_pytorch_model.safetensors
-  sha256: ''
+  sha256: 20f3328e926039b2fbfa0094469bc6af2a034da39bab51ebbe2019ac455186ca
   quality: best
   requires:
     backends:

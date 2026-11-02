@@ -9,6 +9,9 @@ routes and middleware.
 """
 from __future__ import annotations
 
+import asyncio
+import time
+
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
@@ -20,6 +23,8 @@ from tinyagentos.agent_registry_store import (
 )
 from tinyagentos.agent_grants_store import AgentGrantsStore
 from tinyagentos.agent_scope_requests_store import AgentScopeRequestsStore
+from tinyagentos.base_store import PendingCapExceeded
+from taos_test_csrf import csrf_event_hooks
 
 
 class _Env:
@@ -95,7 +100,7 @@ async def test_owner_creates_and_approves_grant_on_existing_identity(
 
         resp = await client.post(
             f"/api/agents/registry/{cid}/scope-requests",
-            json={"requested_scopes": ["memory_read", "memory_write"], "reason": "need memory"},
+            json={"requested_scopes": ["a2a_send", "a2a_receive"], "reason": "need memory"},
         )
         assert resp.status_code == 200, resp.text
         req_id = resp.json()["request_id"]
@@ -104,14 +109,14 @@ async def test_owner_creates_and_approves_grant_on_existing_identity(
         # Admin narrows to a subset on approve.
         resp = await client.post(
             f"/api/agents/registry/{cid}/scope-requests/{req_id}/approve",
-            json={"granted_scopes": ["memory_read"]},
+            json={"granted_scopes": ["a2a_send"]},
         )
         assert resp.status_code == 200, resp.text
         assert resp.json()["canonical_id"] == cid
 
         # Grant landed on the EXISTING canonical_id, and NO new identity exists.
         grants = await env.grants.list_grants(cid)
-        assert {g["scope"] for g in grants} == {"memory_read"}
+        assert {g["scope"] for g in grants} == {"a2a_send"}
         assert all(g["project_id"] is None for g in grants)
         assert len(await env.registry.list_all()) == before  # no new identity
     finally:
@@ -141,6 +146,88 @@ async def test_agent_can_self_request_with_own_token(client, monkeypatch, tmp_pa
 
 
 @pytest.mark.asyncio
+async def test_agent_cannot_self_request_with_rotated_token(
+    client, monkeypatch, tmp_path
+):
+    """Rotating an identity's tokens must kill this route too.
+
+    Self-request is authorised by `check_agent_identity` alone -- no scope
+    grant is required, because the whole point is asking for a scope you do
+    not have.  So if that check skips the rotation cutoff, a leaked token
+    survives `rotate-tokens` on the one route that can widen its own
+    privileges.  Before the cutoff was enforced this returned 200 and left a
+    live `pending` request behind.
+
+    The status is 404, not 401: `_authorize_scope_request_creation`
+    deliberately folds every bad-credential outcome into the not-found body so
+    the pair (unknown target 404, existing target 401/403) cannot be used as an
+    existence oracle.  The load-bearing assertion is that nothing was created.
+    """
+    env = await _wire(client, monkeypatch, tmp_path)
+    try:
+        cid = await _register_active(env)
+        token = env.agent_token(cid)
+        # Owner rotates: every token minted before now is superseded.
+        await env.registry.bump_token_min_iat(cid, int(time.time()) + 3600)
+
+        app = client._transport.app
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as bare:
+            resp = await bare.post(
+                f"/api/agents/registry/{cid}/scope-requests",
+                headers={"Authorization": f"Bearer {token}"},
+                json={"requested_scopes": ["a2a_send"]},
+            )
+        assert resp.status_code == 404, resp.text
+        assert await env.scope_store.count_pending_for(cid) == 0
+    finally:
+        await env.close()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_self_requests_cannot_bypass_pending_cap(
+    client, monkeypatch, tmp_path
+):
+    """A burst from ONE agent must not push it past the per-agent pending cap.
+
+    A count-then-insert cap is bypassable by exactly the traffic it exists to
+    stop: every request in a concurrent burst reads the same pre-insert count,
+    every one of them passes the check, and every one of them inserts — so the
+    agent floods the approver's queue with as many pending rows as it can open
+    connections for.
+    """
+    from tinyagentos.routes.agent_auth_requests import _SCOPE_REQUEST_PENDING_CAP as cap
+
+    env = await _wire(client, monkeypatch, tmp_path)
+    try:
+        cid = await _register_active(env)
+        token = env.agent_token(cid)
+        app = client._transport.app
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as bare:
+            async def _create():
+                return await bare.post(
+                    f"/api/agents/registry/{cid}/scope-requests",
+                    headers={"Authorization": f"Bearer {token}"},
+                    json={"requested_scopes": ["a2a_send"]},
+                )
+
+            # No return_exceptions: a server-side crash must fail the test, not
+            # shrink the status list into a vacuous pass.
+            results = await asyncio.gather(*[_create() for _ in range(2 * cap)])
+
+        statuses = sorted(r.status_code for r in results)
+        assert statuses == [200] * cap + [429] * cap, (
+            f"cap race: expected exactly {cap} accepted, got {statuses}"
+        )
+        assert await env.scope_store.count_pending_for(cid) == cap
+    finally:
+        await env.close()
+
+
+@pytest.mark.asyncio
 async def test_agent_cannot_request_for_another_identity(client, monkeypatch, tmp_path):
     """Agent A's token must not create a scope request against agent B's id."""
     env = await _wire(client, monkeypatch, tmp_path)
@@ -157,7 +244,7 @@ async def test_agent_cannot_request_for_another_identity(client, monkeypatch, tm
                 headers={"Authorization": f"Bearer {token_a}"},
                 json={"requested_scopes": ["a2a_send"]},
             )
-        assert resp.status_code == 403, resp.text
+        assert resp.status_code == 404, resp.text
         assert await env.scope_store.count_pending_for(cid_b) == 0
     finally:
         await env.close()
@@ -169,7 +256,7 @@ async def test_unknown_canonical_id_404(client, monkeypatch, tmp_path):
     try:
         resp = await client.post(
             "/api/agents/registry/does-not-exist/scope-requests",
-            json={"requested_scopes": ["memory_read"]},
+            json={"requested_scopes": ["a2a_receive"]},
         )
         assert resp.status_code == 404, resp.text
     finally:
@@ -184,7 +271,7 @@ async def test_inactive_canonical_id_404(client, monkeypatch, tmp_path):
         await env.registry.revoke(cid)  # now inactive
         resp = await client.post(
             f"/api/agents/registry/{cid}/scope-requests",
-            json={"requested_scopes": ["memory_read"]},
+            json={"requested_scopes": ["a2a_receive"]},
         )
         assert resp.status_code == 404, resp.text
     finally:
@@ -215,11 +302,11 @@ async def test_granted_must_be_subset_of_requested_400(client, monkeypatch, tmp_
     try:
         cid = await _register_active(env)
         rec = await env.scope_store.create(
-            canonical_id=cid, requested_scopes=["memory_read"]
+            canonical_id=cid, requested_scopes=["a2a_receive"]
         )
         resp = await client.post(
             f"/api/agents/registry/{cid}/scope-requests/{rec['id']}/approve",
-            json={"granted_scopes": ["memory_read", "memory_write"]},
+            json={"granted_scopes": ["a2a_receive", "a2a_send"]},
         )
         assert resp.status_code == 400, resp.text
         # Nothing was granted on the rejected approval.
@@ -268,6 +355,37 @@ async def test_project_scope_requires_project_id_400(client, monkeypatch, tmp_pa
         await env.close()
 
 
+@pytest.mark.parametrize("scope", ["project_notes", "project_doc_review"])
+@pytest.mark.asyncio
+async def test_route_side_project_bound_scope_requires_project_id_400(
+    scope, client, monkeypatch, tmp_path
+):
+    """A scope the ROUTES authorize with check_agent_scope_for_project needs a
+    project binding, so approving it without one must be refused.
+
+    project_notes and project_doc_review are both guarded route-side by
+    check_agent_scope_for_project, which matches only a grant whose project_id
+    EQUALS the requested project. Approving either with no project_id writes a
+    global (project_id=None) grant that can never match: the operator sees a
+    successful approval and the agent has no access to the very routes the scope
+    exists for. Same failure mode as test_project_scope_set_is_a_single_definition.
+    """
+    env = await _wire(client, monkeypatch, tmp_path)
+    try:
+        cid = await _register_active(env)
+        rec = await env.scope_store.create(canonical_id=cid, requested_scopes=[scope])
+        resp = await client.post(
+            f"/api/agents/registry/{cid}/scope-requests/{rec['id']}/approve",
+            json={"granted_scopes": [scope]},
+        )
+        assert resp.status_code == 400, resp.text
+        assert "project_id" in resp.text
+        # Refused means refused: no inert global grant was written.
+        assert await env.grants.list_grants(cid) == []
+    finally:
+        await env.close()
+
+
 @pytest.mark.asyncio
 async def test_non_owner_cannot_approve(client, monkeypatch, tmp_path):
     """A non-admin user who does not own the agent cannot approve."""
@@ -283,18 +401,19 @@ async def test_non_owner_cannot_approve(client, monkeypatch, tmp_path):
     try:
         cid = await _register_active(env)
         rec = await env.scope_store.create(
-            canonical_id=cid, requested_scopes=["memory_read"]
+            canonical_id=cid, requested_scopes=["a2a_receive"]
         )
         async with AsyncClient(
             transport=ASGITransport(app=app),
             base_url="http://test",
             cookies={"taos_session": bob_session},
+            event_hooks=csrf_event_hooks(),
         ) as bob_client:
             resp = await bob_client.post(
                 f"/api/agents/registry/{cid}/scope-requests/{rec['id']}/approve",
-                json={"granted_scopes": ["memory_read"]},
+                json={"granted_scopes": ["a2a_receive"]},
             )
-        assert resp.status_code == 403, resp.text
+        assert resp.status_code == 404, resp.text
         assert await env.grants.list_grants(cid) == []
     finally:
         await env.close()
@@ -309,7 +428,7 @@ async def test_agent_cannot_approve_its_own_request(client, monkeypatch, tmp_pat
     try:
         cid = await _register_active(env)
         rec = await env.scope_store.create(
-            canonical_id=cid, requested_scopes=["memory_read"]
+            canonical_id=cid, requested_scopes=["a2a_receive"]
         )
         token = env.agent_token(cid)
         app = client._transport.app
@@ -319,7 +438,7 @@ async def test_agent_cannot_approve_its_own_request(client, monkeypatch, tmp_pat
             resp = await bare.post(
                 f"/api/agents/registry/{cid}/scope-requests/{rec['id']}/approve",
                 headers={"Authorization": f"Bearer {token}"},
-                json={"granted_scopes": ["memory_read"]},
+                json={"granted_scopes": ["a2a_receive"]},
             )
         # The middleware allowlist only exposes the create path to a registry JWT;
         # an agent token on /approve is NOT matched (the regex anchors at the
@@ -368,7 +487,7 @@ async def test_deny_marks_refused_and_second_deny_conflicts(client, monkeypatch,
     try:
         cid = await _register_active(env)
         rec = await env.scope_store.create(
-            canonical_id=cid, requested_scopes=["memory_read"]
+            canonical_id=cid, requested_scopes=["a2a_receive"]
         )
         resp = await client.post(
             f"/api/agents/registry/{cid}/scope-requests/{rec['id']}/deny",
@@ -395,11 +514,11 @@ async def test_approve_wrong_agent_path_404(client, monkeypatch, tmp_path):
         cid_a = await _register_active(env, handle="@a", display="a")
         cid_b = await _register_active(env, handle="@b", display="b")
         rec = await env.scope_store.create(
-            canonical_id=cid_a, requested_scopes=["memory_read"]
+            canonical_id=cid_a, requested_scopes=["a2a_receive"]
         )
         resp = await client.post(
             f"/api/agents/registry/{cid_b}/scope-requests/{rec['id']}/approve",
-            json={"granted_scopes": ["memory_read"]},
+            json={"granted_scopes": ["a2a_receive"]},
         )
         assert resp.status_code == 404, resp.text
     finally:
@@ -453,13 +572,14 @@ async def test_create_authorizes_before_scope_vocab(client, monkeypatch, tmp_pat
             transport=ASGITransport(app=app),
             base_url="http://test",
             cookies={"taos_session": carol_session},
+            event_hooks=csrf_event_hooks(),
         ) as carol_client:
             resp = await carol_client.post(
                 f"/api/agents/registry/{cid}/scope-requests",
                 json={"requested_scopes": ["not_a_real_scope"]},
             )
         # Authz runs first -> 403, NOT a 400 vocab error confirming the bad scope.
-        assert resp.status_code == 403, resp.text
+        assert resp.status_code == 404, resp.text
         assert "not_a_real_scope" not in resp.text
     finally:
         await env.close()
@@ -474,7 +594,7 @@ async def test_agent_cannot_deny_its_own_request(client, monkeypatch, tmp_path):
     try:
         cid = await _register_active(env)
         rec = await env.scope_store.create(
-            canonical_id=cid, requested_scopes=["memory_read"]
+            canonical_id=cid, requested_scopes=["a2a_receive"]
         )
         token = env.agent_token(cid)
         app = client._transport.app
@@ -493,6 +613,269 @@ async def test_agent_cannot_deny_its_own_request(client, monkeypatch, tmp_path):
         assert (await env.scope_store.get(rec["id"]))["status"] == "pending"
     finally:
         await env.close()
+
+
+@pytest.mark.asyncio
+async def test_scope_request_notification_uses_project_name_not_raw_id(client, monkeypatch, tmp_path):
+    """Scope request notifications should use the project's human name instead of its raw ID.
+
+    This ensures the bell/toast message matches the consent UI which already names
+    projects by their human name, making them recognizable to owners.
+    """
+    # Use the existing _wire function to set up the environment properly
+    env = await _wire(client, monkeypatch, tmp_path)
+
+    # Create a real project store and project
+    from tinyagentos.projects.project_store import ProjectStore
+    pstore = ProjectStore(tmp_path / "project.db")
+    await pstore.init()
+    
+    # Create a project with a known name
+    project = await pstore.create_project(
+        name="My Awesome Project",
+        slug="my-awesome-project",
+        description="A test project",
+        created_by=env.owner_uid,
+        user_id=env.owner_uid,
+    )
+    
+    # Monkeypatch the project store onto app.state
+    monkeypatch.setattr(client._transport.app.state, "project_store", pstore)
+
+    # Track notifications to verify the message content
+    notifications_calls = []
+    
+    async def mock_notif_add(**kwargs):
+        notifications_calls.append(kwargs)
+    
+    # Mock the notifications store with the corrected mock
+    mock_notif_store = type('MockNotifStore', (), {'add': staticmethod(mock_notif_add)})()
+    monkeypatch.setattr(client._transport.app.state, 'notifications', mock_notif_store)
+
+    # Register an active agent using the env
+    cid = await _register_active(env, handle="@worker", display="worker", framework="claude")
+
+    try:
+        # Create a scope request bound to our test project
+        resp = await client.post(
+            f"/api/agents/registry/{cid}/scope-requests",
+            json={
+                "requested_scopes": ["a2a_send", "a2a_receive"],
+                "project_id": project["id"],
+                "reason": "need communication",
+            },
+        )
+        assert resp.status_code == 200, resp.text
+
+        # Verify the notification was called with project name, not raw ID
+        assert len(notifications_calls) == 1, f"Expected 1 notification, got {len(notifications_calls)}"
+        
+        notif = notifications_calls[0]
+        message = notif['message']
+        
+        # The message should contain the project name, not the raw ID
+        assert f"project {project['name']}" in message, f"Message should contain project name '{project['name']}', but message was: {message}"
+        assert f"project {project['id']}" not in message, f"Message should NOT contain raw project ID '{project['id']}', but message was: {message}"
+        assert "@worker is requesting a2a_send, a2a_receive on project My Awesome Project" in message
+
+    finally:
+        await env.close()
+        await pstore.close()
+        # Restore original notifications store
+        monkeypatch.undo()
+
+
+@pytest.mark.asyncio
+async def test_scope_request_notification_fallbacks(client, monkeypatch, tmp_path):
+    """Test the three fallback cases for scope request notifications:
+    1. Empty project name - falls back to raw ID
+    2. Missing project store - falls back to raw ID  
+    3. Project is None (deleted/unknown) - falls back to raw ID
+    """
+    # Use the existing _wire function to set up the environment properly
+    env = await _wire(client, monkeypatch, tmp_path)
+    
+    # Create a real project store
+    from tinyagentos.projects.project_store import ProjectStore
+    pstore = ProjectStore(tmp_path / "project.db")
+    await pstore.init()
+    
+    # Create a project with a known name for the happy path
+    good_project = await pstore.create_project(
+        name="Good Project",
+        slug="good-project",
+        description="A good project",
+        created_by=env.owner_uid,
+        user_id=env.owner_uid,
+    )
+    
+    # Register an active agent using the env - use a different handle for this test
+    cid = await _register_active(env, handle="@fallback-worker", display="fallback-worker", framework="claude")
+    
+    # Monkeypatch the project store onto app.state initially
+    monkeypatch.setattr(client._transport.app.state, "project_store", pstore)
+    
+    # Test 1: Empty project name - falls back to raw ID
+    # Create project with empty name
+    empty_name_project = await pstore.create_project(
+        name="",  # Empty name
+        slug="empty-name-project",
+        description="A project with empty name",
+        created_by=env.owner_uid,
+        user_id=env.owner_uid,
+    )
+    
+    # Track notifications for this test
+    empty_name_notifications = []
+    async def empty_name_notif_add(**kwargs):
+        empty_name_notifications.append(kwargs)
+    
+    mock_notif_store = type('MockNotifStore', (), {'add': staticmethod(empty_name_notif_add)})()
+    monkeypatch.setattr(client._transport.app.state, 'notifications', mock_notif_store)
+    
+    # Create a scope request bound to empty name project
+    resp = await client.post(
+        f"/api/agents/registry/{cid}/scope-requests",
+        json={
+            "requested_scopes": ["a2a_send"],
+            "project_id": empty_name_project["id"],
+            "reason": "test",
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    
+    # Verify the notification was called with raw ID (not empty name)
+    assert len(empty_name_notifications) == 1
+    notif = empty_name_notifications[0]
+    assert f"project {empty_name_project['id']}" in notif['message']
+    # Should contain "project " but not the empty name
+    
+    # Test 2: Missing project store - falls back to raw ID
+    # Track notifications
+    missing_store_notifications = []
+    async def missing_store_notif_add(**kwargs):
+        missing_store_notifications.append(kwargs)
+    
+    mock_notif_store = type('MockNotifStore', (), {'add': staticmethod(missing_store_notif_add)})()
+    monkeypatch.setattr(client._transport.app.state, 'notifications', mock_notif_store)
+    
+    # Remove project store from app.state
+    monkeypatch.setattr(client._transport.app.state, 'project_store', None)
+    
+    # Create a scope request without project store
+    resp = await client.post(
+        f"/api/agents/registry/{cid}/scope-requests",
+        json={
+            "requested_scopes": ["a2a_receive"],
+            "project_id": good_project["id"],  # Good project still exists
+            "reason": "test",
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    
+    # Verify the notification was called with raw ID (no project store to look up)
+    assert len(missing_store_notifications) == 1
+    notif = missing_store_notifications[0]
+    assert f"project {good_project['id']}" in notif['message']
+    
+    # Test 3: Project is None (deleted/unknown) - falls back to raw ID
+    # Track notifications
+    none_project_notifications = []
+    async def none_project_notif_add(**kwargs):
+        none_project_notifications.append(kwargs)
+    
+    mock_notif_store = type('MockNotifStore', (), {'add': staticmethod(none_project_notif_add)})()
+    monkeypatch.setattr(client._transport.app.state, 'notifications', mock_notif_store)
+    
+    # Re-set project store
+    monkeypatch.setattr(client._transport.app.state, 'project_store', pstore)
+    
+    # Create a scope request for a project that doesn't exist (ID is valid UUID but won't be found)
+    # Use a fake project ID that won't be found in the store
+    import uuid
+    fake_project_id = str(uuid.uuid4())
+    
+    resp = await client.post(
+        f"/api/agents/registry/{cid}/scope-requests",
+        json={
+            "requested_scopes": ["files_read"],
+            "project_id": fake_project_id,  # Project doesn't exist
+            "reason": "test",
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    
+    # Verify the notification was called with raw ID (project is None/not found)
+    assert len(none_project_notifications) == 1
+    notif = none_project_notifications[0]
+    assert f"project {fake_project_id}" in notif['message']
+    
+    # Clean up
+    await env.close()
+    await pstore.close()
+    # Restore original notifications store
+    monkeypatch.undo()
+
+
+@pytest.mark.asyncio
+async def test_scope_request_notification_falls_back_when_get_project_raises(
+    client, monkeypatch, tmp_path
+):
+    """If project_store.get_project raises, the notification must still be
+    delivered with the raw project id in place of the human name.
+    """
+    env = await _wire(client, monkeypatch, tmp_path)
+
+    from tinyagentos.projects.project_store import ProjectStore
+
+    pstore = ProjectStore(tmp_path / "project.db")
+    await pstore.init()
+
+    project = await pstore.create_project(
+        name="Raising Project",
+        slug="raising-project",
+        description="A project whose store will raise",
+        created_by=env.owner_uid,
+        user_id=env.owner_uid,
+    )
+
+    async def raising_get_project(project_id):
+        raise RuntimeError("project store boom")
+
+    monkeypatch.setattr(client._transport.app.state, "project_store", pstore)
+    monkeypatch.setattr(
+        client._transport.app.state.project_store,
+        "get_project",
+        raising_get_project,
+    )
+
+    recorded = []
+
+    async def capture_notif(**kwargs):
+        recorded.append(kwargs)
+
+    mock_notif_store = type("MockNotifStore", (), {"add": staticmethod(capture_notif)})()
+    monkeypatch.setattr(client._transport.app.state, "notifications", mock_notif_store)
+
+    cid = await _register_active(env, handle="@raiser", display="raiser", framework="claude")
+
+    try:
+        resp = await client.post(
+            f"/api/agents/registry/{cid}/scope-requests",
+            json={
+                "requested_scopes": ["a2a_send"],
+                "project_id": project["id"],
+                "reason": "boom",
+            },
+        )
+        assert resp.status_code == 200, resp.text
+
+        assert len(recorded) == 1
+        assert f"project {project['id']}" in recorded[0]["message"]
+    finally:
+        await env.close()
+        await pstore.close()
+        monkeypatch.undo()
 
 
 @pytest.mark.asyncio
@@ -570,6 +953,9 @@ def test_project_scope_set_is_a_single_definition():
         "project_tasks",
         "project_tasks_create",
         "project_tasks_update",
+        "project_lists",
+        "project_notes",
+        "project_doc_review",
         "canvas_read",
         "canvas_write",
         "files_read",
@@ -598,3 +984,835 @@ def test_every_project_bound_scope_is_a_valid_scope():
     from tinyagentos.routes.agent_auth_requests import VALID_SCOPES, _PROJECT_SCOPES
 
     assert _PROJECT_SCOPES <= set(VALID_SCOPES)
+
+
+# ---------------------------------------------------------------------------
+# Existence-hiding: non-owner vs non-existent must be byte-identical
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_create_scope_request_non_owner_and_nonexistent_identical(
+    client, monkeypatch, tmp_path
+):
+    """An authenticated non-owner and a nonexistent canonical_id must produce
+    byte-identical responses on create_scope_request (status + body)."""
+    app = client._transport.app
+    code = app.state.auth.add_user_invite("carol", "admin")
+    app.state.auth.complete_invite("carol", code, "Carol", "", "carpass123")
+    carol = app.state.auth.find_user("carol")
+    carol_session = app.state.auth.create_session(user_id=carol["id"], long_lived=True)
+
+    env = await _wire(client, monkeypatch, tmp_path)
+    try:
+        cid = await _register_active(env)  # owned by admin, not carol
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+            cookies={"taos_session": carol_session},
+            event_hooks=csrf_event_hooks(),
+        ) as carol_client:
+            resp_owner = await carol_client.post(
+                f"/api/agents/registry/{cid}/scope-requests",
+                json={"requested_scopes": ["a2a_receive"]},
+            )
+            # Same caller for the nonexistent probe: an admin would 404 on a
+            # missing id too, but the contract under test is what ONE
+            # unprivileged caller can distinguish.
+            resp_nonexistent = await carol_client.post(
+                "/api/agents/registry/does-not-exist/scope-requests",
+                json={"requested_scopes": ["a2a_receive"]},
+            )
+
+        assert resp_owner.status_code == resp_nonexistent.status_code == 404
+        assert resp_owner.content == resp_nonexistent.content
+    finally:
+        await env.close()
+
+
+@pytest.mark.asyncio
+async def test_approve_scope_request_non_owner_and_nonexistent_identical(
+    client, monkeypatch, tmp_path
+):
+    """An authenticated non-owner and a nonexistent canonical_id must produce
+    byte-identical responses on approve_scope_request (status + body)."""
+    app = client._transport.app
+    code = app.state.auth.add_user_invite("carol", "admin")
+    app.state.auth.complete_invite("carol", code, "Carol", "", "carpass123")
+    carol = app.state.auth.find_user("carol")
+    carol_session = app.state.auth.create_session(user_id=carol["id"], long_lived=True)
+
+    env = await _wire(client, monkeypatch, tmp_path)
+    try:
+        cid = await _register_active(env)  # owned by admin, not carol
+        rec = await env.scope_store.create(
+            canonical_id=cid, requested_scopes=["a2a_receive"]
+        )
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+            cookies={"taos_session": carol_session},
+            event_hooks=csrf_event_hooks(),
+        ) as carol_client:
+            resp_owner = await carol_client.post(
+                f"/api/agents/registry/{cid}/scope-requests/{rec['id']}/approve",
+                json={"granted_scopes": ["a2a_receive"]},
+            )
+            resp_nonexistent = await carol_client.post(
+                "/api/agents/registry/does-not-exist/scope-requests/does-not-exist/approve",
+                json={"granted_scopes": ["a2a_receive"]},
+            )
+
+        assert resp_owner.status_code == resp_nonexistent.status_code == 404
+        assert resp_owner.content == resp_nonexistent.content
+    finally:
+        await env.close()
+
+
+@pytest.mark.asyncio
+async def test_deny_scope_request_non_owner_and_nonexistent_identical(
+    client, monkeypatch, tmp_path
+):
+    """An authenticated non-owner and a nonexistent canonical_id must produce
+    byte-identical responses on deny_scope_request (status + body)."""
+    app = client._transport.app
+    code = app.state.auth.add_user_invite("carol", "admin")
+    app.state.auth.complete_invite("carol", code, "Carol", "", "carpass123")
+    carol = app.state.auth.find_user("carol")
+    carol_session = app.state.auth.create_session(user_id=carol["id"], long_lived=True)
+
+    env = await _wire(client, monkeypatch, tmp_path)
+    try:
+        cid = await _register_active(env)  # owned by admin, not carol
+        rec = await env.scope_store.create(
+            canonical_id=cid, requested_scopes=["a2a_receive"]
+        )
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+            cookies={"taos_session": carol_session},
+            event_hooks=csrf_event_hooks(),
+        ) as carol_client:
+            resp_owner = await carol_client.post(
+                f"/api/agents/registry/{cid}/scope-requests/{rec['id']}/deny",
+            )
+            resp_nonexistent = await carol_client.post(
+                "/api/agents/registry/does-not-exist/scope-requests/does-not-exist/deny",
+            )
+
+        assert resp_owner.status_code == resp_nonexistent.status_code == 404
+        assert resp_owner.content == resp_nonexistent.content
+    finally:
+        await env.close()
+
+
+@pytest.mark.asyncio
+async def test_create_scope_request_inactive_token_no_existence_oracle(
+    client, monkeypatch, tmp_path
+):
+    """A suspended agent's (validly signed) token must get the SAME response
+    for an existing target as for a nonexistent one. Before the fix,
+    check_agent_identity's 403 surfaced only when the target existed (an
+    unknown target 404s first), disclosing existence through the
+    credential-error path."""
+    env = await _wire(client, monkeypatch, tmp_path)
+    try:
+        cid_target = await _register_active(env, handle="@target", display="target")
+        cid_b = await _register_active(env, handle="@suspended", display="suspended")
+        token_b = env.agent_token(cid_b)
+        await env.registry.set_status(cid_b, "suspended", actor="test")
+
+        app = client._transport.app
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as bare:
+            resp_existing = await bare.post(
+                f"/api/agents/registry/{cid_target}/scope-requests",
+                headers={"Authorization": f"Bearer {token_b}"},
+                json={"requested_scopes": ["a2a_send"]},
+            )
+            resp_missing = await bare.post(
+                "/api/agents/registry/does-not-exist/scope-requests",
+                headers={"Authorization": f"Bearer {token_b}"},
+                json={"requested_scopes": ["a2a_send"]},
+            )
+
+        assert resp_existing.status_code == resp_missing.status_code == 404
+        assert resp_existing.content == resp_missing.content
+        assert await env.scope_store.count_pending_for(cid_target) == 0
+    finally:
+        await env.close()
+
+
+# ---------------------------------------------------------------------------
+# Read: list + get-by-id
+#
+# Without these routes a pending request is unobservable once the notification
+# carrying its request_id is dismissed -- the row stays in the store, keeps
+# consuming the pending cap, and is addressable by nobody. The reads are
+# authorized EXACTLY like create (the agent itself, or its owner/admin), and a
+# caller who is neither gets the same existence-hiding 404 the neighbouring
+# routes return.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_get_scope_request_by_id(client, monkeypatch, tmp_path):
+    """Create a request, then read it back by id and see it is still pending."""
+    env = await _wire(client, monkeypatch, tmp_path)
+    try:
+        cid = await _register_active(env)
+
+        resp = await client.post(
+            f"/api/agents/registry/{cid}/scope-requests",
+            json={"requested_scopes": ["a2a_send"], "reason": "need memory"},
+        )
+        assert resp.status_code == 200, resp.text
+        req_id = resp.json()["request_id"]
+
+        resp = await client.get(
+            f"/api/agents/registry/{cid}/scope-requests/{req_id}"
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["id"] == req_id
+        assert body["canonical_id"] == cid
+        assert body["status"] == "pending"
+        assert body["requested_scopes"] == ["a2a_send"]
+        assert body["reason"] == "need memory"
+        assert body["granted_scopes"] is None
+    finally:
+        await env.close()
+
+
+@pytest.mark.asyncio
+async def test_cannot_read_another_owners_scope_request(
+    client, monkeypatch, tmp_path
+):
+    """An authenticated non-owner reading someone else's agent's request must
+    get the same existence-hiding response as a nonexistent agent -- byte for
+    byte, so the route is not an existence oracle."""
+    app = client._transport.app
+    code = app.state.auth.add_user_invite("carol", "admin")
+    app.state.auth.complete_invite("carol", code, "Carol", "", "carpass123")
+    carol = app.state.auth.find_user("carol")
+    carol_session = app.state.auth.create_session(user_id=carol["id"], long_lived=True)
+
+    env = await _wire(client, monkeypatch, tmp_path)
+    try:
+        cid = await _register_active(env)  # owned by admin, not carol
+        rec = await env.scope_store.create(
+            canonical_id=cid, requested_scopes=["a2a_receive"]
+        )
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+            cookies={"taos_session": carol_session},
+        ) as carol_client:
+            resp_owned = await carol_client.get(
+                f"/api/agents/registry/{cid}/scope-requests/{rec['id']}"
+            )
+            resp_nonexistent = await carol_client.get(
+                "/api/agents/registry/does-not-exist/scope-requests/does-not-exist"
+            )
+            resp_list = await carol_client.get(
+                f"/api/agents/registry/{cid}/scope-requests"
+            )
+            resp_list_nonexistent = await carol_client.get(
+                "/api/agents/registry/does-not-exist/scope-requests"
+            )
+
+        assert resp_owned.status_code == 404
+        # The neighbouring routes' existence-hiding shape, not a bare 403 and
+        # not FastAPI's routing 404 -- carol must learn nothing about cid.
+        assert resp_owned.json() == {"detail": "agent not found or not active"}
+        assert resp_owned.status_code == resp_nonexistent.status_code
+        assert resp_owned.content == resp_nonexistent.content
+        assert resp_list.status_code == 404
+        assert resp_list.json() == {"detail": "agent not found or not active"}
+        assert resp_list.status_code == resp_list_nonexistent.status_code
+        assert resp_list.content == resp_list_nonexistent.content
+    finally:
+        await env.close()
+
+
+@pytest.mark.asyncio
+async def test_list_scope_requests_filters_by_status(client, monkeypatch, tmp_path):
+    """The owner lists an agent's requests, decided ones included, and may
+    narrow to a single status."""
+    env = await _wire(client, monkeypatch, tmp_path)
+    try:
+        cid = await _register_active(env)
+        pending = await env.scope_store.create(
+            canonical_id=cid, requested_scopes=["a2a_receive"]
+        )
+        decided = await env.scope_store.create(
+            canonical_id=cid, requested_scopes=["a2a_send"]
+        )
+        await env.scope_store.set_decision(
+            decided["id"], "refused", decided_by=env.admin_uid
+        )
+
+        resp = await client.get(f"/api/agents/registry/{cid}/scope-requests")
+        assert resp.status_code == 200, resp.text
+        ids = [r["id"] for r in resp.json()["requests"]]
+        assert set(ids) == {pending["id"], decided["id"]}
+
+        resp = await client.get(
+            f"/api/agents/registry/{cid}/scope-requests", params={"status": "pending"}
+        )
+        assert resp.status_code == 200, resp.text
+        assert [r["id"] for r in resp.json()["requests"]] == [pending["id"]]
+
+        resp = await client.get(
+            f"/api/agents/registry/{cid}/scope-requests", params={"status": "refused"}
+        )
+        assert resp.status_code == 200, resp.text
+        assert [r["id"] for r in resp.json()["requests"]] == [decided["id"]]
+    finally:
+        await env.close()
+
+
+@pytest.mark.asyncio
+async def test_agent_reads_its_own_scope_requests_with_own_token(
+    client, monkeypatch, tmp_path
+):
+    """The agent's own registry token can list and read its own requests --
+    the same credential that is allowed to create them."""
+    env = await _wire(client, monkeypatch, tmp_path)
+    try:
+        cid = await _register_active(env)
+        token = env.agent_token(cid)
+        app = client._transport.app
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as bare:
+            created = await bare.post(
+                f"/api/agents/registry/{cid}/scope-requests",
+                headers={"Authorization": f"Bearer {token}"},
+                json={"requested_scopes": ["a2a_send"]},
+            )
+            assert created.status_code == 200, created.text
+            req_id = created.json()["request_id"]
+
+            listed = await bare.get(
+                f"/api/agents/registry/{cid}/scope-requests",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            one = await bare.get(
+                f"/api/agents/registry/{cid}/scope-requests/{req_id}",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
+        assert listed.status_code == 200, listed.text
+        assert [r["id"] for r in listed.json()["requests"]] == [req_id]
+        assert one.status_code == 200, one.text
+        assert one.json()["status"] == "pending"
+    finally:
+        await env.close()
+
+
+@pytest.mark.asyncio
+async def test_agent_cannot_read_another_agents_scope_requests(
+    client, monkeypatch, tmp_path
+):
+    """Agent A's token must not list or read agent B's scope requests, even
+    though both agents share an owner."""
+    env = await _wire(client, monkeypatch, tmp_path)
+    try:
+        cid_a = await _register_active(env, handle="@a", display="a")
+        cid_b = await _register_active(env, handle="@b", display="b")
+        rec_b = await env.scope_store.create(
+            canonical_id=cid_b, requested_scopes=["a2a_receive"]
+        )
+        token_a = env.agent_token(cid_a)
+
+        app = client._transport.app
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as bare:
+            listed = await bare.get(
+                f"/api/agents/registry/{cid_b}/scope-requests",
+                headers={"Authorization": f"Bearer {token_a}"},
+            )
+            one = await bare.get(
+                f"/api/agents/registry/{cid_b}/scope-requests/{rec_b['id']}",
+                headers={"Authorization": f"Bearer {token_a}"},
+            )
+            missing = await bare.get(
+                "/api/agents/registry/does-not-exist/scope-requests",
+                headers={"Authorization": f"Bearer {token_a}"},
+            )
+
+        assert listed.status_code == 404, listed.text
+        assert one.status_code == 404, one.text
+        # The existence-hiding shape, not a bare 403 and not a middleware 401:
+        # agent A must not be able to tell agent B's id from a made-up one.
+        assert listed.json() == {"detail": "agent not found or not active"}
+        assert one.json() == {"detail": "agent not found or not active"}
+        assert listed.content == missing.content
+    finally:
+        await env.close()
+
+
+@pytest.mark.asyncio
+async def test_get_scope_request_wrong_agent_path_404(client, monkeypatch, tmp_path):
+    """A request id that belongs to a DIFFERENT agent is not readable through
+    another agent's path, even for the owner of both."""
+    env = await _wire(client, monkeypatch, tmp_path)
+    try:
+        cid_a = await _register_active(env, handle="@a", display="a")
+        cid_b = await _register_active(env, handle="@b", display="b")
+        rec = await env.scope_store.create(
+            canonical_id=cid_a, requested_scopes=["a2a_receive"]
+        )
+
+        resp = await client.get(
+            f"/api/agents/registry/{cid_b}/scope-requests/{rec['id']}"
+        )
+        assert resp.status_code == 404, resp.text
+        # The route reached the store and rejected the mismatch; this is NOT
+        # FastAPI's "Not Found" from having no route at all.
+        assert resp.json() == {"detail": "scope request not found"}
+    finally:
+        await env.close()
+
+
+@pytest.mark.asyncio
+async def test_list_scope_requests_rejects_unknown_status(
+    client, monkeypatch, tmp_path
+):
+    """An unknown status filter is a 400, not a silently-empty list."""
+    env = await _wire(client, monkeypatch, tmp_path)
+    try:
+        cid = await _register_active(env)
+        resp = await client.get(
+            f"/api/agents/registry/{cid}/scope-requests", params={"status": "bogus"}
+        )
+        assert resp.status_code == 400, resp.text
+        assert "bogus" in resp.text
+    finally:
+        await env.close()
+
+
+# ---------------------------------------------------------------------------
+# Read-route response shape and bounds (review fold)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_read_routes_do_not_leak_decided_by(client, monkeypatch, tmp_path):
+    """The read routes must not hand back the DECIDING USER'S id.
+
+    The stored row carries ``decided_by`` (the owner/admin user_id that
+    approved or denied). An agent holding only its own registry token is
+    allowed to read its own requests, so returning the raw row would hand that
+    agent its owner's internal user id -- an identifier it has no other route
+    to. Both reads must project an explicit public shape instead: the decision
+    stays observable through ``status`` / ``decided_ts`` / ``granted_scopes``,
+    only the deciding identity is withheld.
+    """
+    env = await _wire(client, monkeypatch, tmp_path)
+    try:
+        cid = await _register_active(env)
+        rec = await env.scope_store.create(
+            canonical_id=cid, requested_scopes=["a2a_receive"]
+        )
+        decided = await env.scope_store.set_decision(
+            rec["id"], "refused", decided_by=env.admin_uid
+        )
+        assert decided is not None
+        # The store still records it -- this is a response-shape defect, not a
+        # storage one, so the audit trail must survive the fix.
+        assert decided["decided_by"] == env.admin_uid
+
+        expected_keys = {
+            "id",
+            "canonical_id",
+            "requested_scopes",
+            "project_id",
+            "reason",
+            "status",
+            "granted_scopes",
+            "created_ts",
+            "decided_ts",
+            # Opted in by tsk-6ghcrv: the approver's refusal reason.
+            "deny_reason",
+        }
+
+        owner_one = await client.get(
+            f"/api/agents/registry/{cid}/scope-requests/{rec['id']}"
+        )
+        owner_list = await client.get(f"/api/agents/registry/{cid}/scope-requests")
+
+        token = env.agent_token(cid)
+        app = client._transport.app
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as bare:
+            agent_one = await bare.get(
+                f"/api/agents/registry/{cid}/scope-requests/{rec['id']}",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            agent_list = await bare.get(
+                f"/api/agents/registry/{cid}/scope-requests",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
+        for resp in (owner_one, agent_one):
+            assert resp.status_code == 200, resp.text
+            body = resp.json()
+            assert "decided_by" not in body
+            assert set(body) == expected_keys
+            # Redaction must not blind the caller to WHETHER it was decided,
+            # only to BY WHOM.
+            assert body["status"] == "refused"
+            assert body["decided_ts"] == decided["decided_ts"]
+
+        for resp in (owner_list, agent_list):
+            assert resp.status_code == 200, resp.text
+            rows = resp.json()["requests"]
+            assert len(rows) == 1
+            assert "decided_by" not in rows[0]
+            assert set(rows[0]) == expected_keys
+            assert rows[0]["status"] == "refused"
+
+        # And no serialisation of the id survives anywhere in the payloads.
+        for resp in (owner_one, agent_one, owner_list, agent_list):
+            assert env.admin_uid not in resp.text
+    finally:
+        await env.close()
+
+
+@pytest.mark.asyncio
+async def test_list_scope_requests_is_bounded_and_keeps_pending(
+    client, monkeypatch, tmp_path
+):
+    """The list response is capped, and the cap never truncates a PENDING row.
+
+    Decided rows are never deleted, so an unbounded ``SELECT *`` grows with an
+    agent's whole decision history. Capping naively by "oldest first" would
+    drop the newest rows; capping by "newest first" would drop an OLD pending
+    request -- precisely the row these routes exist to recover. Pending rows
+    are therefore selected ahead of decided ones, and the page is still
+    returned oldest-first.
+    """
+    from tinyagentos import agent_scope_requests_store as srs
+
+    monkeypatch.setattr(srs, "DEFAULT_LIST_LIMIT", 3)
+
+    env = await _wire(client, monkeypatch, tmp_path)
+    try:
+        cid = await _register_active(env)
+        # Oldest row of all, and the only pending one.
+        pending = await env.scope_store.create(
+            canonical_id=cid, requested_scopes=["a2a_receive"]
+        )
+        decided_ids = []
+        for _ in range(5):
+            rec = await env.scope_store.create(
+                canonical_id=cid, requested_scopes=["a2a_send"]
+            )
+            await env.scope_store.set_decision(
+                rec["id"], "refused", decided_by=env.admin_uid
+            )
+            decided_ids.append(rec["id"])
+
+        resp = await client.get(f"/api/agents/registry/{cid}/scope-requests")
+        assert resp.status_code == 200, resp.text
+        rows = resp.json()["requests"]
+        ids = [r["id"] for r in rows]
+
+        assert len(rows) == 3, ids
+        assert pending["id"] in ids
+        # Newest decided survives; the oldest decided row is what got dropped.
+        assert decided_ids[-1] in ids
+        assert decided_ids[0] not in ids
+        # Still oldest-first within the page.
+        assert [r["created_ts"] for r in rows] == sorted(
+            r["created_ts"] for r in rows
+        )
+    finally:
+        await env.close()
+
+
+@pytest.mark.asyncio
+async def test_list_scope_requests_status_filter_is_case_insensitive(
+    client, monkeypatch, tmp_path
+):
+    """``?status=Pending`` is a casing typo, not an unknown status.
+
+    The vocabulary is lowercase by convention; a mixed-case value from a script
+    must select the same rows rather than hard-400 an authorized caller.
+    """
+    env = await _wire(client, monkeypatch, tmp_path)
+    try:
+        cid = await _register_active(env)
+        pending = await env.scope_store.create(
+            canonical_id=cid, requested_scopes=["a2a_receive"]
+        )
+        decided = await env.scope_store.create(
+            canonical_id=cid, requested_scopes=["a2a_send"]
+        )
+        await env.scope_store.set_decision(
+            decided["id"], "refused", decided_by=env.admin_uid
+        )
+
+        resp = await client.get(
+            f"/api/agents/registry/{cid}/scope-requests", params={"status": "PENDING"}
+        )
+        assert resp.status_code == 200, resp.text
+        assert [r["id"] for r in resp.json()["requests"]] == [pending["id"]]
+
+        resp = await client.get(
+            f"/api/agents/registry/{cid}/scope-requests", params={"status": "Refused"}
+        )
+        assert resp.status_code == 200, resp.text
+        assert [r["id"] for r in resp.json()["requests"]] == [decided["id"]]
+
+        # A genuinely unknown status is still a 400, not a silent empty list.
+        resp = await client.get(
+            f"/api/agents/registry/{cid}/scope-requests", params={"status": "Bogus"}
+        )
+        assert resp.status_code == 400, resp.text
+    finally:
+        await env.close()
+
+
+@pytest.mark.asyncio
+async def test_list_keeps_the_oldest_pending_even_past_the_route_cap(tmp_path):
+    """A full page drops the NEWEST pending rows, never the oldest.
+
+    The read path must not depend on the ten-per-agent pending cap holding,
+    however that cap is enforced: the oldest pending request is the one whose
+    notification is long gone and whose id nobody has any more, so it is the
+    last row a full page may drop. Newer pending rows are the ones the caller
+    just created and still holds ids for.
+    """
+    store = AgentScopeRequestsStore(tmp_path / "scope.db")
+    await store.init()
+    try:
+        pending_ids = []
+        for _ in range(5):
+            rec = await store.create(
+                canonical_id="agent-1", requested_scopes=["a2a_receive"]
+            )
+            pending_ids.append(rec["id"])
+
+        page = await store.list_for("agent-1", limit=3)
+        assert [r["id"] for r in page] == pending_ids[:3]
+
+        # Same guarantee through the status filter the desktop app uses.
+        page = await store.list_for("agent-1", "pending", limit=3)
+        assert [r["id"] for r in page] == pending_ids[:3]
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_list_for_page_does_not_sort_the_whole_history(tmp_path, monkeypatch):
+    """The LIMIT must bound the DATABASE WORK, not just the response size.
+
+    Ordering by an expression SQLite cannot serve from an index forces
+    ``USE TEMP B-TREE FOR ORDER BY``: every retained row for the agent is read
+    and sorted before the LIMIT is applied, so read cost still tracks the
+    decision history the cap was meant to stop tracking. Assert on the plan of
+    the queries the store ACTUALLY issues rather than on a copy of them.
+    """
+    store = AgentScopeRequestsStore(tmp_path / "scope.db")
+    await store.init()
+    try:
+        for _ in range(3):
+            rec = await store.create(
+                canonical_id="agent-1", requested_scopes=["a2a_receive"]
+            )
+            await store.set_decision(rec["id"], "refused", decided_by="u1")
+        await store.create(canonical_id="agent-1", requested_scopes=["a2a_send"])
+
+        captured: list[tuple] = []
+        original = store._db.execute
+
+        async def _spy(sql, params=()):
+            captured.append((sql, params))
+            return await original(sql, params)
+
+        monkeypatch.setattr(store._db, "execute", _spy)
+        await store.list_for("agent-1")
+        await store.list_for("agent-1", "refused")
+        monkeypatch.undo()
+
+        assert captured, "list_for issued no queries"
+        for sql, params in captured:
+            rows = await (
+                await store._db.execute("EXPLAIN QUERY PLAN " + sql, params)
+            ).fetchall()
+            plan = " | ".join(str(r[-1]) for r in rows)
+            assert "TEMP B-TREE" not in plan, f"{sql!r} sorts the history: {plan}"
+            assert "idx_scope_requests_canonical_created" in plan, (
+                f"{sql!r} does not use the ordered index: {plan}"
+            )
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_store_create_enforces_pending_cap_atomically(tmp_path):
+    """``create(pending_cap=N)`` admits exactly N pending rows under a burst.
+
+    The guard lives in the INSERT itself, so it holds no matter how the
+    caller's awaits interleave — a caller that checked the count first would
+    hand every racer the same stale answer.
+    """
+    store = AgentScopeRequestsStore(tmp_path / "scope.db")
+    await store.init()
+    try:
+        results = await asyncio.gather(
+            *[
+                store.create(
+                    canonical_id="agent-1",
+                    requested_scopes=["a2a_receive"],
+                    pending_cap=3,
+                )
+                for _ in range(9)
+            ],
+            return_exceptions=True,
+        )
+        created = [r for r in results if isinstance(r, dict)]
+        refused = [r for r in results if isinstance(r, PendingCapExceeded)]
+        assert len(created) == 3, f"expected 3 inserts, got {results}"
+        assert len(refused) == 6, f"expected 6 refusals, got {results}"
+        assert await store.count_pending_for("agent-1") == 3
+        assert refused[0].cap == 3
+
+        # The cap counts PENDING rows only: deciding one frees a slot.
+        await store.set_decision(created[0]["id"], "refused", decided_by="u1")
+        rec = await store.create(
+            canonical_id="agent-1", requested_scopes=["a2a_send"], pending_cap=3
+        )
+        assert rec["status"] == "pending"
+
+        # A different agent has its own budget.
+        other = await store.create(
+            canonical_id="agent-2", requested_scopes=["a2a_send"], pending_cap=3
+        )
+        assert other["canonical_id"] == "agent-2"
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_create_persists_duration_secs(tmp_path):
+    """AgentScopeRequestsStore.create must persist duration_secs so that
+    approve_scope_request can derive expires_at from it."""
+    store = AgentScopeRequestsStore(tmp_path / "scope.db")
+    await store.init()
+    try:
+        rec = await store.create(
+            canonical_id="agent-1",
+            requested_scopes=["a2a_receive"],
+            duration_secs=3600,
+        )
+        assert rec["duration_secs"] == 3600
+
+        back = await store.get(rec["id"])
+        assert back is not None
+        assert back["duration_secs"] == 3600
+
+        none_rec = await store.create(
+            canonical_id="agent-1",
+            requested_scopes=["a2a_send"],
+            duration_secs=None,
+        )
+        assert none_rec["duration_secs"] is None
+    finally:
+        await store.close()
+
+
+# ---------------------------------------------------------------------------
+# Deny reason (tsk-6ghcrv): the Decisions app requires a reason to deny, and
+# the reason is recorded on the row and readable by the agent that asked.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_deny_records_reason_and_clears_pending(client, monkeypatch, tmp_path):
+    env = await _wire(client, monkeypatch, tmp_path)
+    try:
+        cid = await _register_active(env)
+        rec = await env.scope_store.create(
+            canonical_id=cid,
+            requested_scopes=["decisions_read", "decisions_write"],
+            project_id=None,
+            reason="ask the user questions",
+        )
+        resp = await client.post(
+            f"/api/agents/registry/{cid}/scope-requests/{rec['id']}/deny",
+            json={"reason": "too broad for an OS-wide grant"},
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["status"] == "refused"
+
+        # The reason is persisted and part of the public read shape, so the
+        # agent can learn WHY it was refused instead of re-filing blind.
+        one = await client.get(f"/api/agents/registry/{cid}/scope-requests/{rec['id']}")
+        assert one.status_code == 200, one.text
+        assert one.json()["status"] == "refused"
+        assert one.json()["deny_reason"] == "too broad for an OS-wide grant"
+
+        # The row has left the pending list the Decisions app renders.
+        pending = await client.get("/api/agents/scope-requests?status=pending")
+        assert pending.status_code == 200, pending.text
+        assert pending.json()["requests"] == []
+        assert await env.grants.list_grants(cid) == []
+    finally:
+        await env.close()
+
+
+@pytest.mark.asyncio
+async def test_deny_without_body_still_works_and_reason_is_null(
+    client, monkeypatch, tmp_path
+):
+    """The bell/toast Deny posts no body; that stays valid (reason recorded as null)."""
+    env = await _wire(client, monkeypatch, tmp_path)
+    try:
+        cid = await _register_active(env)
+        rec = await env.scope_store.create(canonical_id=cid, requested_scopes=["a2a_send"])
+        resp = await client.post(
+            f"/api/agents/registry/{cid}/scope-requests/{rec['id']}/deny",
+        )
+        assert resp.status_code == 200, resp.text
+        one = await client.get(f"/api/agents/registry/{cid}/scope-requests/{rec['id']}")
+        assert one.json()["deny_reason"] is None
+    finally:
+        await env.close()
+
+
+@pytest.mark.asyncio
+async def test_store_migrates_deny_reason_column_onto_existing_db(tmp_path):
+    """A pre-existing agent_scope_requests.db (no deny_reason column) gains the
+    column on init, and set_decision records the reason into it."""
+    import aiosqlite
+
+    path = tmp_path / "scope.db"
+    async with aiosqlite.connect(path) as db:
+        await db.execute(
+            "CREATE TABLE agent_scope_requests ("
+            " id TEXT PRIMARY KEY, canonical_id TEXT NOT NULL,"
+            " requested_scopes TEXT NOT NULL DEFAULT '[]', project_id TEXT,"
+            " reason TEXT NOT NULL DEFAULT '', duration_secs INTEGER,"
+            " status TEXT NOT NULL DEFAULT 'pending', granted_scopes TEXT,"
+            " created_ts TEXT NOT NULL, decided_ts TEXT, decided_by TEXT)"
+        )
+        await db.commit()
+
+    store = AgentScopeRequestsStore(path)
+    await store.init()
+    try:
+        rec = await store.create(canonical_id="agent-1", requested_scopes=["a2a_send"])
+        out = await store.set_decision(
+            rec["id"], "refused", decided_by="u1", deny_reason="not needed"
+        )
+        assert out is not None
+        assert out["deny_reason"] == "not needed"
+    finally:
+        await store.close()

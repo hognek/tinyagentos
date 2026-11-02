@@ -1,0 +1,1 @@
+- Store verification: port_hygiene now checks `container.ports` even when a top-level `ports` list exists, and run_checks reports an unresolvable app_dir as a failed runner_error check instead of raising.

@@ -1,4 +1,5 @@
 import { withCsrf } from "@/lib/csrf";
+import { createSseConnection } from "@/lib/sse";
 
 export type Project = {
   id: string;
@@ -31,7 +32,7 @@ export type ProjectTask = {
   parent_task_id: string | null;
   title: string;
   body: string;
-  status: "open" | "claimed" | "closed" | "cancelled";
+  status: "open" | "claimed" | "closed" | "cancelled" | "quarantined" | "parked";
   priority: number;
   labels: string[];
   assignee_id: string | null;
@@ -44,6 +45,8 @@ export type ProjectTask = {
   created_by: string;
   created_at: number;
   updated_at: number;
+  strike_count?: number;
+  latest_strike?: { id: string; task_id: string; step: string; log_tail: string; actor: string; created_at: number } | null;
 };
 
 export type ElementType =
@@ -105,6 +108,7 @@ export type ProjectEvent = {
   kind: string;
   payload: Record<string, unknown>;
   ts: number;
+  id?: string;
 };
 
 export type Routine = {
@@ -139,6 +143,34 @@ export type DocReview = {
   updated_at: number;
 };
 
+export type ProjectList = {
+  id: string;
+  project_id: string;
+  title: string;
+  description: string;
+  status: string;
+  created_by: string;
+  created_at: number;
+  updated_at: number;
+};
+
+export type ProjectListEntry = {
+  id: string;
+  list_id: string;
+  project_id: string;
+  text: string;
+  original_text: string;
+  category: string | null;
+  status: string;
+  done: number;
+  author_kind: string;
+  author_id: string;
+  edited_by: string | null;
+  position: number;
+  created_at: number;
+  updated_at: number;
+};
+
 export type DocReviewMissing = {
   project_id: string;
   doc_path: string;
@@ -159,10 +191,12 @@ async function http<T>(path: string, init?: RequestInit): Promise<T> {
   // withCsrf attaches X-CSRF-Token on mutating methods (POST/PUT/PATCH/DELETE);
   // without it, cookie-authenticated project create/update/delete 403 with
   // "CSRF token missing". Non-mutating GETs pass through unchanged.
+  const headers = new Headers(init?.headers);
+  headers.set("Content-Type", "application/json");
   const r = await fetch(path, withCsrf({
     credentials: "include",
-    headers: { "Content-Type": "application/json", ...(init?.headers || {}) },
     ...init,
+    headers,
   }));
   if (!r.ok) {
     const text = await r.text().catch(() => r.statusText);
@@ -239,6 +273,10 @@ export const projectsApi = {
       http<ProjectTask>(`/api/projects/${pid}/tasks/${tid}`, {
         method: "PATCH",
         body: JSON.stringify(patch),
+      }),
+    unquarantine: (pid: string, tid: string) =>
+      http<ProjectTask>(`/api/projects/${pid}/tasks/${tid}/unquarantine`, {
+        method: "POST",
       }),
     listComments: (pid: string, tid: string) =>
       http<{ items: ProjectComment[] }>(`/api/projects/${pid}/tasks/${tid}/comments`).then((r) => r.items),
@@ -356,6 +394,46 @@ export const projectsApi = {
   activity: (pid: string) =>
     http<{ items: ProjectActivity[] }>(`/api/projects/${pid}/activity`).then((r) => r.items),
 
+  lists: {
+    list: (pid: string) =>
+      http<{ items: ProjectList[] }>(`/api/projects/${pid}/lists`).then((r) => r.items),
+    create: (pid: string, input: { title: string; description?: string }) =>
+      http<ProjectList>(`/api/projects/${pid}/lists`, {
+        method: "POST",
+        body: JSON.stringify(input),
+      }),
+    get: (pid: string, listId: string) =>
+      http<ProjectList>(`/api/projects/${pid}/lists/${listId}`),
+    update: (pid: string, listId: string, patch: Partial<Pick<ProjectList, "title" | "description" | "status">>) =>
+      http<ProjectList>(`/api/projects/${pid}/lists/${listId}`, {
+        method: "PATCH",
+        body: JSON.stringify(patch),
+      }),
+    remove: (pid: string, listId: string) =>
+      http<{ ok: boolean }>(`/api/projects/${pid}/lists/${listId}`, { method: "DELETE" }),
+    entries: {
+      list: (pid: string, listId: string) =>
+        http<{ items: ProjectListEntry[] }>(`/api/projects/${pid}/lists/${listId}/entries`).then((r) => r.items),
+      create: (pid: string, listId: string, input: { text: string; category?: string | null; position?: number | null }) =>
+        http<ProjectListEntry>(`/api/projects/${pid}/lists/${listId}/entries`, {
+          method: "POST",
+          body: JSON.stringify(input),
+        }),
+      update: (pid: string, listId: string, entryId: string, patch: Partial<Pick<ProjectListEntry, "text" | "category" | "status" | "done" | "position">>) =>
+        http<ProjectListEntry>(`/api/projects/${pid}/lists/${listId}/entries/${entryId}`, {
+          method: "PATCH",
+          body: JSON.stringify(patch),
+        }),
+      remove: (pid: string, listId: string, entryId: string) =>
+        http<{ ok: boolean }>(`/api/projects/${pid}/lists/${listId}/entries/${entryId}`, { method: "DELETE" }),
+      reorder: (pid: string, listId: string, entries: { id: string; position: number }[]) =>
+        http<{ ok: boolean }>(`/api/projects/${pid}/lists/${listId}/entries/reorder`, {
+          method: "POST",
+          body: JSON.stringify({ entries }),
+        }),
+    },
+  },
+
   docReviews: {
     list: (pid: string, state?: string) =>
       http<{ items: DocReview[] }>(
@@ -372,12 +450,30 @@ export const projectsApi = {
       ),
   },
 
-  subscribeEvents(projectId: string, onEvent: (ev: ProjectEvent) => void): () => void {
-    const es = new EventSource(`/api/projects/${projectId}/events`);
-    es.onmessage = (e) => {
-      try { onEvent(JSON.parse(e.data) as ProjectEvent); } catch { /* heartbeat / malformed — skip */ }
-    };
-    return () => es.close();
+  subscribeEvents(
+    projectId: string,
+    onEvent: (ev: ProjectEvent) => void,
+    opts?: { onOpen?: () => void; onError?: () => void },
+  ): () => void {
+    return createSseConnection({
+      url: `/api/projects/${projectId}/events`,
+      onMessage: (e) => {
+        try {
+          onEvent(JSON.parse(e.data) as ProjectEvent);
+        } catch {
+          /* heartbeat / malformed — skip */
+        }
+      },
+      onOpen: opts?.onOpen,
+      onError: opts?.onError,
+      getMessageId: (msg) => {
+        try {
+          return (JSON.parse(msg.data) as ProjectEvent & { id?: string }).id;
+        } catch {
+          return undefined;
+        }
+      },
+    });
   },
 
   // Community View (Milestone F)

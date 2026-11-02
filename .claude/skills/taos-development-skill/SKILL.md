@@ -132,14 +132,130 @@ uv run pytest tests/test_<changed_module>.py tests/<related>/ -v
 uv run pytest tests/ --ignore=tests/e2e -n auto
 ```
 
+### Vendored LLM price table (`tinyagentos/llm_usage/data/`)
+
+`model_prices.json` is GENERATED: a subset of LiteLLM's MIT-licensed
+`model_prices_and_context_window.json`, pinned to the upstream commit recorded in its `_source` key.
+Never hand-edit it and never fetch prices at runtime. Refresh it with
+`python scripts/update_model_prices.py [<sha>]`, keep `data/NOTICE` beside it (the MIT licence
+requires it), and ship both through `[tool.setuptools.package-data]` in `pyproject.toml`. After a
+refresh, run `tests/test_llm_usage.py`: its frozen parity results use synthetic entries, so a data
+refresh cannot break them, but the lookup tests will tell you if a model key taOS relies on moved.
+An unknown price must stay `usd=None`, never `0.0`: the budget code only charges `cost > 0`.
+
+### Dependency-audit ignore hygiene
+
+`security/pip-audit-ignore.toml` suppresses advisories that have no released
+fix. `scripts/check_dependency_audit_ignores.py` (run by
+`.github/workflows/security.yml` on PRs and a Monday cron) re-evaluates the
+list every run so it cannot rot: it probes `uv lock --upgrade-package` per
+ignored package to see whether a fixed version now resolves, and runs
+`pip-audit` WITHOUT the ignore flags to catch any finding not on the list.
+If it fires: a resolvable fix means take the upgrade and drop the entry; a
+new advisory means triage it, never blanket-add it. Entries for tool-level
+deps the project does not pin set `check_upgrade = false`.
+
 ### Test conventions
 
 - `conftest.py`: `tmp_data_dir` fixture creates temp config + SQLite
 - `app` fixture: `create_app(data_dir=tmp_data_dir)`
 - `client` fixture: `AsyncClient(transport=ASGITransport(app=app))` - async HTTP test client
-- Module mirroring: `tests/test_agents.py` tests `routes/agents.py`
+- Module mirroring: `tests/test_routes_agents.py` tests `routes/agents.py`
 - SPA stubs: conftest creates stub `index.html`/`sw.js` so tests don't need `npm run build`
 - E2E (Playwright) tests excluded from CI and local gate
+
+### CSRF in tests - ON by default
+
+`verify_csrf` runs for real in tests. It used to be no-op'd by an autouse fixture for every
+file whose path lacked the substring `test_csrf` - measured at 788 test files, exactly ONE
+inside that carve-out, so 787 ran against an app whose CSRF dependency did nothing. That is
+what hid #2081: a repro written as an ordinary test returned 303 and PASSED, and the tell was
+that the CONTROL passed identically, which is the shape you get when the input never reaches
+the system under test.
+
+What this means when you write a test:
+
+- **The shared `client` fixture already does the right thing.** It echoes the `csrf_token`
+  cookie into `X-CSRF-Token` on mutating requests, exactly as `taosFetch` does in the SPA.
+  Nothing to remember.
+- **If you build your own `AsyncClient`, it will 403 on mutating routes** once it carries a
+  `taos_session` cookie. Fix it the way the real caller does - send the header - not by
+  disabling the check. One line does it:
+
+  ```python
+  from taos_test_csrf import csrf_event_hooks   # tests/taos_test_csrf.py
+
+  AsyncClient(
+      transport=ASGITransport(app=app),
+      base_url="http://test",
+      cookies={"taos_session": token},
+      event_hooks=csrf_event_hooks(),      # <- echoes the cookie into the header
+  )
+  ```
+
+  It lives in its own module, not in `conftest.py`, because `tests/` is not a package and
+  several `conftest.py` files exist, so a bare `from conftest import ...` binds whichever one
+  is on `sys.path` first.
+- **The `csrf_token` must be bound to the session.** `verify_csrf` also checks
+  `verify_bound(secret, cookie, taos_session)`, so an arbitrary value next to a real session 403s.
+  The hook mints a bound token for any session made by `AuthManager.create_session`. If you
+  set the cookie and header by hand, mint it:
+  `from taos_test_csrf import bound_csrf_token; token = bound_csrf_token(app, session)`.
+- **`verify_csrf` exempts** safe methods, `Authorization: Bearer` callers, `_CREDENTIAL_PATHS`
+  (the sign-in surfaces), and any request with no `taos_session` cookie. A test that never
+  authenticates is unaffected.
+- **`@pytest.mark.csrf_bypass` exists but nothing uses it, and
+  `tests/test_csrf_bypass_debt.py` asserts the list stays EMPTY.** Adding a marker turns that
+  guard red on purpose. Do NOT add it to silence a new red: a red means a route the real
+  caller could not reach the way your test reaches it - give the client the event hook
+  instead.
+- **A filename no longer changes behaviour.** The old carve-out was a substring match on the
+  path, so renaming a file silently re-armed the bypass with no failure anywhere.
+
+### Test markers
+
+Every pytest marker is declared once, in `pyproject.toml` under
+`[tool.pytest.ini_options] markers`. Do NOT register one from a
+`pytest_configure` hook in `tests/conftest.py`: that file already defines the
+canonical hook, and a second module-level `def pytest_configure` is last-wins
+rebinding rather than additive registration, so the earlier body never runs and
+its next edit is a silent no-op in CI.
+
+- **`@pytest.mark.guards("module:function", replace=[(correct, defective)])`
+  declares what a guard test protects.** It is inert in a normal run.
+  `scripts/check_non_discriminating.py` (workflow
+  `guard-discrimination-gate.yml`, not a required check) re-runs every declared
+  test against the broken variant, compiled from the function's own source and
+  swapped in via `__code__`; a test that still passes is NON-DISCRIMINATING
+  (exit 1). `must_kill=[ids]` names generated mutants instead (list them with
+  `--list-mutants module:function`); with neither, one generated mutant must
+  kill it. A test that monkeypatches the function it guards can never pass
+  this. Ad-hoc mode (`--guard NODEID --target ... --replace OLD NEW --root DIR`)
+  checks an undecorated test in any repo.
+  **It proves the DECLARED edit, not the card's defect:** a `replace` that
+  raises on entry, or default mode's `return-none`, is killed by any test that
+  merely calls the function. Review the `replace` pair against the real
+  defect; a default-mode OK only proves the test reaches the function. A kill
+  counts only if an unmutated control rerun still passes (else ERROR).
+- **`@pytest.mark.skip_if_no_embed_backend` skips a test that cannot run without
+  an embedding backend** — a reachable qmd service, or an installed
+  `onnxruntime`. There is no opt-out marker and no `-o` switch: not applying it
+  IS the opt-out, and that is the default for every test.
+- **Like `csrf_bypass`, nothing uses it, and
+  `tests/test_embed_backend_marker_debt.py` asserts the list stays EMPTY.**
+  Before adding it, check what the test actually calls. A test driving an
+  `AsyncMock(spec=httpx.AsyncClient)`, a hand-built `_snapshot`, or a patched
+  `_run_setup` never reaches a backend, so the marker does not protect it from
+  anything — it just deletes it from every CI row while the suite stays green.
+- **Probe the capability, not a proxy for it.** The backend check opens a socket
+  against the packaged default qmd URL and looks for `onnxruntime` (what executes a
+  model), not `onnx` (the model-format library taOS does not depend on) and not
+  an environment variable no module under `tinyagentos/` reads. A proxy answers
+  "no backend" on a box that works and "backend" for a host that does not exist.
+
+Patch timing matters if you ever stub it yourself: `register_all_routers` does
+`from ... import verify_csrf` and freezes the object into `Depends(...)` at `include_router`
+time, so patching the module attribute AFTER `create_app` does nothing.
 
 ### CI matrix
 
@@ -147,27 +263,44 @@ uv run pytest tests/ --ignore=tests/e2e -n auto
 - GitHub Actions: `.github/workflows/ci.yml` in upstream repo
 - Uses `uv sync --frozen` and `pytest -n auto`
 - Also required: `spa-build` (npm build + tsc + **vitest** - a desktop type error or failing
-  component test fails CI), a "Verify app starts" `create_app` import smoke, `lint`
-  (`compileall`), and `cla`. The doc-gate is a separate workflow.
-
-## CLA - HUMAN signs
-
-taOS requires a Contributor License Agreement for first-time contributors. The CLA bot
-flags the PR with a `cla: fail` check.
-
-**The agent does NOT sign the CLA.** Posting the acceptance text accepts a legal agreement - that is the human account-holder's action, not the agent's.
-
-### Procedure when `cla: fail` appears:
-
-1. Verify the commit author email matches a GitHub-verified email.
-   If the email was wrong, amend the commit with the correct email, force-push.
-2. Surface the bot's comment + link to the human. Do NOT post the acceptance text yourself.
-   Do NOT post `recheck`.
-
-The bot accepts a PR comment in this format (for the human to post):
-```
-I have read the CLA Document and I hereby sign the CLA
-```
+  component test fails CI), `desktop-e2e` (the Playwright suite under `desktop/tests`, run on
+  webkit - see "Desktop SPA build + test" below), a "Verify app starts" `create_app` import
+  smoke, `lint`
+  (`compileall`), and `docs-build`. `docs-build` is the only job with the mkdocs
+  toolchain installed (mkdocs is NOT a project dependency, so `uv sync` does not provide
+  it): it runs `tests/test_mkdocs_exclude.py` with `TAOS_DOCS_BUILD_TESTS=1`, which turns
+  off the `importorskip` the ordinary shards rely on — put any test that has to build the
+  docs site there, or the shards will silently skip it. The doc-gate, store-wiring gate,
+  bot-review gate,
+  distrust-green gate, and evil-merge gate (`.github/workflows/evil-merge-gate.yml`,
+  implementation in `scripts/check_evil_merge.py` — fails a PR whose merge resolution
+  invents test-file content differing from the `git merge-tree` baseline; the workflow
+  selftests that it fires RED on the known evil merge `ad5cdfb0c` before checking the
+  PR) are separate workflows.
+- `check-all-skip` (`.github/workflows/distrust-green-gate.yml`, implementation in
+  `.github/scripts/check_all_skip.py`) fails a PR when a test file it adds or modifies
+  has tests and ALL of them skip (e.g. `pytest.importorskip` on a module that does not
+  exist yet) — green CI that asserts nothing. The failure names the file and the guard.
+  Landing tests ahead of code stays legal via an explicit waiver trailer in the PR body:
+  `Tests-Skipped-Intentionally: <file>, <why>`. Files with SOME skips pass (v1 scope).
+- **Gate integrity** (`.github/workflows/gate-integrity.yml`, implementation in
+  `scripts/check_gate_integrity.py`): because each `pull_request` gate checks
+  out the PR merge ref and runs its checker FROM that checkout, a PR can edit
+  its own gate to always-exit-0 and green-pass the check that gates it. This
+  workflow runs on `pull_request_target` from the base ref and inspects the PR
+  diff via the GitHub API only -- it never checks out or executes PR code. It
+  fails any PR touching `.github/workflows/`, `.github/scripts/`,
+  `scripts/check_*.py`, `docs/doc-gate.toml`, `pyproject.toml`, or
+  `tests/conftest.py` unless the PR carries the human-set
+  `gate-integrity-allow` label (the only way to land a legitimate change to CI
+  or a gate checker). Add that label yourself; lanes must not add it. Branch
+  protection must require "Gate integrity" as a blocking check.
+  **Retargeting a PR re-runs this gate, and it can newly fail.** The verdict is
+  a function of the base..head diff, so a PR that passed against one base can
+  touch protected files against another; the workflow subscribes to the
+  `edited` activity type (which is what a base change fires) so the new diff is
+  actually inspected. If you change a PR's base and this gate goes red, that is
+  the new diff being judged, not a flake -- re-read what the failure names.
 
 ## PR / CI flow (fork specifics)
 
@@ -176,7 +309,7 @@ I have read the CLA Document and I hereby sign the CLA
    `pr checks` while it awaits approval.
 2. **If the CI run shows `action_required`**: the first-time-contributor workflow-approval policy
    is blocking it. Surface this to the human - do not re-poll, re-push, or re-create the PR.
-   Lightweight checks (CLA, Gitar, CodeRabbit) run independently and don't need approval.
+   Lightweight checks (Gitar, CodeRabbit) run independently and don't need approval.
 3. Once code is done and local tests pass, `gh pr ready`. Address review feedback with additional
    commits on the same branch. The maintainer merges upstream.
 
@@ -206,6 +339,49 @@ After pushing a PR and marking it ready, automated bots review it. The reliable 
 no-op, so never treat a CodeRabbit pass alone as evidence of review (its findings, when it does
 run, still get folded). Qodo (`qodo-code-review`) appears on old PRs but is paused. Address all
 findings **before** surfacing the PR for human maintainer review.
+
+The rate-limited no-op is now also machine-gated: `.github/workflows/bot-review-gate.yml`
+(implementation in `scripts/check_bot_review.py`) fails the `bot-review-gate` check when the
+only CodeRabbit output on a PR is a rate-limit stub, and a companion `re-run-on-stub-comment`
+job re-runs the gate against the PR head SHA when a stub comment lands *after* the initial
+run went green. A red `bot-review-gate` check means the PR has no substantive CodeRabbit
+review yet — wait for (or retrigger) a real review; do not merge on the
+stub. A lead may waive a known rate-limit/stub false positive by applying the
+`bot-review-allow` label (see below).
+
+The gate also self-heals its own stale red. `pull_request` and
+`pull_request_review` are separate runs producing separate check suites on one head SHA, so the
+pre-review FAIL used to survive next to the later SUCCESS and the required-check rollup stayed
+FAILURE, leaving `mergeStateStatus` BLOCKED and `gh pr merge --auto` unable to fire. Once the
+gate passes on a `pull_request_review` event, a separate `reconcile-stale-runs` job
+(`scripts/rerun_failed_bot_review_runs.py`, with `actions: write` scoped to that job only, and
+checking out `ref: ${{ github.event.pull_request.base.sha }}` so the helper always comes from
+the base branch) re-runs the failed `pull_request` runs of this workflow for that same SHA --
+this workflow only, that SHA only, `conclusion=failure` only, `event=pull_request` only. So a
+red that predates the review clears itself once the review lands; a genuine stub verdict stays
+red, because the re-run re-reads review state and reaches the same verdict.
+
+Enforcement parity is a GitHub-side branch-protection setting, not in-repo config:
+`bot-review-gate` is REQUIRED on `master` but only ADVISORY on `dev` (absent from dev's
+`required_status_checks.contexts`), so a red check can merge through dev and block only at the
+dev->master promotion. The hardening target is to add `bot-review-gate` to dev's required
+contexts too; that edit is Jay's standing GitHub configuration (master is left unchanged) and
+is not performed by a repo commit.
+
+Two things to know before applying it (both recorded in the workflow header):
+
+- **An override label (`bot-review-allow`) ships first.** `scripts/check_bot_review.py` fails
+  on a CodeRabbit rate-limit stub, which is an infrastructure condition, not a code problem.
+  Making the context required on `dev` before there is an escape hatch would block every merge
+  to `dev` for the length of a rate-limit window. The `bot-review-allow` label (lead-applied,
+  never by automation) waives the stub-only FAIL verdict to exit 0 with an explicit WAIVED
+  message -- it covers only the stub verdict class (EXIT_STUB), not a cannot-fetch ERROR, so
+  fail-closed is preserved. The script reads the label from the API at run time (never a stale
+  event payload) and the workflow re-runs on `labeled`/`unlabeled` so the waiver is revokable.
+- **Use the right API shape.** The contexts endpoint takes a top-level `contexts` ARRAY. A
+  `-f required_status_checks='[...]'` string field is the wrong shape and the update silently
+  does not apply. Send `{"contexts":[...]}` via `gh api -X PATCH ... --input <file>`, carrying
+  the branch's existing contexts plus the new one -- the call replaces the whole list.
 
 ### Procedure
 
@@ -376,6 +552,19 @@ items by number (for example "pitfall 5").
   `test_config.py`.
 - **Catalog entry:** `manifest.yaml` under `app-catalog/<category>/<id>/` → add to `catalog.yaml` →
   `pytest tests/test_catalog_sync.py`.
+- **Writing a state file:** call `atomic_write_text` / `atomic_write_bytes` from
+  `tinyagentos.atomic_io` (it creates the parent dir, fsyncs the temp file and the parent
+  directory, applies `mode` before the rename, and randomises the temp name). Never hand-roll
+  `tmp.write_text(...)` + `tmp.replace(target)` — that fsyncs nothing, so a power cut brings the
+  file back the right size and full of NULs, which is the 2026-08-21 account-store wipe.
+  `tests/test_config_atomic.py` fails the build on a new copy; a promotion that genuinely cannot
+  use `atomic_io` (a symlink swap) is waived in place with `# atomic-io-exempt: <reason>`
+  (pitfall 24). From `async` code, wrap it: `await asyncio.to_thread(atomic_write_text, ...)` --
+  the fsyncs are blocking syscalls and stall the event loop.
+- **Creating one-time key material:** call `atomic_create_bytes`, not `atomic_write_bytes`. A write
+  is a durable *replace*, so two processes that both find the key file absent both write and the
+  last one wins; the loser keeps encrypting/signing with material that is not on disk.
+  `atomic_create_bytes` claims the name with `link(2)` and returns whatever actually persisted.
 - **Debugging a test:** confirm it uses the async `client` fixture and that `tmp_data_dir` setup is
   complete; check the store's `init()`; isolate with `pytest <path>::<test> -v`.
 
@@ -385,9 +574,11 @@ Every mutating route requires `X-CSRF-Token` on cookie-session requests (`verify
 router-wide). Any SPA `fetch` that POSTs/PUTs/PATCHes/DELETEs must attach the double-submit header:
 use `withCsrf(init)` from `desktop/src/lib/csrf.ts`, or the `taosFetch` wrapper
 (`desktop/src/lib/taos-fetch.ts`) which applies it automatically. **A raw
-`fetch("/api/...", {method:"POST"})` passes vitest AND pytest (tests bypass CSRF) but 403s
-"CSRF token missing" in production** - this exact class shipped as a bug (#1977). Bearer-token
+`fetch("/api/...", {method:"POST"})` passes vitest but 403s "CSRF token missing" in
+production** - this exact class shipped as a bug (#1977). Bearer-token
 (agent JWT) calls are CSRF-exempt; only cookie sessions need the header.
+
+pytest used to miss this class too, and no longer does - see "CSRF in tests" above.
 
 ## Agent auth model (Bearer JWT vs session)
 
@@ -416,16 +607,28 @@ normalized form (`1.0.0bN`). Only pyproject vs uv.lock is test-gated
 
 ## Documentation gate
 
-A gate blocks PRs that add or remove certain feature code without a matching doc update
-(configured in `docs/doc-gate.toml`):
+A gate blocks PRs that change certain feature code without a matching doc update
+(configured in `docs/doc-gate.toml`). Rules marked **any change** also fire on a plain
+modification; the rest fire only when a matching file is added or deleted. Test files
+(`test_*.py`, `*.test.*`, `*.spec.*`, `__tests__/`) never trigger any rule.
 
-| Change | Requires editing |
-|--------|-----------------|
-| Desktop app under `desktop/src/apps/` added/removed | `README.md` |
-| Route module under `tinyagentos/routes/` added/removed | `docs/agent-coordination.md` |
-| Installer under `tinyagentos/installers/` or `scripts/install*` added/removed | `README.md` |
-| Manifest under `app-catalog/` added/removed | `README.md` |
-| `tinyagentos/auth_middleware.py` (agent-token route allowlist) changed | `docs/agent-coordination.md` |
+| Change | Fires on | Requires editing |
+|--------|----------|-----------------|
+| Desktop app under `desktop/src/apps/` | add/remove | `README.md` |
+| Route module under `tinyagentos/routes/` | any change | `docs/agent-coordination.md` |
+| Installer under `tinyagentos/installers/` or `scripts/install*` | any change | `README.md` |
+| Manifest under `app-catalog/` | any change | `README.md` |
+| `tinyagentos/auth_middleware.py` (agent-token route allowlist) | any change | `docs/agent-coordination.md` |
+| Anything under `tinyagentos/` or `desktop/src/` | any change | `CHANGELOG.md` or a `changelog.d/*.md` fragment |
+| Agent registry, token auth, scope-requests store, `routes/agent_*.py`, `tinyagentos/mcp/` | any change | `docs/agent-manual/*.md` or `docs/agent-coordination.md` |
+| `.github/workflows/*.yml`, `pyproject.toml`, `CONTRIBUTING.md` | any change | this skill or `docs/*.md` |
+| `routes/desktop.py`, `routes/desktop_control.py`, `routes/taos_agent.py` | any change | `.claude/skills/taos-agent/*.md` or `docs/agent-manual/*.md` |
+| `update_runner.py`, `auto_update.py`, `restart_orchestrator.py`, `scripts/collate_changelog.py` | any change | `docs/RELEASING.md`, a runbook, or another `docs/*.md` |
+| `tinyagentos/worker/` | add/remove | `tinyagentos/worker/README.md` |
+
+The changelog rule is the one that catches most PRs: any non-test change under
+`tinyagentos/` or `desktop/src/` needs a `changelog.d/<pr>-<slug>.md` fragment (preferred
+over editing `CHANGELOG.md` directly, which conflicts between PRs).
 
 `.github/workflows/doc-gate.yml` is authoritative (a local `--no-verify` does not bypass it) and
 also runs `scripts/check_schema_migrations.py` (the SCHEMA-before-migrations guard, see Pitfalls).
@@ -434,9 +637,80 @@ If your PR trips a rule and there is genuinely nothing to document, add a traile
 ```
 Docs-Reviewed: no user-facing change, internal refactor only
 ```
+The trailer covers **only the commit that carries it**: it waives the rules tripped by the
+files that commit touched, and nothing else. A trailer on an unrelated or empty commit
+waives nothing, and code pushed in a later commit is gated on its own (a doc edit or
+changelog fragment in any commit still satisfies a rule PR-wide). `Docs-Reviewed: [routes]
+<why>` narrows the waiver to the named rules, which is how a squash-merged single commit
+waives one rule and still owes its fragment. The gate prints
+`doc-gate: trailer override used in <sha> by <author>: <why> [covers: <files>]` in its CI
+log for each commit that carries one, and that line is reviewable. A reviewer may ask for
+a real doc instead.
 
 Run `scripts/install-git-hooks.sh` to enable local hooks (`.githooks/pre-commit` and
 `.githooks/commit-msg`) so the gate runs before you push.
+
+## Store wiring gate
+
+A gate (`.github/workflows/store-wiring-gate.yml`, running `scripts/check_store_wiring.py`)
+blocks PRs that add a new `BaseStore` subclass without wiring it into `tinyagentos/app.py`.
+Routes reach stores ONLY via `request.app.state`, so an unwired store is unreachable dead
+code. The check is name-level (the class name must appear in `app.py`) and polices only
+classes added by the PR - pre-existing orphans are skipped.
+
+A class that some other class under `tinyagentos/` subclasses **and** that declares no
+`SCHEMA` of its own is skipped too, and the gate prints the exemption. Such a base exists
+to be inherited from, never to be assigned to `app.state` - `ProjectsDBStore` in
+`tinyagentos/projects/tx.py` carries the shared `projects.db` transaction helper for the
+eight stores on that file, owns no tables and is never instantiated. A class that declares
+`SCHEMA` owns tables, so it is a store and stays policed however many subclasses it grows:
+subclassing an unwired store does not launder it past the gate.
+
+For a store genuinely constructed elsewhere (tests, CLI, workers), waive it with a PR-body
+trailer, which is logged by the gate:
+```
+Store-Unwired-Intentionally: <ClassName>, <why>
+```
+
+## Secret-ignores gate
+
+A gate (`.github/workflows/secret-ignores-gate.yml`, running `scripts/check_secret_ignores.py`)
+verifies that the committed `.gitignore` still protects known secret-shaped paths on every
+promotion target. A `.gitignore` rule is the kind of file a rebase conflict can quietly drop
+during a dev->master promotion while every test stays green and nothing builds red, so the
+protection is asserted here, not assumed. The gate runs on push to `master`, `dev` and
+`release/*` (a dropped rule fails the branch it lands on) and on PRs to those branches (a
+conflict-resolution loss fails before the merge, since the merge commit's `.gitignore` is what
+is checked).
+
+Two signals, defense in depth:
+
+- Every required protection rule must appear verbatim as an active line of `.gitignore`
+  (`*.key`, `identity.json`, `*.p8`, `*credentials.json`, `*creds*.json`, the `*_private.*`
+  key shapes, `secrets/`, `data/hub/`, and the rest listed in `REQUIRED_PATTERNS` in the
+  script). Comment prose and narrower sibling rules do not satisfy a rule.
+- A set of secret-shaped paths (`data/hub/identity.json`, `foo.key`, `creds.json`, `x.p8`,
+  `y_credentials.json`, ...) must all be reported ignored by `git check-ignore`.
+
+Removing any one protection pattern turns the gate red -- proven by a parametrized test that
+drops each pattern from a copy of the real `.gitignore` and asserts the guard fails.
+
+## Action-pinning gate
+
+A gate (`.github/workflows/action-pinning-gate.yml`, running `scripts/check_action_pinning.py`)
+fails when any `uses:` in `.github/workflows/` names a movable ref (a tag, a branch, a short
+SHA) instead of a full 40-char commit SHA. A retargeted tag runs new code in every workflow on
+its next run, the gate workflows included. When adding or bumping an action, resolve the tag's
+commit from the action repository (`git ls-remote https://github.com/<owner>/<repo>
+'refs/tags/<tag>' 'refs/tags/<tag>^{}'`, taking the `^{}` line for an annotated tag) and keep
+the tag as a trailing comment for humans and Dependabot:
+
+```yaml
+- uses: actions/checkout@<40-char-sha>  # v7
+```
+
+The check is on the ref shape, not the comment: an unpinned `uses:` with a `# v7` comment
+still fails. Local actions (`./...`) pass; `docker://` refs need an `@sha256:` digest.
 
 ## Upstream conventions (from CONTRIBUTING.md)
 
@@ -444,7 +718,7 @@ Run `scripts/install-git-hooks.sh` to enable local hooks (`.githooks/pre-commit`
 - Branch naming: `feat/<slug>` or `fix/<slug>`
 - Conventional commits (see table above)
 - No AI tool attribution in commits
-- Python 3.11+ floor (pyproject.toml: `>=3.11,<3.14`). `match`/`case` and `X | None` union syntax
+- Python 3.11+ floor (pyproject.toml: `>=3.11,<3.15`). `match`/`case` and `X | None` union syntax
   are available. Most modules use `from __future__ import annotations`.
 - Code style: match surrounding code, one concern per module
 - Use `uv` for dependency management and test running: `uv sync --extra dev`, `uv run pytest`
@@ -482,8 +756,67 @@ cd desktop
 npm install                # Node.js 22+
 npm run build              # tsc -b && vite build → outputs to static/desktop/
 npm run test               # vitest (unit/component tests)
-npm run test:e2e           # Playwright browser tests (needs running server)
+npm run test:e2e           # Playwright browser tests (starts vite itself)
 ```
+
+`test:e2e` with no `E2E_BASE_URL` starts its own vite server
+(`npm run build && npm run preview` on :5173) and runs the specs against it.
+That is enough for the specs that `page.route()`-mock the API, and NOT enough
+for the rest: `canvas-e2e` and `projects-mobile` POST `/api/projects` for real,
+and `sw-and-reconnect` needs `/sw.js` at the ROOT, which only the backend
+serves (`tinyagentos/routes/desktop.py`) because vite's base is `/desktop/`.
+
+To run the whole suite, start a real backend and point the suite at it:
+
+```bash
+uvicorn --factory tinyagentos.app:create_app --host 127.0.0.1 --port 6969
+cd desktop && npm run build          # the desktop routes serve static/desktop from disk
+E2E_BASE_URL=http://127.0.0.1:6969 npx playwright test
+```
+
+With `E2E_BASE_URL` set, `playwright.config.ts` leaves `webServer` undefined --
+the server is already up and is not the suite's to manage.
+
+A backend with **no account** serves the zero-user setup wizard at `/desktop/`,
+so `App.tsx` never mounts and anything inside the desktop shell is untested.
+The `desktop-e2e` CI job onboards a throwaway first user via `/auth/setup` and
+hands Playwright the session cookie as a storage state (`E2E_STORAGE_STATE`).
+Do the same locally, or expect those specs to fail on a 401.
+
+Seed that session under the **browser's** user-agent, not curl's. `auth.py:1011`
+stores a SHA-256 of the creating user-agent on the session and `:1048` compares
+it on every validation, so a session minted by a plain `curl` is rejected the
+moment WebKit replays the cookie: `/desktop/` 302s to `/auth/login?next=/desktop/`
+and the API answers `401 {"error":"Authentication required"}`. The CI job reads
+the UA out of `require("@playwright/test").devices["iPhone 14"].userAgent` and
+passes it as `curl -A`, so it cannot drift from the config's device.
+
+A `curl` probe **cannot** catch this class of bug on its own. The probe that
+mints the session and the probe that replays it are the same client, so the
+user-agent pair it exercises is self-consistent and passes while the browser's
+pair is refused. A probe proves the pair *it* uses, not the pair the real client
+uses -- give it the real client's identity, or assert the real client directly.
+
+The session cookie alone is not enough for a mutating call: the projects router
+is included with `dependencies=_csrf`, so a cookie-authenticated `POST
+/api/projects` answers `403 {"detail": "CSRF token missing"}` unless the
+`csrf_token` cookie is echoed in an `X-CSRF-Token` header. The job seeds **both**
+cookies into the storage state and proves the pair with a `curl` probe before
+Playwright starts, so a broken seed is one error line instead of three red tests.
+
+The suite also needs the browser binary, and that browser is **webkit**, not
+chromium: the config declares one project, `iphone-14`, built from
+`devices["iPhone 14"]`, whose `defaultBrowserType` is `webkit`. Install it once
+with
+
+```bash
+cd desktop && npx playwright install --with-deps webkit
+```
+
+Installing chromium instead fails every test at launch with
+`browserType.launch: Executable doesn't exist at .../webkit-<rev>/pw_run.sh`.
+The suite runs in CI as the `desktop-e2e` job; it is not schedule-only, so a
+spec broken by a PR fails that PR.
 
 ## Adding an app to the catalog
 
@@ -514,7 +847,7 @@ controls which hardware profiles see the app as recommended.
 - **Secrets have a dedicated store.** `tinyagentos/secrets.py` (routes in
   `tinyagentos/routes/secrets.py`, attached as `app.state.secrets`) is the credential store. Store
   credentials there - never in config or in code.
-- **CONTRIBUTING.md** says Python 3.10+, but `pyproject.toml` requires `>=3.11,<3.14`.
+- **CONTRIBUTING.md** says Python 3.10+, but `pyproject.toml` requires `>=3.11,<3.15`.
   Python 3.11 is the effective floor.
 - **Routes do not import stores directly.** They access them via `request.app.state`.
   This is a common mistake - check existing routes for the pattern.

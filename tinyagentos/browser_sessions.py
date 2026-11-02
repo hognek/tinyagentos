@@ -24,6 +24,8 @@ class BrowserWorkerError(Exception):
 IDLE_TIMEOUT_S = 600
 
 BROWSER_SESSIONS_SCHEMA = """
+PRAGMA journal_mode=WAL;
+PRAGMA busy_timeout=5000;
 CREATE TABLE IF NOT EXISTS browser_sessions (
     id           TEXT PRIMARY KEY,
     owner_type   TEXT NOT NULL,
@@ -566,6 +568,11 @@ def _capable_workers(
     candidates = []
     for w in cluster.get_workers():
         if w.status != "online":
+            continue
+        # A device node (kind="device", a taOSusb board) is never a job
+        # candidate regardless of what it lists in capabilities -- see
+        # cluster/manager.py get_workers_for_capability's docstring.
+        if getattr(w, "kind", "worker") == "device":
             continue
         if "browser" not in (getattr(w, "capabilities", None) or []):
             continue

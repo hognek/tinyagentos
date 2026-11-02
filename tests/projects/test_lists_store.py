@@ -3,6 +3,7 @@ import time
 
 import pytest
 import pytest_asyncio
+from aiosqlite.context import Result
 
 from tinyagentos.projects.lists_store import ProjectListsStore, ProjectListEntriesStore
 
@@ -297,14 +298,27 @@ async def test_reorder_entries_does_not_corrupt_sibling_list(entries_store):
 async def test_concurrent_add_entry_distinct_positions(entries_store, monkeypatch):
     """Two concurrent add_entry calls without explicit positions must not
     persist duplicate positions."""
-    original = entries_store._get_next_position
+    # Yield to the loop after each INSERT starts so the two gather branches
+    # actually interleave on the shared connection; without this the atomic
+    # single-statement INSERT keeps the test passing for the wrong reason.
+    real_execute = entries_store._db.execute
+    insert_calls = 0
 
-    async def slow_next_position(project_id, list_id):
-        val = await original(project_id, list_id)
-        await asyncio.sleep(0)
-        return val
+    def delaying_execute(*args, **kwargs):
+        nonlocal insert_calls
+        sql = args[0] if args else kwargs.get("sql", "")
+        is_insert = "INSERT INTO project_list_entries" in sql
 
-    monkeypatch.setattr(entries_store, "_get_next_position", slow_next_position)
+        async def _runner():
+            nonlocal insert_calls
+            if is_insert:
+                insert_calls += 1
+                await asyncio.sleep(0)
+            return await real_execute(*args, **kwargs)
+
+        return Result(_runner())
+
+    monkeypatch.setattr(entries_store._db, "execute", delaying_execute)
 
     e1, e2 = await asyncio.gather(
         entries_store.add_entry(
@@ -325,5 +339,147 @@ async def test_concurrent_add_entry_distinct_positions(entries_store, monkeypatc
         ),
     )
 
+    assert insert_calls == 2, "both inserts must have run through execute()"
     positions = {e1["position"], e2["position"]}
-    assert len(positions) == 2, f"expected distinct positions, got {positions}"
+    assert len(positions) == 2, (
+        f"expected distinct positions under concurrent gather, got {positions}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# tsk-u23vjy (fix-forward of the closed duplicate PR #2183, re-scoped to what
+# is real on dev): of the card's four defects, position-0 collision is already
+# fixed by the atomic INSERT (#2265, concurrency test above) and NULL list_id
+# rows are impossible (schema: list_id TEXT NOT NULL). The two below remain.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_get_entry_reads_description_before_cursor_closes(entries_store):
+    e = await entries_store.add_entry(
+        list_id="lst-1", project_id="prj-1", text="Test entry",
+        original_text="Test entry", author_kind="agent", author_id="agent-1",
+    )
+    result = await entries_store.get_entry(e["id"])
+    assert result is not None
+    assert result["id"] == e["id"]
+    assert result["text"] == "Test entry"
+
+
+@pytest.mark.asyncio
+async def test_reorder_entries_rolls_back_on_exception(entries_store, monkeypatch):
+    """If an UPDATE raises partway, the earlier UPDATEs must be rolled back --
+    otherwise they sit pending on the shared connection and the next unrelated
+    commit() flushes a half-applied reorder."""
+    a = await entries_store.add_entry(
+        list_id="lst-1", project_id="prj-1", text="A", original_text="A",
+        author_kind="agent", author_id="agent-1",
+    )
+    b = await entries_store.add_entry(
+        list_id="lst-1", project_id="prj-1", text="B", original_text="B",
+        author_kind="agent", author_id="agent-1",
+    )
+
+    real_execute = entries_store._db.execute
+    update_calls = 0
+
+    async def failing_execute(sql, params=()):
+        nonlocal update_calls
+        if sql.startswith("UPDATE project_list_entries SET position"):
+            update_calls += 1
+            if update_calls == 2:
+                raise RuntimeError("boom")
+        return await real_execute(sql, params)
+
+    monkeypatch.setattr(entries_store._db, "execute", failing_execute)
+
+    with pytest.raises(RuntimeError):
+        await entries_store.reorder_entries(
+            "prj-1", "lst-1",
+            [{"id": a["id"], "position": 1}, {"id": b["id"], "position": 0}],
+        )
+    monkeypatch.undo()
+
+    # The half-applied first UPDATE must be gone immediately...
+    a_after = await entries_store.get_entry(a["id"])
+    b_after = await entries_store.get_entry(b["id"])
+    assert a_after["position"] == 0
+    assert b_after["position"] == 1
+
+    # ...and must NOT resurface when an unrelated write commits later.
+    await entries_store.add_entry(
+        list_id="lst-2", project_id="prj-1", text="Unrelated",
+        original_text="Unrelated", author_kind="agent", author_id="agent-1",
+    )
+    a_final = await entries_store.get_entry(a["id"])
+    assert a_final["position"] == 0
+
+
+@pytest.mark.asyncio
+async def test_reorder_entries_rolls_back_on_cancellation(entries_store, monkeypatch):
+    """CancelledError is not an Exception; the rollback guard must still fire."""
+    a = await entries_store.add_entry(
+        list_id="lst-1", project_id="prj-1", text="A", original_text="A",
+        author_kind="agent", author_id="agent-1",
+    )
+    b = await entries_store.add_entry(
+        list_id="lst-1", project_id="prj-1", text="B", original_text="B",
+        author_kind="agent", author_id="agent-1",
+    )
+
+    real_execute = entries_store._db.execute
+    update_calls = 0
+
+    async def cancelling_execute(sql, params=()):
+        nonlocal update_calls
+        if sql.startswith("UPDATE project_list_entries SET position"):
+            update_calls += 1
+            if update_calls == 2:
+                raise asyncio.CancelledError()
+        return await real_execute(sql, params)
+
+    monkeypatch.setattr(entries_store._db, "execute", cancelling_execute)
+
+    with pytest.raises(asyncio.CancelledError):
+        await entries_store.reorder_entries(
+            "prj-1", "lst-1",
+            [{"id": a["id"], "position": 1}, {"id": b["id"], "position": 0}],
+        )
+    monkeypatch.undo()
+
+    await entries_store.add_entry(
+        list_id="lst-2", project_id="prj-1", text="Unrelated",
+        original_text="Unrelated", author_kind="agent", author_id="agent-1",
+    )
+    assert (await entries_store.get_entry(a["id"]))["position"] == 0
+    assert (await entries_store.get_entry(b["id"]))["position"] == 1
+
+
+@pytest.mark.asyncio
+async def test_reorder_entries_rolls_back_on_commit_failure(entries_store, monkeypatch):
+    a = await entries_store.add_entry(
+        list_id="lst-1", project_id="prj-1", text="A", original_text="A",
+        author_kind="agent", author_id="agent-1",
+    )
+    b = await entries_store.add_entry(
+        list_id="lst-1", project_id="prj-1", text="B", original_text="B",
+        author_kind="agent", author_id="agent-1",
+    )
+
+    async def failing_commit():
+        raise RuntimeError("commit boom")
+
+    monkeypatch.setattr(entries_store._db, "commit", failing_commit)
+
+    with pytest.raises(RuntimeError):
+        await entries_store.reorder_entries(
+            "prj-1", "lst-1",
+            [{"id": a["id"], "position": 1}, {"id": b["id"], "position": 0}],
+        )
+    monkeypatch.undo()
+
+    await entries_store.add_entry(
+        list_id="lst-2", project_id="prj-1", text="Unrelated",
+        original_text="Unrelated", author_kind="agent", author_id="agent-1",
+    )
+    assert (await entries_store.get_entry(a["id"]))["position"] == 0
+    assert (await entries_store.get_entry(b["id"]))["position"] == 1

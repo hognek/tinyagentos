@@ -1,84 +1,291 @@
 import { useEffect, useState } from "react";
 import { CheckCircle, XCircle } from "lucide-react";
 import { withCsrf } from "@/lib/csrf";
+import { slugifyWithFallback } from "@/lib/slug";
 
 /**
  * Inline Allow / Deny actions for an external-agent access request.
  *
- * Rendered in the compact consent surfaces — the bell notification and the
+ * Rendered in the compact consent surfaces -- the bell notification and the
  * non-blocking toast (mirroring AgentPausedActions) and reused in the Decisions
- * app. The granted scope set is exactly the requested scopes.
+ * app.
  *
- * When the request includes the `project_tasks` scope, that scope is bound to a
- * single project, so the approver must choose which project it applies to before
+ * What is being consented to must be legible before the approver clicks. Two
+ * things historically went unchecked in this surface:
+ *
+ *  - The requested PROJECT. The request payload may name a project that is
+ *    not visible to the approver (nonexistent on this install, or owned
+ *    elsewhere). The picker never adopted a requested id it could not resolve
+ *    in the operator's project list, which is correct -- but it also rendered a
+ *    BLANK dropdown with no hint of what was asked, training the approver to
+ *    click through an approval they could not see. The requested project is now
+ *    preselected AND labelled by name when it resolves, and an explicit
+ *    not-found message is shown (in red) when it does not, so the failure is
+ *    legible instead of silent.
+ *
+ *  - The SCOPES. The granted set is always a subset of the requested set (the
+ *    backend enforces narrow-not-widen); this surface now renders both the
+ *    Requested and the Granted lists and highlights any scope that is dropped
+ *    from -- or added beyond -- the request, so a narrowing or a widening can
+ *    never happen silently.
+ *
+ * When the request includes a project scope, that scope is bound to a single
+ * project, so the approver must choose which project it applies to before
  * allowing. The picker lists the operator's projects and can create one inline,
- * so a request that named no project (or the wrong one) can still be assigned the
- * right project at approval time. The chosen project id is passed to the approve
- * endpoint, which mints the token bound to it.
+ * so a request that named no project (or the wrong one) can still be assigned
+ * the right project at approval time. The chosen project id is passed to the
+ * approve endpoint, which mints the token bound to it.
+ *
+ * WHICH scopes those are is the server's answer, never ours. This file used to
+ * carry its own Set of them, and it fell six scopes behind the backend's
+ * `_PROJECT_SCOPES`: for `files_write` (and five others) the picker never
+ * rendered, approve was POSTed with no project_id, and the operator got a 400
+ * with no control on screen that could fix it. A refreshed copy would only
+ * postpone that until the next scope is added, so there is no copy here at all
+ * -- the vocabulary is fetched below and the picker renders from the response.
  */
-const PROJECT_SCOPES = new Set(["project_tasks", "canvas_read", "canvas_write"]);
+
+/** Server-published scope vocabulary: every grantable scope, plus the subset
+ *  that is meaningless without a project binding. See
+ *  tinyagentos/routes/agent_auth_requests.py. */
+const SCOPE_VOCABULARY_URL = "/api/agents/scope-vocabulary";
+
+/** Mirrors DenyScopeBody.reason's max_length on the scope-request deny route. */
+const DENY_REASON_MAX = 2000;
+
+/** How long to wait for the vocabulary before treating silence as a failure.
+ *  A hung request must become a visible error, not an Allow button that is
+ *  disabled forever for no stated reason. */
+const VOCAB_TIMEOUT_MS = 10_000;
 
 interface ProjectOption {
   id: string;
   name: string;
 }
 
-function slugify(name: string): string {
+/** Difference between the requested scope set and the granted scope set.
+ * `dropped` = requested but not granted (narrowing); `added` = granted but not
+ * requested (widening). Exported so the diff logic is unit-testable in isolation.
+ */
+export function computeScopeDiff(
+  requested: readonly string[],
+  granted: readonly string[],
+) {
+  const r = new Set(requested);
+  const g = new Set(granted);
+  return {
+    dropped: requested.filter((s) => !g.has(s)),
+    added: granted.filter((s) => !r.has(s)),
+  };
+}
+
+function ScopeBadge({
+  scope,
+  dropped,
+  added,
+}: {
+  scope: string;
+  dropped?: boolean;
+  added?: boolean;
+}) {
+  if (dropped) {
+    return (
+      <span
+        className="inline-flex items-center rounded px-1.5 py-0.5 text-[11px] font-mono text-red-200 bg-red-500/15 border border-red-500/30"
+        aria-label={`${scope} (dropped from request)`}
+        data-state="dropped"
+      >
+        {scope}
+      </span>
+    );
+  }
+  if (added) {
+    return (
+      <span
+        className="inline-flex items-center rounded px-1.5 py-0.5 text-[11px] font-mono text-amber-200 bg-amber-500/15 border border-amber-500/30"
+        aria-label={`${scope} (granted beyond request)`}
+        data-state="added"
+      >
+        {scope}
+      </span>
+    );
+  }
   return (
-    name
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, "-")
-      .replace(/^-+|-+$/g, "")
-      .slice(0, 63) || "project"
+    <span
+      className="inline-flex items-center rounded px-2 py-0.5 text-[11px] font-mono text-shell-text-secondary bg-shell-surface border border-white/10"
+      aria-label={scope}
+      data-state="normal"
+    >
+      {scope}
+    </span>
   );
 }
 
 export function ConsentActions({
   requestId,
   scopes,
+  grantedScopes,
   requestedProjectId,
   onResolved,
   source = "auth_requests",
   canonicalId,
+  humanDuration,
+  harness,
+  denyReasonRequired = false,
+  showEffectiveBinding = false,
 }: {
   requestId: string;
   scopes: string[];
+  /** Scopes actually being granted. Defaults to the full requested set; pass a
+   *  narrower set to approve with fewer scopes (the backend allows
+   *  narrow-not-widen) and the diff against `scopes` is highlighted inline. */
+  grantedScopes?: string[];
   requestedProjectId?: string;
   onResolved?: () => void;
   source?: string;
   canonicalId?: string;
+  humanDuration?: string;
+  harness?: string;
+  /** Deny becomes two-step: the approver must type a reason, which is sent as
+   *  `{reason}` to the deny route (scope requests record it as deny_reason). */
+  denyReasonRequired?: boolean;
+  /** Say where the grant will actually apply. A grant with no project scope is
+   *  sent without a project_id and lands OS-wide, whatever project the request
+   *  named, so the approver must see that before Allow (tsk-6ghcrv). */
+  showEffectiveBinding?: boolean;
 }) {
-  const needsProject = scopes.some((s) => PROJECT_SCOPES.has(s));
+  // `granted` is what the approve call will actually send. It defaults to the
+  // full requested set, so the out-of-the-box behaviour (grant exactly what was
+  // asked) is unchanged; the prop exists so the Requested vs Granted contrast
+  // is always explicit and a narrowing can never be silent.
+  const granted = grantedScopes ?? scopes;
+  const { dropped, added } = computeScopeDiff(scopes, granted);
+  const hasScopeDiff = dropped.length > 0 || added.length > 0;
+
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // null until the server's vocabulary has been read. There is deliberately no
+  // default value to fall back on: not knowing which scopes need a project is
+  // exactly the state that produced the unfixable 400, so it blocks Allow and
+  // says why rather than guessing from a stale list.
+  const [projectScopes, setProjectScopes] = useState<string[] | null>(null);
+  const [vocabError, setVocabError] = useState<string | null>(null);
+  const needsProject =
+    projectScopes !== null && granted.some((s) => projectScopes.includes(s));
   const [projects, setProjects] = useState<ProjectOption[]>([]);
   const [loadingProjects, setLoadingProjects] = useState(false);
   // Start empty on purpose: a requestedProjectId is only adopted after it is
   // verified to exist in the fetched project list (below), so a stale or
-  // unowned id from the request can never be sent to approve.
+  // unowned id from the request can never be sent to approve. What changes here
+  // is that a requested id that does NOT resolve is now reported explicitly
+  // instead of leaving a silent blank dropdown.
   const [selectedProjectId, setSelectedProjectId] = useState<string>("");
+  const [resolvedRequestedProject, setResolvedRequestedProject] =
+    useState<ProjectOption | null>(null);
+  const [requestedProjectNotFound, setRequestedProjectNotFound] =
+    useState<boolean>(false);
   const [creating, setCreating] = useState(false);
+  // Only the consent route takes is_lead, and the backend refuses it unless
+  // the grant creates a membership row (project_tasks or a canvas scope).
+  const canLead =
+    source === "auth_requests" &&
+    needsProject &&
+    granted.some((s) => s === "project_tasks" || s.startsWith("canvas_"));
+  const [makeLead, setMakeLead] = useState(false);
+  // The request was accepted but the lead assignment is unconfirmed. Terminal:
+  // Allow/Deny never come back, because a second approve would 409.
+  const [leadUnconfirmed, setLeadUnconfirmed] = useState(false);
   const [newName, setNewName] = useState("");
+  const [denying, setDenying] = useState(false);
+  const [denyReason, setDenyReason] = useState("");
+
+  useEffect(() => {
+    let cancelled = false;
+    // A request that never settles would leave Allow disabled forever with
+    // nothing on screen saying why -- the same "no remedy on screen" shape as
+    // the 400 this card removes. Bound it and report the timeout.
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), VOCAB_TIMEOUT_MS);
+    fetch(SCOPE_VOCABULARY_URL, {
+      credentials: "include",
+      signal: controller.signal,
+    })
+      .then(async (r) => {
+        if (!r.ok) {
+          throw new Error(`the server answered ${r.status}`);
+        }
+        const d = (await r.json()) as { project_scopes?: unknown };
+        // Every entry must be a string. Filtering the bad ones out instead
+        // would hand back a SHORTER list that still looks valid, silently
+        // dropping a project scope and reopening the picker-never-renders bug.
+        if (
+          !Array.isArray(d?.project_scopes) ||
+          !d.project_scopes.every((v): v is string => typeof v === "string")
+        ) {
+          throw new Error("the server's answer was malformed");
+        }
+        return d.project_scopes;
+      })
+      .then((list) => {
+        if (cancelled) return;
+        setProjectScopes(list);
+        setVocabError(null);
+      })
+      .catch((e) => {
+        if (cancelled) return;
+        setProjectScopes(null);
+        setVocabError(
+          controller.signal.aborted
+            ? `no answer within ${Math.round(VOCAB_TIMEOUT_MS / 1000)}s`
+            : e instanceof Error
+              ? e.message
+              : "the request failed",
+        );
+      })
+      .finally(() => clearTimeout(timer));
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+      controller.abort();
+    };
+  }, []);
 
   useEffect(() => {
     if (!needsProject) return;
     let cancelled = false;
     setLoadingProjects(true);
+    setRequestedProjectNotFound(false);
+    setResolvedRequestedProject(null);
     fetch("/api/projects?status=active", { credentials: "include" })
       .then((r) => (r.ok ? r.json() : { items: [] }))
       .then((d: { items?: ProjectOption[] }) => {
         if (cancelled) return;
         const items = Array.isArray(d.items) ? d.items : [];
         setProjects(items);
-        // Preselect the requested project if it exists, else auto-pick when there
-        // is exactly one project. Never overwrite an operator's manual choice.
-        setSelectedProjectId((cur) => {
-          if (cur) return cur;
-          if (requestedProjectId && items.some((p) => p.id === requestedProjectId)) {
-            return requestedProjectId;
+        // Preselect the requested project if it exists in the operator's
+        // visible set -- and label it -- else leave the picker blank with an
+        // explicit not-found message so the approver is never guessing.
+        if (requestedProjectId) {
+          const match = items.find((p) => p.id === requestedProjectId);
+          if (match) {
+            setResolvedRequestedProject(match);
+            setRequestedProjectNotFound(false);
+            setSelectedProjectId((cur) => cur || match.id);
+          } else {
+            setResolvedRequestedProject(null);
+            setRequestedProjectNotFound(true);
+            // Do not adopt the requested id; leave the picker blank so the
+            // operator must actively choose a project they can see.
+            setSelectedProjectId((cur) => cur);
           }
-          return items.length === 1 && items[0] ? items[0].id : "";
-        });
+        } else {
+          setResolvedRequestedProject(null);
+          setRequestedProjectNotFound(false);
+          setSelectedProjectId((cur) => {
+            if (cur) return cur;
+            return items.length === 1 && items[0] ? items[0].id : "";
+          });
+        }
       })
       .catch(() => {
         if (!cancelled) setProjects([]);
@@ -94,24 +301,39 @@ export function ConsentActions({
   async function createProject(): Promise<string | null> {
     const name = newName.trim();
     if (!name) return null;
-    const res = await fetch("/api/projects", withCsrf({
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      credentials: "include",
-      body: JSON.stringify({ name, slug: slugify(name) }),
-    }));
+    const res = await fetch(
+      "/api/projects",
+      withCsrf({
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        // A name in a non-Latin script derives no client-side slug, and the
+      // constant "project" this replaced gave every such name the same one.
+      body: JSON.stringify({ name, slug: slugifyWithFallback(name, "project") }),
+      }),
+    );
     if (!res.ok) {
       const d = await res.json().catch(() => ({}));
-      setError((d as { error?: string }).error ?? `Could not create project (${res.status})`);
+      setError(
+        (d as { error?: string }).error ??
+          `Could not create project (${res.status})`,
+      );
       return null;
     }
-    const p = (await res.json().catch(() => null)) as Partial<ProjectOption> | null;
+    const p = (await res.json().catch(() => null)) as
+      | Partial<ProjectOption>
+      | null;
     const id = typeof p?.id === "string" ? p.id : "";
     if (!id) {
-      setError("Project created but the response was unexpected; reload and pick it from the list.");
+      setError(
+        "Project created but the response was unexpected; reload and pick it from the list.",
+      );
       return null;
     }
-    const created: ProjectOption = { id, name: typeof p?.name === "string" ? p.name : id };
+    const created: ProjectOption = {
+      id,
+      name: typeof p?.name === "string" ? p.name : id,
+    };
     setProjects((prev) => [created, ...prev]);
     setSelectedProjectId(id);
     setCreating(false);
@@ -122,8 +344,19 @@ export function ConsentActions({
   async function decide(approved: boolean) {
     setBusy(true);
     setError(null);
+    // Approving without knowing whether these scopes are project-bound is the
+    // defect this surface exists to prevent; refuse rather than guess. Denying
+    // needs no vocabulary, so it is never blocked.
+    if (approved && projectScopes === null) {
+      setError(
+        vocabError ??
+          "Still reading the scope vocabulary from the server; try again in a moment.",
+      );
+      setBusy(false);
+      return;
+    }
     let projectId = selectedProjectId;
-    // If approving with project_tasks while mid-create, create the project first.
+    // If approving with a project scope while mid-create, create the project first.
     if (approved && needsProject && creating && newName.trim()) {
       const created = await createProject();
       if (!created) {
@@ -142,28 +375,60 @@ export function ConsentActions({
       setBusy(false);
       return;
     }
-    const baseUrl = source === "agent_scope_requests"
-      ? `/api/agents/registry/${encodeURIComponent(canonicalId!)}/scope-requests/${encodeURIComponent(requestId)}`
-      : `/api/agents/auth-requests/${encodeURIComponent(requestId)}`;
+    const baseUrl =
+      source === "agent_scope_requests"
+        ? `/api/agents/registry/${encodeURIComponent(canonicalId!)}/scope-requests/${encodeURIComponent(requestId)}`
+        : `/api/agents/auth-requests/${encodeURIComponent(requestId)}`;
     const url = `${baseUrl}/${approved ? "approve" : "deny"}`;
     let body: string | undefined;
     if (approved) {
-      const payload: { granted_scopes: string[]; project_id?: string } = { granted_scopes: scopes };
+      const payload: {
+        granted_scopes: string[];
+        project_id?: string;
+        is_lead?: boolean;
+      } = {
+        granted_scopes: granted,
+      };
       if (needsProject && projectId) payload.project_id = projectId;
+      if (canLead && makeLead && projectId) payload.is_lead = true;
       body = JSON.stringify(payload);
-    }
-    try {
-      const res = await fetch(url, withCsrf({
-        method: "POST",
-        headers: body ? { "Content-Type": "application/json" } : {},
-        body,
-        credentials: "include",
-      }));
-      if (!res.ok) {
-        const data = await res.json().catch(() => ({}));
-        setError((data as { detail?: string }).detail ?? `Request failed (${res.status})`);
+    } else if (denyReasonRequired) {
+      const reason = denyReason.trim();
+      if (!reason) {
+        setError("Give a reason for denying this request.");
         setBusy(false);
         return;
+      }
+      body = JSON.stringify({ reason });
+    }
+    try {
+      const res = await fetch(
+        url,
+        withCsrf({
+          method: "POST",
+          headers: body ? { "Content-Type": "application/json" } : {},
+          body,
+          credentials: "include",
+        }),
+      );
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        setError(
+          (data as { detail?: string }).detail ??
+            `Request failed (${res.status})`,
+        );
+        setBusy(false);
+        return;
+      }
+      if (body && JSON.parse(body).is_lead) {
+        const data = (await res.json().catch(() => ({}))) as {
+          lead_assigned?: boolean;
+        };
+        if (data.lead_assigned !== true) {
+          setLeadUnconfirmed(true);
+          setBusy(false);
+          return;
+        }
       }
       onResolved?.();
     } catch (e) {
@@ -172,70 +437,295 @@ export function ConsentActions({
     }
   }
 
+  // Screen-reader names for the two decisions: what is granted (or refused)
+  // and on which project, so "Allow" is never ambiguous out of context. Allow
+  // follows the picker, because that is the project the grant binds to.
+  const pickedProjectName = creating
+    ? newName.trim()
+    : projects.find((p) => p.id === selectedProjectId)?.name ?? "";
+  const requestedProjectName =
+    resolvedRequestedProject?.name ?? pickedProjectName;
+  const allowLabel = `Allow ${granted.join(", ")}${
+    needsProject && pickedProjectName ? ` on ${pickedProjectName}` : ""
+  }`;
+  const denyLabel = `Deny ${scopes.join(", ")}${
+    needsProject && requestedProjectName ? ` on ${requestedProjectName}` : ""
+  }`;
+
   const allowDisabled =
-    busy || (needsProject && (creating ? !newName.trim() : !selectedProjectId));
+    busy ||
+    projectScopes === null ||
+    // Every requested scope unticked: nothing left to grant.
+    (scopes.length > 0 && granted.length === 0) ||
+    (needsProject &&
+      (creating ? !newName.trim() : !selectedProjectId));
 
   return (
     <div className="mt-2" role="group" aria-label="Consent actions">
-      {needsProject && (
+      {vocabError && (
+        <p role="alert" className="mb-2 text-[11px] text-red-300">
+          Could not confirm which scopes need a project ({vocabError}), so this
+          request cannot be approved safely. Reload and try again.
+        </p>
+      )}
+      {scopes.length > 0 && (
         <div className="mb-2">
-          <label
-            htmlFor={`consent-project-${requestId}`}
-            className="block text-[11px] text-shell-text-secondary mb-1"
-          >
-            Grant project access for
-          </label>
-          {!creating ? (
-            <div className="flex items-center gap-1.5">
-              <select
-                id={`consent-project-${requestId}`}
-                value={selectedProjectId}
-                onChange={(e) => {
-                  e.stopPropagation();
-                  setSelectedProjectId(e.target.value);
-                }}
-                onClick={(e) => e.stopPropagation()}
-                disabled={busy || loadingProjects}
-                className="flex-1 min-w-0 px-2 py-1 rounded-md text-[11px] bg-white/5 border border-white/10 text-shell-text disabled:opacity-50"
-              >
-                <option value="">{loadingProjects ? "Loading..." : "Select a project"}</option>
-                {projects.map((p) => (
-                  <option key={p.id} value={p.id}>
-                    {p.name}
-                  </option>
-                ))}
-              </select>
-              <button
-                type="button"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  setCreating(true);
-                }}
-                disabled={busy}
-                className="px-2 py-1 rounded-md text-[11px] bg-white/5 hover:bg-white/10 border border-white/10 text-shell-text-secondary disabled:opacity-50"
-              >
-                New
-              </button>
-            </div>
-          ) : (
-            <div className="flex items-center gap-1.5">
-              <input
-                aria-label="New project name"
-                value={newName}
-                onChange={(e) => {
-                  e.stopPropagation();
-                  setNewName(e.target.value);
-                }}
-                onClick={(e) => e.stopPropagation()}
-                placeholder="New project name"
-                className="flex-1 min-w-0 px-2 py-1 rounded-md text-[11px] bg-white/5 border border-white/10 text-shell-text"
+          <div className="flex flex-wrap items-baseline gap-1">
+            <span className="font-medium text-[11px] uppercase tracking-wide text-shell-text-tertiary">
+              Requested
+            </span>
+            {scopes.map((s) => (
+              <ScopeBadge
+                key={`req-${s}`}
+                scope={s}
+                dropped={dropped.includes(s)}
               />
+            ))}
+          </div>
+          <div className="flex flex-wrap items-baseline gap-1 mt-0.5">
+            <span className="font-medium text-[11px] uppercase tracking-wide text-shell-text-tertiary">
+              Granted
+            </span>
+            {granted.map((s) => (
+              <ScopeBadge
+                key={`grant-${s}`}
+                scope={s}
+                added={added.includes(s)}
+              />
+            ))}
+          </div>
+          {hasScopeDiff && (
+            <p
+              role="alert"
+              className="mt-1 text-[11px] text-red-300"
+            >
+              {dropped.length > 0 && (
+                <span>
+                  Dropping {dropped.length} requested scope(s):{" "}
+                  {dropped.join(", ")}.
+                </span>
+              )}
+              {added.length > 0 && (
+                <span>
+                  {" "}
+                  Granting {added.length} scope(s) beyond the request:{" "}
+                  {added.join(", ")}.
+                </span>
+              )}
+            </p>
+          )}
+        </div>
+      )}
+      {humanDuration && (
+        <div className="mb-2">
+          <p className="text-[11px] text-shell-text-tertiary">
+            {humanDuration}
+          </p>
+        </div>
+      )}
+      {harness === "grok" && (
+        <p className="mb-2 text-[11px] text-amber-300">
+          This token will be readable by all bots on this Grok account.
+        </p>
+      )}
+      {showEffectiveBinding &&
+        projectScopes !== null &&
+        !needsProject &&
+        granted.length > 0 && (
+          <p className="mb-2 text-[11px] font-medium text-red-300">
+            Grants OS-wide (all projects)
+          </p>
+        )}
+      {needsProject && (
+          <div className="mb-2">
+            {requestedProjectId && requestedProjectNotFound && (
+              <p
+                role="alert"
+                className="mb-1.5 text-[11px] text-red-300"
+              >
+                Requested project {requestedProjectId} not found (not visible to
+                you). Pick a project you can see below, or create one.
+              </p>
+            )}
+            {requestedProjectId && resolvedRequestedProject && (
+              <p className="mb-1 text-[11px] text-shell-text-secondary">
+                Requesting access for{" "}
+                <span className="font-medium text-shell-text">
+                  {resolvedRequestedProject.name}
+                </span>
+                {" "}
+                (<code className="text-shell-text-tertiary">
+                  {resolvedRequestedProject.id}
+                </code>)
+              </p>
+            )}
+            {!creating ? (
+              <div className="flex items-center gap-1.5">
+                <select
+                  id={`consent-project-${requestId}`}
+                  aria-label="Grant project access for"
+                  value={selectedProjectId}
+                  onChange={(e) => {
+                    e.stopPropagation();
+                    setSelectedProjectId(e.target.value);
+                    setRequestedProjectNotFound(false);
+                  }}
+                  onClick={(e) => e.stopPropagation()}
+                  disabled={busy || loadingProjects}
+                  className="flex-1 min-w-0 px-2 py-1 rounded-md text-[11px] bg-white/5 border border-white/10 text-shell-text disabled:opacity-50"
+                  aria-invalid={requestedProjectNotFound ? "true" : undefined}
+                >
+                  <option value="">
+                    {loadingProjects ? "Loading..." : "Select a project"}
+                  </option>
+                  {projects.map((p) => (
+                    <option key={p.id} value={p.id}>
+                      {p.name}
+                    </option>
+                  ))}
+                </select>
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setRequestedProjectNotFound(false);
+                    setCreating(true);
+                  }}
+                  disabled={busy}
+                  className="px-2 py-1 rounded-md text-[11px] bg-white/5 hover:bg-white/10 border border-white/10 text-shell-text-secondary disabled:opacity-50"
+                >
+                  New
+                </button>
+              </div>
+            ) : (
+              <div className="flex items-center gap-1.5">
+                <input
+                  aria-label="New project name"
+                  value={newName}
+                  onChange={(e) => {
+                    e.stopPropagation();
+                    setNewName(e.target.value);
+                  }}
+                  onClick={(e) => e.stopPropagation()}
+                  placeholder="New project name"
+                  className="flex-1 min-w-0 px-2 py-1 rounded-md text-[11px] bg-white/5 border border-white/10 text-shell-text"
+                />
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setCreating(false);
+                    setNewName("");
+                  }}
+                  disabled={busy}
+                  className="px-2 py-1 rounded-md text-[11px] bg-white/5 hover:bg-white/10 border border-white/10 text-shell-text-secondary disabled:opacity-50"
+                >
+                  Cancel
+                </button>
+              </div>
+            )}
+            {canLead && (
+              <label
+                className="mt-1.5 flex items-center gap-1.5 text-[11px] text-shell-text-secondary"
+                onClick={(e) => e.stopPropagation()}
+              >
+                <input
+                  type="checkbox"
+                  checked={makeLead}
+                  onChange={(e) => {
+                    e.stopPropagation();
+                    setMakeLead(e.target.checked);
+                  }}
+                  disabled={busy}
+                />
+                Make project lead
+              </label>
+            )}
+          </div>
+        )}
+        {leadUnconfirmed ? (
+          <div className="flex flex-wrap items-center gap-1.5">
+            <p role="alert" className="text-[11px] text-amber-300">
+              Approved, but the project lead could not be set. Make the agent lead from the project&apos;s Members.
+            </p>
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                onResolved?.();
+              }}
+              className="px-2 py-1 rounded-md text-[11px] font-medium bg-white/5 hover:bg-white/10 text-shell-text-secondary border border-white/10 transition-colors"
+            >
+              Dismiss
+            </button>
+          </div>
+        ) : (
+          <div className="flex flex-wrap gap-1.5">
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                decide(true);
+              }}
+              disabled={allowDisabled}
+              aria-label={allowLabel}
+              className="flex items-center gap-1 px-2 py-1 rounded-md text-[11px] font-medium bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-400 border border-emerald-500/20 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              <CheckCircle size={11} />
+              Allow
+            </button>
+            <button
+              type="button"
+              aria-label={denyLabel}
+              onClick={(e) => {
+                e.stopPropagation();
+                if (denyReasonRequired) {
+                  setDenying(true);
+                  return;
+                }
+                decide(false);
+              }}
+              disabled={busy || denying}
+              className="flex items-center gap-1 px-2 py-1 rounded-md text-[11px] font-medium bg-white/5 hover:bg-red-500/15 hover:text-red-300 text-shell-text-secondary border border-white/10 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              <XCircle size={11} />
+              Deny
+            </button>
+          </div>
+        )}
+        {denying && !leadUnconfirmed && (
+          <div className="mt-1.5 flex flex-col gap-1.5">
+            <textarea
+              aria-label="Reason for denying"
+              value={denyReason}
+              onChange={(e) => {
+                e.stopPropagation();
+                setDenyReason(e.target.value);
+              }}
+              onClick={(e) => e.stopPropagation()}
+              placeholder="Why is this request denied?"
+              maxLength={DENY_REASON_MAX}
+              rows={2}
+              className="w-full px-2 py-1 rounded-md text-[11px] bg-white/5 border border-white/10 text-shell-text"
+            />
+            <div className="flex flex-wrap gap-1.5">
               <button
                 type="button"
                 onClick={(e) => {
                   e.stopPropagation();
-                  setCreating(false);
-                  setNewName("");
+                  decide(false);
+                }}
+                disabled={busy || !denyReason.trim()}
+                className="px-2 py-1 rounded-md text-[11px] font-medium bg-red-500/15 hover:bg-red-500/25 text-red-300 border border-red-500/20 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                Confirm deny
+              </button>
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setDenying(false);
+                  setDenyReason("");
                 }}
                 disabled={busy}
                 className="px-2 py-1 rounded-md text-[11px] bg-white/5 hover:bg-white/10 border border-white/10 text-shell-text-secondary disabled:opacity-50"
@@ -243,50 +733,23 @@ export function ConsentActions({
                 Cancel
               </button>
             </div>
-          )}
-        </div>
-      )}
-      <div className="flex flex-wrap gap-1.5">
-        <button
-          type="button"
-          onClick={(e) => {
-            e.stopPropagation();
-            decide(true);
-          }}
-          disabled={allowDisabled}
-          className="flex items-center gap-1 px-2 py-1 rounded-md text-[11px] font-medium bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-400 border border-emerald-500/20 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-        >
-          <CheckCircle size={11} />
-          Allow
-        </button>
-        <button
-          type="button"
-          onClick={(e) => {
-            e.stopPropagation();
-            decide(false);
-          }}
-          disabled={busy}
-          className="flex items-center gap-1 px-2 py-1 rounded-md text-[11px] font-medium bg-white/5 hover:bg-red-500/15 hover:text-red-300 text-shell-text-secondary border border-white/10 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-        >
-          <XCircle size={11} />
-          Deny
-        </button>
+          </div>
+        )}
+        {error && (
+          <p role="alert" className="mt-1.5 text-[11px] text-red-300">
+            {error}
+          </p>
+        )}
       </div>
-      {error && (
-        <p role="alert" className="mt-1.5 text-[11px] text-red-300">
-          {error}
-        </p>
-      )}
-    </div>
-  );
+    );
 }
 
 /** Pull the consent payload (request id + requested scopes + any requested
- *  project) out of a notification's `data` field. Returns null when the shape
- *  is missing. */
+ * project + human-readable duration) out of a notification's `data` field.
+ * Returns null when the shape is missing. */
 export function consentPayload(
   data: Record<string, unknown> | undefined,
-): { requestId: string; scopes: string[]; projectId?: string; canonicalId?: string } | null {
+): { requestId: string; scopes: string[]; projectId?: string; canonicalId?: string; humanDuration?: string; harness?: string } | null {
   if (!data) return null;
   const requestId = data.request_id;
   if (typeof requestId !== "string") return null;
@@ -294,5 +757,7 @@ export function consentPayload(
   const scopes = Array.isArray(raw) ? raw.filter((s): s is string => typeof s === "string") : [];
   const projectId = typeof data.project_id === "string" ? data.project_id : undefined;
   const canonicalId = typeof data.canonical_id === "string" ? data.canonical_id : undefined;
-  return { requestId, scopes, projectId, canonicalId };
+  const humanDuration = typeof data.human_duration === "string" ? data.human_duration : undefined;
+  const harness = typeof data.framework === "string" ? data.framework : undefined;
+  return { requestId, scopes, projectId, canonicalId, humanDuration, harness };
 }

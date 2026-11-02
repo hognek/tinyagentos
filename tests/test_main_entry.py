@@ -4,12 +4,27 @@ from __future__ import annotations
 from unittest.mock import patch
 
 
+def _disable_tls_device_listener(monkeypatch, m):
+    """Force main() down the plain uvicorn.run branch.
+
+    The TLS device listener is on by default (:6974) and, like the gateway
+    agent listener, pushes main() onto the dual-port path. Its port cannot be
+    turned off by env (device_scopes.device_tls_port falls back to the default
+    for any out-of-range value, including 0), so stub the resolved port.
+    """
+    monkeypatch.setattr(m, "device_tls_port", lambda: 0)
+
+
 def test_main_uses_env_host_port(monkeypatch):
     monkeypatch.setenv("TAOS_HOST", "127.0.0.1")
     monkeypatch.setenv("TAOS_PORT", "7117")
     # Disable dual-port: these tests only exercise host/port env-var resolution.
     monkeypatch.setenv("TAOS_BROWSER_PROXY_PORT", "0")
+    monkeypatch.setenv("TAOS_LLM_GATEWAY_PORT", "0")  # and the gateway agent listener
+    monkeypatch.setenv("TAOS_AGENT_CONTROLLER_PORT", "0")  # and the agent controller listener
     from tinyagentos import __main__ as m
+
+    _disable_tls_device_listener(monkeypatch, m)
 
     captured = {}
 
@@ -30,7 +45,11 @@ def test_main_falls_back_to_config_when_env_unset(monkeypatch):
     monkeypatch.delenv("TAOS_PORT", raising=False)
     # Disable dual-port: these tests only exercise host/port env-var resolution.
     monkeypatch.setenv("TAOS_BROWSER_PROXY_PORT", "0")
+    monkeypatch.setenv("TAOS_LLM_GATEWAY_PORT", "0")  # and the gateway agent listener
+    monkeypatch.setenv("TAOS_AGENT_CONTROLLER_PORT", "0")  # and the agent controller listener
     from tinyagentos import __main__ as m
+
+    _disable_tls_device_listener(monkeypatch, m)
 
     captured = {}
 
@@ -44,3 +63,87 @@ def test_main_falls_back_to_config_when_env_unset(monkeypatch):
 
     assert captured["host"] == "0.0.0.0"
     assert captured["port"] == 6969
+
+
+def _run_main_capturing_serve(monkeypatch, gateway_flag):
+    from types import SimpleNamespace
+
+    monkeypatch.setenv("TAOS_HOST", "127.0.0.1")
+    monkeypatch.setenv("TAOS_PORT", "7117")
+    monkeypatch.setenv("TAOS_BROWSER_PROXY_PORT", "0")
+    monkeypatch.delenv("TAOS_LLM_GATEWAY_PORT", raising=False)
+    if gateway_flag is None:
+        monkeypatch.delenv("TAOS_LLM_GATEWAY", raising=False)
+    else:
+        monkeypatch.setenv("TAOS_LLM_GATEWAY", gateway_flag)
+    from tinyagentos import __main__ as m
+
+    app = SimpleNamespace(state=SimpleNamespace())
+    served = {}
+    with patch("uvicorn.run", side_effect=lambda *a, **k: served.setdefault("uvicorn_run", k)), \
+         patch.object(m, "_serve_dual_port", side_effect=lambda *a, **k: served.setdefault("multi", k)), \
+         patch.object(m, "create_app", return_value=app):
+        m.main()
+    return app, served
+
+
+def test_main_serves_the_gateway_agent_listener_by_default(monkeypatch):
+    app, served = _run_main_capturing_serve(monkeypatch, None)
+    assert "uvicorn_run" not in served
+    assert served["multi"]["gateway_port"] == 7838
+    assert served["multi"]["proxy_port"] == 0
+    assert app.state.llm_gateway_agent_port == 7838
+
+
+def test_main_serves_the_tls_device_listener_by_default(monkeypatch):
+    """The TLS device listener (:6974) is on by default, so main() serves it
+    alongside the main origin through _serve_dual_port."""
+    from types import SimpleNamespace
+
+    monkeypatch.setenv("TAOS_HOST", "127.0.0.1")
+    monkeypatch.setenv("TAOS_PORT", "7117")
+    monkeypatch.setenv("TAOS_BROWSER_PROXY_PORT", "0")
+    monkeypatch.setenv("TAOS_DEVICE_TLS_PORT", "6974")
+    monkeypatch.delenv("TAOS_LLM_GATEWAY_PORT", raising=False)
+    from tinyagentos import __main__ as m
+
+    served = {}
+    with patch.object(m, "_serve_dual_port", side_effect=lambda *a, **k: served.setdefault("multi", k)), \
+         patch.object(m, "create_app", return_value=SimpleNamespace(state=SimpleNamespace())):
+        m.main()
+
+    assert served["multi"]["tls_port"] == 6974
+    assert served["multi"]["port"] == 7117
+
+
+def test_gateway_listener_binds_loopback_only_without_lifespan(monkeypatch):
+    from types import SimpleNamespace
+
+    from tinyagentos import __main__ as m
+
+    configs = []
+
+    class _Cfg:
+        def __init__(self, app, **kw):
+            configs.append(kw)
+
+    def fake_asyncio_run(coro):
+        coro.close()
+        return True
+
+    app = SimpleNamespace(state=SimpleNamespace(llm_proxy=SimpleNamespace(port=7834)))
+    with patch("uvicorn.Config", _Cfg), patch("uvicorn.Server.__init__", lambda self, config: None), \
+         patch("asyncio.run", fake_asyncio_run):
+        m._serve_dual_port(app, host="0.0.0.0", port=6969, proxy_port=0, gateway_port=7838)
+    gw = [c for c in configs if c.get("port") == 7838]
+    assert len(gw) == 1 and gw[0]["host"] == "127.0.0.1" and gw[0]["lifespan"] == "off"
+    assert [c["port"] for c in configs] == [6969, 7838]  # no browser-proxy server
+
+
+def test_main_old_gateway_off_flag_still_serves_the_listener(monkeypatch):
+    """TAOS_LLM_GATEWAY=0 is a logged no-op since LiteLLM removal 2b-2a: the
+    agent listener is the only LLM path, so it is served anyway."""
+    app, served = _run_main_capturing_serve(monkeypatch, "0")
+    assert "uvicorn_run" not in served
+    assert served["multi"]["gateway_port"] == 7838
+    assert app.state.llm_gateway_agent_port == 7838

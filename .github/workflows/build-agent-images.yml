@@ -157,7 +157,39 @@ jobs:
       # Map the "openclaw"/"generic"/"hermes" base label to its published alias.
       ALIAS: ${{ matrix.base == 'openclaw' && 'taos-openclaw-base' || (matrix.base == 'generic' && 'taos-base' || 'taos-hermes-base') }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+
+      - name: Extract openclaw version from install.sh
+        if: matrix.base == 'openclaw'
+        id: extract_openclaw_version
+        run: |
+          set -euo pipefail
+          # Collect DISTINCT versions so a matching echo/error line does not
+          # pollute the result (grep -oE anchors on the version token, then
+          # sort -u collapses duplicates).
+          VERSIONS=$(grep -oE 'openclaw@[0-9]+(\.[0-9]+)+' app-catalog/agents/openclaw/scripts/install.sh | sed 's/openclaw@//' | sort -u)
+
+          COUNT=$(printf '%s\n' "$VERSIONS" | wc -l)
+          if [ "$COUNT" -ne 1 ]; then
+            echo "ERROR: Expected exactly one distinct openclaw version in install.sh, found $COUNT" >&2
+            printf '%s\n' "$VERSIONS" >&2
+            exit 1
+          fi
+
+          VERSION=$(printf '%s\n' "$VERSIONS" | head -n1)
+
+          if [ -z "$VERSION" ]; then
+            echo "ERROR: Failed to extract openclaw version from install.sh" >&2
+            exit 1
+          fi
+
+          if ! [[ "$VERSION" =~ ^[0-9]+(\.[0-9]+)+$ ]]; then
+            echo "ERROR: Invalid openclaw version format: '$VERSION' (expected format: X.Y.Z where X, Y, Z are numbers)" >&2
+            exit 1
+          fi
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Extracted openclaw version: $VERSION"
 
       # Approach A: install incus in the runner and build the base image
       # by launching a real container. GitHub's ubuntu-latest and
@@ -224,13 +256,14 @@ jobs:
 
       - name: Bake openclaw into the base container
         if: matrix.base == 'openclaw'
+        env:
+          OPENCLAW_VERSION: ${{ steps.extract_openclaw_version.outputs.version }}
         run: |
-          sudo incus exec build-base -- bash -eux <<'BASH'
+          sudo incus exec build-base --env OPENCLAW_VERSION="$OPENCLAW_VERSION" -- bash -eux <<'BASH'
           export DEBIAN_FRONTEND=noninteractive
-          # Upstream OpenClaw from npm (latest) — no fork. The deploy-time
-          # install.sh also installs openclaw@latest, so this just warms the
-          # base image with a current build.
-          npm install -g --unsafe-perm openclaw@latest
+          # Upstream OpenClaw from npm — pinned to the same version the
+          # deploy-time install.sh uses (single source of truth).
+          npm install -g --unsafe-perm "openclaw@${OPENCLAW_VERSION}"
 
           # Sanity check
           test -f /usr/lib/node_modules/openclaw/dist/entry.js \
@@ -246,6 +279,7 @@ jobs:
           # deps the config patch needs). Per-agent config (.env, config.yaml,
           # systemd unit, bridge) stays at deploy time -- only prerequisites
           # are baked so a hermes deploy from this image needs no live install.
+          # Source of truth for tag/commit: tinyagentos/scripts/install_hermes.sh
           sudo incus exec build-base -- bash -eux <<'BASH'
           export DEBIAN_FRONTEND=noninteractive
           export PATH="/root/.local/bin:$PATH"
@@ -257,8 +291,8 @@ jobs:
           echo 'export PATH="/root/.local/bin:$PATH"' >> /root/.bashrc
 
           # NousResearch hermes-agent prerequisites (no setup; config is per-agent).
-          curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh \
-            | bash -s -- --skip-setup
+          curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/v2026.8.31/scripts/install.sh \
+            | bash -s -- --skip-setup --commit "29112bef099274229cadff79cdff7bf7b99c4b77"
 
           # Deps the deploy-time config patch step relies on.
           pip3 install --break-system-packages --quiet pyyaml httpx
@@ -290,7 +324,7 @@ jobs:
           sudo incus image export "$ALIAS" "./$ALIAS-linux-$ARCH"
           ls -la "./$ALIAS-linux-$ARCH"*
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7
         with:
           name: ${{ env.ALIAS }}-${{ matrix.arch }}
           path: ${{ env.ALIAS }}-linux-${{ matrix.arch }}.tar.gz
@@ -298,17 +332,18 @@ jobs:
 
   release:
     needs: [detect, build]
+    if: ${{ !cancelled() && needs.detect.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8
         with:
-          pattern: taos-*-base-*
+          pattern: taos-*base-*
           merge-multiple: true
 
       - name: List downloaded assets
-        run: ls -la taos-*-base-linux-*.tar.gz
+        run: ls -la taos-*base-linux-*.tar.gz
 
       - name: Compute build identifier
         id: id
@@ -342,7 +377,7 @@ jobs:
       # releases. Consumers (taOS deployer) point at the images repo directly.
       # Reuses ADD_TO_PROJECT_PAT (classic repo-scoped PAT already configured
       # on this repo) — it has Contents: write on jaylfc/tinyagentos-images.
-      - uses: softprops/action-gh-release@v3
+      - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64  # v3
         with:
           repository: jaylfc/tinyagentos-images
           token: ${{ secrets.ADD_TO_PROJECT_PAT }}

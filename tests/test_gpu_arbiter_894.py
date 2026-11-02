@@ -270,7 +270,7 @@ class FakeClusterManager:
         self.claim_calls.append(resource_id)
         return lease
 
-    async def release_lease(self, lease_id):
+    async def release_lease(self, lease_id, epoch=None):
         self._leases.pop(lease_id, None)
         self.release_calls.append(lease_id)
 

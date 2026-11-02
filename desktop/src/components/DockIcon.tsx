@@ -1,13 +1,16 @@
 import { useState, useCallback } from "react";
 import * as icons from "lucide-react";
-import { getApp, prefetchApp } from "@/registry/app-registry";
+import { getApp, pinnedAppId, pinnedLaunchProps, prefetchApp } from "@/registry/app-registry";
 import { useProcessStore } from "@/stores/process-store";
 import { useDockStore } from "@/stores/dock-store";
 import { ContextMenu, type MenuItem } from "./ContextMenu";
+import { AppTypeBadge } from "./AppTypeBadge";
+import { appRuntime } from "@/lib/app-runtime";
 
 type DockIconSize = "small" | "medium" | "large";
 
 interface Props {
+  /** A dock pin id, which for a legacy pin is not an app id (see APP_REDIRECTS). */
   appId: string;
   isRunning: boolean;
   onClick: () => void;
@@ -20,6 +23,12 @@ const SIZE_CLASSES: Record<DockIconSize, string> = {
   large: "w-14 h-14",
 };
 
+const BADGE_SIZE: Record<DockIconSize, "sm" | "md" | "lg"> = {
+  small: "sm",
+  medium: "md",
+  large: "lg",
+};
+
 const ICON_PX: Record<DockIconSize, number> = {
   small: 16,
   medium: 20,
@@ -27,7 +36,11 @@ const ICON_PX: Record<DockIconSize, number> = {
 };
 
 export function DockIcon({ appId, isRunning, onClick, size = "medium" }: Props) {
-  const app = getApp(appId);
+  // Everything that touches the app behind the pin resolves the id first;
+  // pinning and unpinning still act on the id the dock actually stores, so a
+  // legacy pin keeps the section that only its own id can express (#2677).
+  const targetId = pinnedAppId(appId);
+  const app = getApp(targetId);
   const [menu, setMenu] = useState<{ x: number; y: number } | null>(null);
 
   const windows = useProcessStore((s) => s.windows);
@@ -42,7 +55,7 @@ export function DockIcon({ appId, isRunning, onClick, size = "medium" }: Props) 
   const pin = useDockStore((s) => s.pin);
   const unpin = useDockStore((s) => s.unpin);
 
-  const win = windows.find((w) => w.appId === appId);
+  const win = windows.find((w) => w.appId === targetId);
   const isPinned = pinned.includes(appId);
 
   const onContextMenu = useCallback((e: React.MouseEvent) => {
@@ -64,7 +77,7 @@ export function DockIcon({ appId, isRunning, onClick, size = "medium" }: Props) 
   const newWindowItem: MenuItem = {
     label: "New Window",
     icon: <icons.SquarePlus size={14} />,
-    action: () => openWindow(appId, app.defaultSize, undefined, { forceNew: true }),
+    action: () => openWindow(targetId, app.defaultSize, pinnedLaunchProps(appId), { forceNew: true }),
   };
 
   const items: MenuItem[] = win
@@ -108,12 +121,13 @@ export function DockIcon({ appId, isRunning, onClick, size = "medium" }: Props) 
       <button
         onClick={onClick}
         onContextMenu={onContextMenu}
-        onMouseEnter={() => prefetchApp(appId)}
+        onMouseEnter={() => prefetchApp(targetId)}
         className={`group relative flex items-center justify-center ${SIZE_CLASSES[size]} rounded-lg bg-shell-surface hover:bg-shell-surface-active transition-all hover:scale-110`}
         aria-label={`Open ${app.name}`}
         title={app.name}
       >
         <IconComponent size={ICON_PX[size]} className="text-shell-text" />
+        <AppTypeBadge runtime={appRuntime(app)} size={BADGE_SIZE[size]} />
         {isRunning && (
           <div className="absolute -bottom-1 left-1/2 -translate-x-1/2 w-1 h-1 rounded-full bg-accent" />
         )}

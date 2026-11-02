@@ -15,6 +15,7 @@ POST   /api/agents/registry/{id}/approve     - lifecycle: pending → active (ad
 POST   /api/agents/registry/{id}/reject      - lifecycle: pending → rejected (admin only)
 POST   /api/agents/registry/{id}/suspend     - lifecycle: active → suspended (admin only)
 POST   /api/agents/registry/{id}/reactivate  - lifecycle: suspended → active (admin only)
+POST   /api/agents/registry/{id}/rotate-tokens - rotate the credential ON this identity, return the new token (owner/admin, or the agent itself)
 
 Route ordering matters: /pubkey, /revoked, and /inactive are declared before
 /{canonical_id} so the literal strings are not captured as a path parameter.
@@ -22,6 +23,7 @@ Route ordering matters: /pubkey, /revoked, and /inactive are declared before
 
 import asyncio
 import logging
+import time
 from typing import Optional
 
 import aiosqlite
@@ -29,9 +31,9 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, field_validator
 
-from tinyagentos.agent_registry_store import mint_registry_token
+from tinyagentos.agent_registry_store import TOKEN_STORAGE_GUIDANCE, mint_registry_token
 from tinyagentos.agent_token_auth import check_agent_scope
-from tinyagentos.auth_context import CurrentUser, current_user, require_owner_or_admin
+from tinyagentos.auth_context import CurrentUser, current_user
 
 logger = logging.getLogger(__name__)
 
@@ -88,18 +90,23 @@ class OrgUpdateRequest(BaseModel):
 # consent-flow VALID_SCOPES; the mint route must not be a back door to invent
 # arbitrary scopes that the rest of the system does not understand.
 _ALLOWED_SCOPES = frozenset({
-    "memory_read", "memory_write",
     "a2a_send", "a2a_receive",
     "files_read", "files_write",
-    "tools_execute", "registry_feeds_read",
+    "registry_feeds_read",
+    "chat_session",
     "project_tasks",
     "project_tasks_create",
     "project_tasks_update",
-     "project_doc_review",
-     "project_notes",
-     "canvas_read", "canvas_write",
+    "project_doc_review",
+    "project_notes",
+    "project_lists",
+    "canvas_read", "canvas_write",
     "decisions_read", "decisions_write",
     "observatory_control",
+    "notifications_write",
+    "memory_read",
+    # Memory access: write to an agent's own memory namespace.
+    "memory_write",
 })
 
 
@@ -218,23 +225,27 @@ async def _audit_governance(
     actor_user_id: str,
     before_status: str,
     after_status: str,
+    **extras,
 ) -> None:
-    """Write a governance audit event to the trace store (best-effort, non-fatal)."""
+    """Write a governance audit event to the trace store (best-effort, non-fatal).
+
+    Extra keyword arguments are merged into the payload (e.g. before/after
+    token_min_iat for rotation events).
+    """
     try:
         trace_registry = getattr(request.app.state, "trace_registry", None)
         if trace_registry is None:
             return
         ts = await trace_registry.get(_GOVERNANCE_SLUG)
-        await ts.record(
-            "governance",
-            payload={
-                "action": action,
-                "canonical_id": canonical_id,
-                "actor_user_id": actor_user_id,
-                "before_status": before_status,
-                "after_status": after_status,
-            },
-        )
+        payload = {
+            "action": action,
+            "canonical_id": canonical_id,
+            "actor_user_id": actor_user_id,
+            "before_status": before_status,
+            "after_status": after_status,
+            **extras,
+        }
+        await ts.record("governance", payload=payload)
     except Exception:
         logger.exception("governance audit write failed (non-fatal)")
 
@@ -287,6 +298,7 @@ async def register_agent(
     return {
         "canonical_id": record["canonical_id"],
         "token": token,
+        "storage_guidance": TOKEN_STORAGE_GUIDANCE,
         "record": record,
     }
 
@@ -314,8 +326,28 @@ async def _mint_internal_identity(
 
     # The lock makes the check-then-register atomic: a concurrent mint of the
     # same handle waits, then sees the row the first one created and reuses it.
+    # The consent approve path registers with ``_slugify(identity_claim)``, so a
+    # driver that self-joined is stored as `taosmd-dev` while ``_INTERNAL_AGENTS``
+    # names it `@taOSmd-dev`.  ``get_by_handle`` is an exact SQL match, so looking
+    # up only the spelling we were given misses that row and registers a SECOND
+    # identity: the duplicate takes the driver scopes and the token while the
+    # original keeps the project grants, leaving the agent with two identities and
+    # the wrong one credentialed.
+    #
+    # Match on the SLUG rather than trying the two spellings we can think of.
+    # ``handle`` arrives from a request body here, so the caller may hold either
+    # spelling -- an admin passing `taosmd-dev` while the row is stored as
+    # `@taOSmd-dev` forks a row just as readily as the reverse, and no amount of
+    # string surgery recovers `@taOSmd-dev` from `taosmd-dev` (slugifying
+    # discards case).  Slug comparison is direction-free and closes both.
+    #
+    # The exact lookup still runs first: it is the indexed path and it is what
+    # almost every call hits.
+
     async with _mint_lock:
         existing = await store.get_by_handle(handle)
+        if existing is None:
+            existing = await store.get_by_handle_normalised(handle)
         if existing is not None:
             # A non-internal owner is only reused when the admin adopts it: this
             # blocks an impostor that grabbed "@Hermes" from silently receiving
@@ -377,6 +409,7 @@ async def _mint_internal_identity(
         "adopted": adopted,
         "scopes": scopes,
         "token": token,
+        "storage_guidance": TOKEN_STORAGE_GUIDANCE,
     }
 
 
@@ -478,7 +511,12 @@ async def get_pubkey(request: Request):
 
 @router.get("/api/agents/registry/revoked")
 async def list_revoked_entries(request: Request):
-    """Return the global revocation feed: [{canonical_id, revoked_at}, ...].
+    """Return the global revocation feed for agent identities: [{canonical_id, revoked_at}, ...].
+
+    This feed is scoped to agent identities only, as decided on 2026-08-13.
+    Human credential withdrawal is handled through the session/auth layer and
+    does not appear here. Do not extend this feed to include human principals
+    or subject_type fields without a new design decision.
 
     Accessible to admin sessions/local-token OR a registry JWT whose
     canonical_id holds an active ``registry_feeds_read`` grant.  The grant is
@@ -528,8 +566,12 @@ async def list_active_grants(request: Request, canonical_id: Optional[str] = Non
     grant -- the token itself carries no exp claim.
 
     @taOSmd polls this on interval to keep its local cache current.
-    Grants are active if expires_at IS NULL or expires_at > now (Phase 1: all
-    grants are non-expiring, so the full list is always returned).
+    Grants are active if expires_at IS NULL or expires_at > now. A consent
+    approval that carried ``duration_secs`` writes a real expires_at; a grant
+    with no duration stays unbounded. The unfiltered feed and every
+    feed-token caller get active grants only. An admin ``?canonical_id=``
+    query is not filtered: it returns that agent's rows from ``list_grants``,
+    expired ones included.
 
     Optional ``?canonical_id=`` filter narrows to a single agent.
     """
@@ -606,13 +648,17 @@ async def patch_registry_entry(
 
     Allowed fields: display_name, handle, role, capabilities.
     Status, framework, user_id, and timestamps are immutable.
-    Only the owning user or an admin may update an entry.
+    Only the owning user or an admin may update an entry; anyone else gets
+    the same 404 as an unknown id (existence-hiding, as on GET).
     """
     store = _get_store(request)
     record = await store.get(canonical_id)
     if record is None:
+        logger.info("registry patch 404-unknown for %s", canonical_id)
         return JSONResponse({"error": "not found"}, status_code=404)
-    require_owner_or_admin(user, record["user_id"])
+    if not user.is_admin and user.user_id != record["user_id"]:
+        logger.info("registry patch 404-not-owner for %s by %s", canonical_id, user.user_id)
+        return JSONResponse({"error": "not found"}, status_code=404)
     old_name = record.get("display_name") or ""
     try:
         updated = await store.update(
@@ -622,10 +668,10 @@ async def patch_registry_entry(
             role=body.role,
             capabilities=body.capabilities,
         )
-    except aiosqlite.IntegrityError:
-        # Renaming this entry's handle onto one another active agent owns.
+    except ValueError as exc:
+        # handle collision raised by the store's transition guard.
         return JSONResponse(
-            {"error": "handle is already owned by another active agent"},
+            {"error": str(exc)},
             status_code=409,
         )
     if updated is None:
@@ -658,15 +704,28 @@ async def revoke_registry_entry(
 ):
     """Revoke a registry entry (sets revoked_at, does not delete).
 
-    Only the owning user or an admin may revoke an entry.
+    Only the owning user or an admin may revoke an entry; anyone else gets
+    the same 404 as an unknown id (existence-hiding, as on GET).
     """
     store = _get_store(request)
     record = await store.get(canonical_id)
     if record is None:
+        logger.info("registry revoke 404-unknown for %s", canonical_id)
         return JSONResponse({"error": "not found or already revoked"}, status_code=404)
-    require_owner_or_admin(user, record["user_id"])
+    if not user.is_admin and user.user_id != record["user_id"]:
+        logger.info("registry revoke 404-not-owner for %s by %s", canonical_id, user.user_id)
+        return JSONResponse({"error": "not found or already revoked"}, status_code=404)
+    
+    # If already revoked, return the record as a 200 to make DELETE idempotent
+    if record.get("status") == "revoked":
+        return {"status": "revoked", "canonical_id": canonical_id, "revoked_at": record.get("revoked_at")}
+    
     before_status = record.get("status") or "active"
-    revoked = await store.revoke(canonical_id)
+    try:
+        revoked = await store.revoke(canonical_id)
+    except (ValueError, KeyError) as exc:
+        return JSONResponse({"error": str(exc)}, status_code=409)
+    
     await _audit_governance(
         request,
         action="revoke",
@@ -755,6 +814,141 @@ async def reactivate_agent(
     return await _transition(request, canonical_id, "reactivate", "active", user)
 
 
+@router.post("/api/agents/registry/{canonical_id}/rotate-tokens")
+async def rotate_tokens(
+    request: Request,
+    canonical_id: str,
+):
+    """Rotate the credential ON this identity and return the replacement token.
+
+    The canonical_id is UNCHANGED: this is the recovery/rotation path that does
+    NOT mint a new identity.  It supersedes every existing token for the
+    identity by moving ``token_min_iat`` forward, then mints one fresh token
+    whose ``iat`` sits exactly AT the new cutoff, so the caller gets a working
+    credential back in the same call.  Minting a new identity instead would
+    orphan this one: its grants stay behind while the replacement starts empty
+    (taOS #2158).
+
+    Authorized for an owner/admin session, OR the agent's OWN live registry
+    bearer token (``sub`` == ``canonical_id``) so an agent that suspects its
+    token is stale or leaked can rotate itself without a human in the loop.
+    Every other caller gets the same 404 as an unknown id (existence-hiding,
+    matching the registry PATCH/DELETE routes).
+
+    The cutoff moves STRICTLY past the identity's current one, and past this
+    second: ``target = max(now + 1, current_cutoff + 1)``, applied by the store
+    as a single ``MAX(token_min_iat + 1, ?)`` statement so two rotations cannot
+    land on the same cutoff.  ``now + 1`` alone is not enough: a token minted in
+    the same second would carry ``iat == cutoff`` and survive its own
+    supersession, and two rotations in one second would let the first
+    replacement outlive the second.  The replacement token is minted AT the
+    resulting cutoff so it always clears it.
+
+    The replacement is minted BEFORE the cutoff moves.  Minting is the step that
+    can fail, and a moved cutoff with no replacement would leave the identity
+    holding no usable credential at all -- the opposite of what recovery is for.
+    If minting raises, nothing was written and the existing token stays live.
+
+    Leaves a forensic audit-log entry, actor = the session user, a literal
+    ``agent:<canonical_id>`` marker for a self-rotation.
+
+    The replacement carries ``sub``/``user_id``/``framework`` but NOT the
+    original token's ``project_id`` claim.  That claim has been advisory since
+    #1862 -- project-scoped authority comes from the identity's active grants,
+    which rotation does not touch -- so dropping it is not a privilege change;
+    the claim is simply not re-issued.
+    """
+    store = _get_store(request)
+    record = await store.get(canonical_id)
+    if record is None:
+        logger.info("registry rotate-tokens 404-unknown for %s", canonical_id)
+        return JSONResponse({"error": "not found"}, status_code=404)
+
+    actor_user_id = await _authorize_rotate(request, canonical_id, record)
+    if actor_user_id is None:
+        logger.info("registry rotate-tokens 404-not-owner for %s", canonical_id)
+        return JSONResponse({"error": "not found"}, status_code=404)
+
+    private_pem, _public_pem = _get_keypair(request)
+
+    before_iat = record.get("token_min_iat") or 0
+    target = max(int(time.time()) + 1, before_iat + 1)
+
+    def _mint(at: int) -> str:
+        return mint_registry_token(
+            canonical_id,
+            private_pem,
+            user_id=record.get("user_id", ""),
+            framework=record.get("framework", ""),
+            iat=at,
+        )
+
+    # Nothing is written yet: a signing failure here leaves the identity exactly
+    # as it was, with its current token still valid.
+    token = _mint(target)
+
+    updated = await store.bump_token_min_iat(canonical_id, target)
+    if updated is None:
+        return JSONResponse({"error": "not found"}, status_code=404)
+
+    cutoff = int(updated.get("token_min_iat") or 0)
+    if cutoff != target:
+        # A concurrent rotation advanced the cutoff past this call's target, so
+        # the token just minted would be superseded.  Re-mint at the cutoff that
+        # actually landed (the store allocates it atomically, so it is final).
+        token = _mint(cutoff)
+
+    await _audit_governance(
+        request,
+        action="rotate-tokens",
+        canonical_id=canonical_id,
+        actor_user_id=actor_user_id,
+        before_status=record.get("status") or "active",
+        after_status=updated.get("status") or "active",
+        before_token_min_iat=before_iat,
+        after_token_min_iat=cutoff,
+    )
+    return {
+        **updated,
+        "token": token,
+        "storage_guidance": TOKEN_STORAGE_GUIDANCE,
+    }
+
+
+async def _authorize_rotate(
+    request: Request, canonical_id: str, record: dict
+) -> Optional[str]:
+    """Return the audit actor for a rotation, or ``None`` when unauthorized.
+
+    Allowed: an owner/admin session (or admin local token), OR the agent's own
+    live registry bearer token whose ``sub`` matches *canonical_id*.  A
+    self-rotation reports an actor of ``agent:<canonical_id>`` -- there is no
+    user behind it, and inventing the owner's user_id would blame the human for
+    a change the agent made.
+    """
+    is_admin = bool(getattr(request.state, "is_admin", False))
+    uid = getattr(request.state, "user_id", None)
+    if is_admin or (uid and uid == record.get("user_id")):
+        return uid or "admin"
+
+    from tinyagentos.agent_token_auth import check_agent_identity
+
+    try:
+        agent_cid = await check_agent_identity(request)
+    except HTTPException as exc:
+        # A malformed / inactive / superseded token learns no more than an
+        # anonymous caller: surfacing the 401/403 here would pair with the
+        # 404-on-unknown above to form an existence oracle.
+        logger.info(
+            "registry rotate-tokens 404-bad-credentials for %s (%s)",
+            canonical_id, exc.detail,
+        )
+        return None
+    if agent_cid is not None and agent_cid == canonical_id:
+        return f"agent:{canonical_id}"
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Org model (#161): reporting lines, roles/titles, org tree
 #
@@ -796,8 +990,11 @@ async def update_org_fields(
     store = _get_store(request)
     record = await store.get(canonical_id)
     if record is None:
+        logger.info("registry org update 404-unknown for %s", canonical_id)
         return JSONResponse({"error": "not found"}, status_code=404)
-    require_owner_or_admin(user, record["user_id"])
+    if not user.is_admin and user.user_id != record["user_id"]:
+        logger.info("registry org update 404-not-owner for %s by %s", canonical_id, user.user_id)
+        return JSONResponse({"error": "not found"}, status_code=404)
 
     if body.role is None and body.title is None and body.reports_to is None:
         # An all-None body is a no-op write; reject it rather than returning a

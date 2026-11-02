@@ -34,6 +34,10 @@ BACKEND_CAPABILITIES: dict[str, set[str]] = {
     "rkllama": {"llm-chat", "embedding", "reranking"},
     "ollama": {"llm-chat", "embedding"},
     "llama-cpp": {"llm-chat", "embedding"},
+    # llama-swap: OpenAI-compatible proxy that starts and swaps llama.cpp (or
+    # other) upstreams per requested model. It routes /v1/rerank (and /rerank,
+    # /reranking) by model like chat and embeddings.
+    "llama-swap": {"llm-chat", "embedding", "reranking"},
     "vllm": {"llm-chat"},
     "exo": {"llm-chat"},
     "mlx": {"llm-chat"},
@@ -47,6 +51,11 @@ BACKEND_CAPABILITIES: dict[str, set[str]] = {
     "iopaint": {"image-editing", "background-removal", "upscale"},
     # FLUX.1-Fill served via an inpaint/outpaint endpoint — the quality tier.
     "flux-fill": {"image-editing"},
+    # Speech: ASR via faster-whisper / whisper.cpp OpenAI-compatible servers;
+    # TTS via the Kokoro TTS server or MOSS TTS served through SGLang/vLLM-Omni.
+    "whisper": {"asr"},
+    "kokoro": {"tts"},
+    "moss": {"tts"},
 }
 
 
@@ -177,13 +186,44 @@ class BackendCatalog:
         return repr(parts)
 
     async def start(self) -> None:
-        """Kick off the background polling task and wait for the first pass."""
+        """Kick off the background polling task and return immediately.
+
+        The first probe pass runs concurrently in the background so the
+        main app starts serving requests without waiting for backends to
+        be reachable. Misconfigured or unreachable backends would
+        otherwise block the lifespan for the full connect timeout per
+        backend (tsk-xjwolt). Subscribers and ``backends()`` consumers
+        are guaranteed to see a consistent post-probe view once
+        ``wait_initial_probe()`` resolves.
+        """
         if self._task is not None:
             return
+        # The barrier is NOT replaced here: stop() already installs a fresh
+        # one, and swapping it in start() would strand a caller that began
+        # awaiting wait_initial_probe() before start() was reached.
         self._task = asyncio.create_task(self._poll_loop(), name="backend-catalog-poll")
-        await asyncio.wait_for(self._initial_probe_done.wait(), timeout=15.0)
+
+    async def wait_initial_probe(self, timeout: float | None = None) -> None:
+        """Await the first probe pass, used by tests and by callers that
+        genuinely need the post-probe view before proceeding. The main
+        server boot path should NOT call this — it is the fix for
+        tsk-xjwolt that probing backends sequentially with long timeouts
+        delayed :6969 from accepting traffic.
+
+        ``stop()`` releases waiters, so this also returns when the catalog
+        is shut down mid-probe; check :meth:`backends` rather than assuming
+        a probe completed.
+        """
+        event = self._initial_probe_done
+        if event.is_set():
+            return
+        if timeout is None:
+            await event.wait()
+        else:
+            await asyncio.wait_for(event.wait(), timeout=timeout)
 
     async def stop(self) -> None:
+        """Cancel the polling task and reset the first-probe barrier."""
         if self._task is not None:
             self._task.cancel()
             try:
@@ -191,6 +231,13 @@ class BackendCatalog:
             except asyncio.CancelledError:
                 pass
             self._task = None
+        # Release anyone parked in wait_initial_probe(): they captured THIS
+        # Event object, and the poll task that would have set it is now
+        # cancelled. Replacing the event without setting it first strands
+        # those waiters until their own timeout (forever, if untimed).
+        self._initial_probe_done.set()
+        # Fresh barrier so a later start() waits on a real probe again.
+        self._initial_probe_done = asyncio.Event()
 
     async def refresh(self) -> None:
         """Force a single probe pass immediately, used after a backend change."""

@@ -22,9 +22,10 @@ import { ElementCreateDialog } from "./elements/ElementCreateDialog";
 import styles from "./ProjectsApp.module.css";
 
 import { CommunityView } from "./CommunityView";
+import { ProjectLists } from "./ProjectLists";
 
-export type Tab = "workspace" | "board" | "canvas" | "tasks" | "files" | "messages" | "members" | "activity" | "decisions" | "routines" | "community";
-const TABS: Tab[] = ["workspace", "board", "canvas", "tasks", "files", "messages", "members", "activity", "decisions", "routines", "community"];
+export type Tab = "workspace" | "board" | "canvas" | "tasks" | "files" | "messages" | "members" | "activity" | "decisions" | "routines" | "community" | "lists";
+const TABS: Tab[] = ["workspace", "board", "canvas", "tasks", "files", "messages", "members", "activity", "decisions", "routines", "community", "lists"];
 
 function isTab(value: string | undefined): value is Tab {
   return value != null && (TABS as string[]).includes(value);
@@ -105,7 +106,7 @@ export function ProjectWorkspace({ project, onChanged, initialTab, filePath }: {
   // Mobile pill order: surface Messages right after Workspace so it is reachable
   // without scrolling (on mobile Messages is its own full page, not a squeezed
   // pane inside Workspace).
-  const mobileTabOrder: Tab[] = ["workspace", "messages", "board", "tasks", "canvas", "files", "members", "activity", "decisions", "routines", "community"];
+  const mobileTabOrder: Tab[] = ["workspace", "messages", "board", "tasks", "canvas", "files", "members", "activity", "decisions", "routines", "community", "lists"];
   const tabPills = mobileTabOrder.map((t) => ({
     id: t,
     label: t.charAt(0).toUpperCase() + t.slice(1),
@@ -203,6 +204,11 @@ export function ProjectWorkspace({ project, onChanged, initialTab, filePath }: {
     () => derivePresence({ ownerInitial: "Y", members, agentName }),
     [members, agentName],
   );
+
+  const isLead = useMemo(() => {
+    if (!currentUserId) return false;
+    return members.some(m => m.member_id === currentUserId && (m.is_lead === 1 || m.member_id === project.lead_member_id));
+  }, [members, currentUserId, project.lead_member_id]);
 
   const openTask = (id: string) => { setTaskParam(id); setOpenTaskId(id); };
   const closeTask = () => { setTaskParam(null); setOpenTaskId(null); };
@@ -340,6 +346,7 @@ export function ProjectWorkspace({ project, onChanged, initialTab, filePath }: {
               <ProjectBoard
                 projectId={project.id}
                 currentUserId={currentUserId}
+                isLead={isLead}
                 elementId={scopedElementId}
                 onOpenTask={openTask}
               />
@@ -390,6 +397,7 @@ export function ProjectWorkspace({ project, onChanged, initialTab, filePath }: {
         {tab === "decisions" && <ProjectDecisions projectId={project.id} />}
         {tab === "routines" && <ProjectRoutines project={project} />}
         {tab === "community" && <CommunityView projectId={project.id} />}
+        {tab === "lists" && <ProjectLists project={project} />}
       </div>
 
       {isMobile && (tab === "tasks" || tab === "board") && (

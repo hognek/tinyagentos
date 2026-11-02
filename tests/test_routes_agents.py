@@ -1,6 +1,7 @@
 import pytest
 from tinyagentos.config import load_config
 from tinyagentos.cluster.worker_protocol import WorkerInfo
+from tinyagentos.cluster.placement import rank
 from tinyagentos.containers.backend import ContainerInfo
 
 
@@ -352,7 +353,7 @@ class TestDeployRouting:
         assert data["pinned_worker"] == "arch-box"
         assert data["available_on"] == ["fedora"]
 
-    async def test_canonical_host_is_alphabetical_when_multiple_workers_have_model(
+    async def test_canonical_host_is_rendezvous_winner_when_multiple_workers_have_model(
         self, client, app
     ):
         _seed_worker(app, "zeta", ["shared-model"])
@@ -365,10 +366,17 @@ class TestDeployRouting:
         })
         assert resp.status_code == 202
         data = resp.json()
-        assert data["worker"] == "alpha"
+        assert data["worker"] == rank("shared-model", ["alpha", "mid", "zeta"])[0]
+        assert data["worker"] == "mid"
         assert data["available_on"] == ["alpha", "mid", "zeta"]
 
-    async def test_controller_local_model_falls_through(self, client, app):
+    async def test_controller_local_model_falls_through(self, client, app, tmp_data_dir, monkeypatch):
+        # Root the process-global taosmd agent registry at this test's tmp_path
+        # instead of the repository's data/ directory so registration cannot
+        # trip the xdist data-dir mutation guard on data/agents.json.
+        import taosmd.agents
+        monkeypatch.setattr(taosmd.agents, "_default_registry", taosmd.agents.AgentRegistry(tmp_data_dir))
+
         class _FakeCatalog:
             def all_models(self, capability=None):
                 return [{"name": "local-model", "id": "local-model"}]
@@ -627,7 +635,6 @@ class TestDeployRegistryRegistration:
 
     async def test_deploy_creates_registry_row(self, client, app, monkeypatch):
         import re
-        import taosmd.agents as tm_agents
         from unittest.mock import AsyncMock, MagicMock
 
         app.state.archive = MagicMock(
@@ -650,7 +657,7 @@ class TestDeployRegistryRegistration:
 
         def fake_register_agent(name, **kwargs):
             pass
-        monkeypatch.setattr(tm_agents, "register_agent", fake_register_agent)
+        monkeypatch.setattr(app.state.taosmd_agent_registry, "register_agent", fake_register_agent)
 
         async def fake_deploy(req):
             return {"success": True, "name": req.name, "ip": "10.0.0.42",
@@ -682,7 +689,6 @@ class TestDeployRegistryRegistration:
         """Display names are not unique; a second deploy with the same name is
         a NEW agent (suffixed slug) and must get its own canonical_id, never
         inherit the first agent's identity."""
-        import taosmd.agents as tm_agents
         from unittest.mock import AsyncMock, MagicMock
 
         app.state.archive = MagicMock(
@@ -707,7 +713,7 @@ class TestDeployRegistryRegistration:
 
         def fake_register_agent(name, **kwargs):
             pass
-        monkeypatch.setattr(tm_agents, "register_agent", fake_register_agent)
+        monkeypatch.setattr(app.state.taosmd_agent_registry, "register_agent", fake_register_agent)
 
         async def fake_deploy(req):
             return {"success": True, "name": req.name, "ip": "10.0.0.42",
@@ -748,7 +754,6 @@ class TestDeployRegistryRegistration:
     async def test_reserved_name_registration_rejected_as_400(self, client, app, monkeypatch):
         """A name the registry rejects (reserved prefix) is a user error: the
         deploy must return 400 with the registry's message and add no agent."""
-        import taosmd.agents as tm_agents
         from unittest.mock import AsyncMock, MagicMock
 
         app.state.archive = MagicMock(
@@ -768,7 +773,7 @@ class TestDeployRegistryRegistration:
 
         def fake_register_agent(name, **kwargs):
             pass
-        monkeypatch.setattr(tm_agents, "register_agent", fake_register_agent)
+        monkeypatch.setattr(app.state.taosmd_agent_registry, "register_agent", fake_register_agent)
 
         async def fake_deploy(req):
             return {"success": True, "name": req.name, "ip": "10.0.0.42",
@@ -794,7 +799,49 @@ class TestDeployRegistryRegistration:
 
 
 @pytest.mark.asyncio
+class TestDeployUsesAppScopedTaosmdRegistry:
+    """Deploy must register agents via app.state.taosmd_agent_registry, not the
+    module-level global, so multiple create_app() calls do not share state."""
+
+    async def test_deploy_registers_into_app_scoped_registry(self, client, app, tmp_path, monkeypatch):
+        from unittest.mock import AsyncMock, MagicMock
+
+        app.state.archive = MagicMock(
+            record=AsyncMock(), query=AsyncMock(return_value=[{}])
+        )
+
+        assert hasattr(app.state, "taosmd_agent_registry"), (
+            "create_app must set app.state.taosmd_agent_registry"
+        )
+        pre_count = len(app.state.taosmd_agent_registry.list_agents())
+
+        async def fake_deploy(req):
+            return {"success": True, "name": req.name, "ip": "10.0.0.42",
+                    "llm_key": "sk-test", "steps": ["deployment_complete"],
+                    "container": f"taos-agent-{req.name}"}
+        monkeypatch.setattr("tinyagentos.deployer.deploy_agent", fake_deploy)
+
+        class _FakeCatalog:
+            def all_models(self, capability=None):
+                return [{"name": "test-model", "id": "test-model"}]
+        app.state.backend_catalog = _FakeCatalog()
+        app.state.cluster_manager._workers.clear()
+
+        resp = await client.post("/api/agents/deploy", json={
+            "name": "ScopedReg",
+            "framework": "openclaw",
+            "model": "test-model",
+        })
+        assert resp.status_code == 200
+
+        post_count = len(app.state.taosmd_agent_registry.list_agents())
+        assert post_count == pre_count + 1
+        names = {r["name"] for r in app.state.taosmd_agent_registry.list_agents()}
+        assert "scopedreg" in names
+
+@pytest.mark.asyncio
 class TestAgentArchiveLifecycle:
+
     async def test_archive_creates_snapshot_not_rename(self, client, monkeypatch):
         """DELETE /api/agents/{name} archives via snapshot; no rename called."""
         stopped = []
@@ -1016,7 +1063,8 @@ class TestAgentArchiveLifecycle:
         assert op_names.index("rename") < op_names.index("start")
 
     async def test_restore_env_rewrite_uses_incus_config_set(self, client, app, monkeypatch):
-        """When proxy is running, set_env is called with OPENAI_API_KEY=<new>."""
+        """Restore mints a new key (no process needed) and set_env pushes it as
+        OPENAI_API_KEY (and LITELLM_API_KEY)."""
         env_calls = []
 
         async def fake_deploy(req):
@@ -1051,7 +1099,6 @@ class TestAgentArchiveLifecycle:
         monkeypatch.setattr("tinyagentos.containers.exec_in_container", fake_exec)
 
         proxy = app.state.llm_proxy
-        monkeypatch.setattr(proxy, "is_running", lambda: True)
         async def fake_create_agent_key(name, models=None, budget_duration=None):
             return "sk-incus-key"
         monkeypatch.setattr(proxy, "create_agent_key", fake_create_agent_key)
@@ -1517,6 +1564,60 @@ class TestOrphanAgentDeletion:
         archived_after = (await client.get("/api/agents/archived")).json()
         assert archived_after == []
 
+    async def test_orphan_hard_delete_unbinds_local_token(
+        self, client, app, tmp_data_dir, monkeypatch
+    ):
+        """Hard-delete orphan (no chat, no trace) revokes the agent's local token."""
+        async def _no_container(name):
+            return False
+        monkeypatch.setattr("tinyagentos.containers.container_exists", _no_container)
+
+        async def fake_stop(name, force=False):
+            raise AssertionError("stop_container should not be called for orphans")
+
+        async def fake_snapshot_create(name, snapshot_name):
+            raise AssertionError("snapshot_create should not be called for orphans")
+
+        monkeypatch.setattr("tinyagentos.containers.stop_container", fake_stop)
+        monkeypatch.setattr("tinyagentos.containers.snapshot_create", fake_snapshot_create)
+
+        token = app.state.auth.mint_agent_local_token("test-agent")
+        assert app.state.auth.validate_local_token(token) is True
+        assert app.state.auth.get_local_token_agent(token) == "test-agent"
+
+        resp = await client.delete("/api/agents/test-agent")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "deleted"
+
+        assert app.state.auth.validate_local_token(token) is False
+        assert app.state.auth.get_local_token_agent(token) is None
+
+    async def test_orphan_tombstone_unbinds_local_token(
+        self, client, app, tmp_data_dir, monkeypatch
+    ):
+        """Tombstone orphan (trace dir exists) revokes the agent's local token."""
+        async def _no_container(name):
+            return False
+        monkeypatch.setattr("tinyagentos.containers.container_exists", _no_container)
+
+        trace_dir = tmp_data_dir / "trace" / "test-agent"
+        trace_dir.mkdir(parents=True, exist_ok=True)
+        (trace_dir / "2026-04-17T13.db").write_text("")
+
+        token = app.state.auth.mint_agent_local_token("test-agent")
+        assert app.state.auth.validate_local_token(token) is True
+        assert app.state.auth.get_local_token_agent(token) == "test-agent"
+
+        resp = await client.delete("/api/agents/test-agent")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "archived"
+        assert data["snapshot_name"] is None
+
+        assert app.state.auth.validate_local_token(token) is False
+        assert app.state.auth.get_local_token_agent(token) is None
+
 
 @pytest.mark.asyncio
 class TestDeleteResolvesOrphanedContainer:
@@ -1817,3 +1918,620 @@ class TestAgentBudgetRoutes:
     async def test_reset_not_found_agent(self, client):
         resp = await client.post("/api/agents/no-such-agent/budget/reset")
         assert resp.status_code == 404
+
+    async def test_budget_store_constructed_once_per_app(self, client):
+        """Two requests must not trigger the DDL constructor twice."""
+        from unittest.mock import patch
+
+        from tinyagentos.agent_budget_store import AgentBudgetStore
+
+        init_calls = []
+        orig_init = AgentBudgetStore._init
+
+        def spy_init(self):
+            init_calls.append(self.path)
+            return orig_init(self)
+
+        with patch.object(AgentBudgetStore, "_init", spy_init):
+            resp1 = await client.get("/api/agents/test-agent/budget")
+            assert resp1.status_code == 200
+            resp2 = await client.get("/api/agents/test-agent/budget")
+            assert resp2.status_code == 200
+
+        assert len(init_calls) == 1, (
+            f"AgentBudgetStore._init called {len(init_calls)} times, expected 1"
+        )
+
+    async def test_budget_route_does_not_block_event_loop(self, client):
+        """Two concurrent budget reads should not serialize if the store is offloaded."""
+        import asyncio
+        import time
+        from unittest.mock import patch
+
+        from tinyagentos.agent_budget_store import AgentBudgetStore
+
+        call_times = []
+
+        def slow_get(self, agent):
+            call_times.append(time.monotonic())
+            time.sleep(0.07)
+            return None
+
+        with patch.object(AgentBudgetStore, "get", slow_get):
+            task1 = asyncio.create_task(client.get("/api/agents/test-agent/budget"))
+            task2 = asyncio.create_task(client.get("/api/agents/test-agent/budget"))
+            r1 = await task1
+            r2 = await task2
+
+        assert r1.status_code == 200
+        assert r2.status_code == 200
+        assert len(call_times) == 2, f"expected 2 get() calls, got {len(call_times)}"
+        assert call_times[1] - call_times[0] < 0.03, (
+            f"sync get() calls serialized: gap={call_times[1] - call_times[0]:.3f}s"
+        )
+
+
+@pytest.mark.asyncio
+class TestAgentWakeBudget:
+    async def test_get_wake_budget_defaults(self, client):
+        resp = await client.get("/api/agents/test-agent/wake-budget")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["agent"] == "test-agent"
+        assert data["budget"] == 2
+        assert data["consumed"] == 0
+        assert data["remaining"] == 2
+        assert data["date"] == _today_str()
+        assert data["next_wake_epoch"] is not None
+
+    async def test_wake_budget_reports_enforced_project_counter(
+        self, client, app, tmp_data_dir, monkeypatch
+    ):
+        from tinyagentos.agent_heartbeat import _heartbeat_tick
+
+        agent = next(a for a in app.state.config.agents if a["name"] == "test-agent")
+        agent["id"] = "test-agent"
+        agent["status"] = "running"
+        app.state.config.server["agent_heartbeat_enabled"] = True
+
+        project = await app.state.project_store.create_project(
+            name="proj-1", slug="proj-1", created_by="test",
+        )
+        await app.state.project_task_store.create_task(
+            project_id=project["id"],
+            title="ready task",
+            created_by="test",
+            assignee_id="test-agent",
+        )
+
+        async def fake_wake(*args, **kwargs):
+            return True
+
+        monkeypatch.setattr(
+            "tinyagentos.agent_heartbeat._wake_agent_with_task", fake_wake
+        )
+
+        await _heartbeat_tick(app.state)
+
+        resp = await client.get("/api/agents/test-agent/wake-budget")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["consumed"] == 1
+
+    async def test_wake_budget_reports_per_agent_override(
+        self, client, app, tmp_data_dir, monkeypatch
+    ):
+        from tinyagentos.agent_heartbeat import _heartbeat_tick
+
+        agent = next(a for a in app.state.config.agents if a["name"] == "test-agent")
+        agent["id"] = "test-agent"
+        agent["status"] = "running"
+        app.state.config.server["agent_heartbeat_enabled"] = True
+
+        project = await app.state.project_store.create_project(
+            name="proj-pp", slug="proj-pp", created_by="test",
+        )
+        app.state.config.wake_budget = {
+            "global_default": 2,
+            "per_agent": {"test-agent": 1},
+            "per_project": {},
+        }
+        await app.state.project_task_store.create_task(
+            project_id=project["id"],
+            title="ready task",
+            created_by="test",
+            assignee_id="test-agent",
+        )
+
+        async def fake_wake(*args, **kwargs):
+            return True
+
+        monkeypatch.setattr(
+            "tinyagentos.agent_heartbeat._wake_agent_with_task", fake_wake
+        )
+
+        await _heartbeat_tick(app.state)
+
+        resp = await client.get("/api/agents/test-agent/wake-budget")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["budget"] == 1
+        assert data["consumed"] == 1
+        assert data["remaining"] == 0
+
+        resp2 = await client.get("/api/observatory/wake-budget")
+        assert resp2.status_code == 200
+        data2 = resp2.json()
+        agent_row = next(a for a in data2["agents"] if a["agent_id"] == "test-agent")
+        assert agent_row["budget"] == 1
+        assert agent_row["consumed"] == 1
+        assert agent_row["remaining"] == 0
+
+    async def test_wake_budget_reports_consumed_after_tasks_closed(
+        self, client, app, tmp_data_dir, monkeypatch
+    ):
+        from tinyagentos.agent_heartbeat import _heartbeat_tick
+
+        agent = next(a for a in app.state.config.agents if a["name"] == "test-agent")
+        agent["id"] = "test-agent"
+        agent["status"] = "running"
+        app.state.config.server["agent_heartbeat_enabled"] = True
+
+        project_a = await app.state.project_store.create_project(
+            name="proj-a", slug="proj-a", created_by="test",
+        )
+        project_b = await app.state.project_store.create_project(
+            name="proj-b", slug="proj-b", created_by="test",
+        )
+        task_a = await app.state.project_task_store.create_task(
+            project_id=project_a["id"],
+            title="task a",
+            created_by="test",
+            assignee_id="test-agent",
+        )
+        task_b = await app.state.project_task_store.create_task(
+            project_id=project_b["id"],
+            title="task b",
+            created_by="test",
+            assignee_id="test-agent",
+        )
+
+        async def fake_wake(*args, **kwargs):
+            return True
+
+        monkeypatch.setattr(
+            "tinyagentos.agent_heartbeat._wake_agent_with_task", fake_wake
+        )
+
+        await _heartbeat_tick(app.state)
+
+        # Close task_a so the next tick picks up task_b (proj-b)
+        await app.state.project_task_store.update_task(task_a["id"], status="closed")
+
+        await _heartbeat_tick(app.state)
+
+        # Close both tasks so held_task and list_ready_tasks both return empty
+        await app.state.project_task_store.update_task(task_b["id"], status="closed")
+
+        resp = await client.get("/api/agents/test-agent/wake-budget")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["consumed"] == 2
+        assert data["remaining"] == 0
+
+        resp2 = await client.get("/api/observatory/wake-budget")
+        assert resp2.status_code == 200
+        data2 = resp2.json()
+        agent_row = next(a for a in data2["agents"] if a["agent_id"] == "test-agent")
+        assert agent_row["consumed"] == 2
+        assert agent_row["remaining"] == 0
+
+    async def test_wake_budget_enforces_per_agent_total_across_projects(
+        self, client, app, tmp_data_dir, monkeypatch
+    ):
+        from tinyagentos.agent_heartbeat import _heartbeat_tick
+
+        agent = next(a for a in app.state.config.agents if a["name"] == "test-agent")
+        agent["id"] = "test-agent"
+        agent["status"] = "running"
+        app.state.config.server["agent_heartbeat_enabled"] = True
+        app.state.config.wake_budget = {
+            "global_default": 2,
+            "per_agent": {},
+            "per_project": {},
+        }
+
+        project_a = await app.state.project_store.create_project(
+            name="proj-a", slug="proj-a", created_by="test",
+        )
+        project_b = await app.state.project_store.create_project(
+            name="proj-b", slug="proj-b", created_by="test",
+        )
+        task_a = await app.state.project_task_store.create_task(
+            project_id=project_a["id"],
+            title="task a",
+            created_by="test",
+            assignee_id="test-agent",
+        )
+        task_b = await app.state.project_task_store.create_task(
+            project_id=project_b["id"],
+            title="task b",
+            created_by="test",
+            assignee_id="test-agent",
+        )
+
+        async def fake_wake(*args, **kwargs):
+            return True
+
+        from tinyagentos.wake_budget import can_wake as real_can_wake
+        can_wake_calls = []
+        def fake_can_wake(*args, **kwargs):
+            can_wake_calls.append((args, kwargs))
+            return real_can_wake(*args, **kwargs)
+
+        monkeypatch.setattr(
+            "tinyagentos.agent_heartbeat._wake_agent_with_task", fake_wake
+        )
+        monkeypatch.setattr(
+            "tinyagentos.agent_heartbeat.can_wake", fake_can_wake
+        )
+
+        await _heartbeat_tick(app.state)
+
+        # Close task_a so the next tick picks up task_b instead of re-debouncing
+        await app.state.project_task_store.update_task(task_a["id"], status="closed")
+
+        await _heartbeat_tick(app.state)
+
+        # Close task_b and create a new ready task so the third tick reaches
+        # can_wake (same task would re-debounce and skip budget enforcement).
+        await app.state.project_task_store.update_task(task_b["id"], status="closed")
+        task_c = await app.state.project_task_store.create_task(
+            project_id=project_b["id"],
+            title="task c",
+            created_by="test",
+            assignee_id="test-agent",
+        )
+
+        # Third tick: budget exhausted, no more wakes regardless of ready tasks
+        await _heartbeat_tick(app.state)
+
+        resp = await client.get("/api/agents/test-agent/wake-budget")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["consumed"] == 2
+        assert data["remaining"] == 0
+        assert len(can_wake_calls) == 3
+
+    async def test_get_wake_budget_not_found(self, client):
+        resp = await client.get("/api/agents/no-such-agent/wake-budget")
+        assert resp.status_code == 404
+
+
+def _today_str() -> str:
+    import datetime
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+
+
+@pytest.mark.asyncio
+class TestDeployDeferredModelsSelfHeal:
+    """Deploying an agent with taOSmd memory when models were deferred must
+    either start the deferred pull or return 409 if it cannot."""
+
+    async def test_deploy_deferred_models_no_registry_returns_409(
+        self, client, app, tmp_data_dir
+    ):
+        """When taosmd_default.json has models_skipped=true and there is no
+        model registry, deploying with memory_plugin='taosmd' must return 409
+        so the caller knows the deferred downloads cannot start."""
+        import json
+
+        default_data = {
+            "device_id": "local",
+            "tier_id": "standard",
+            "tier_name": "Standard",
+            "models_skipped": True,
+        }
+        (tmp_data_dir / "taosmd_default.json").write_text(json.dumps(default_data))
+
+        # Remove registry so the deferred pull cannot start.
+        app.state.registry = None
+        app.state.cluster_manager._workers.clear()
+
+        class _FakeCatalog:
+            def all_models(self, capability=None):
+                return [{"name": "test-model", "id": "test-model"}]
+
+        app.state.backend_catalog = _FakeCatalog()
+
+        resp = await client.post("/api/agents/deploy", json={
+            "name": "deferred-no-registry",
+            "framework": "none",
+            "model": "test-model",
+            "memory_plugin": "taosmd",
+            "memory_config": None,
+        })
+        assert resp.status_code == 409
+        data = resp.json()
+        assert "deferred" in data["error"].lower() or "download" in data["error"].lower()
+
+    async def test_concurrent_deploys_share_single_run_setup(
+        self, client, app, tmp_data_dir, monkeypatch
+    ):
+        """Two concurrent deploys against a deferred default must attach to
+        the same in-flight _run_setup task and never start a duplicate pull."""
+        import asyncio
+        import json
+        from unittest.mock import patch
+
+        default_data = {
+            "device_id": "local",
+            "tier_id": "standard",
+            "tier_name": "Standard",
+            "models_skipped": True,
+        }
+        (tmp_data_dir / "taosmd_default.json").write_text(json.dumps(default_data))
+
+        class _FakeCatalog:
+            def all_models(self, capability=None):
+                return [{"name": "test-model", "id": "test-model"}]
+
+        app.state.backend_catalog = _FakeCatalog()
+        app.state.cluster_manager._workers.clear()
+
+        setup_call_count = 0
+        setup_event = asyncio.Event()
+
+        async def fake_run_setup(tasks, task_id, *args, **kwargs):
+            nonlocal setup_call_count
+            setup_call_count += 1
+            tasks[task_id] = {
+                "state": "downloading",
+                "progress_pct": 0,
+                "message": "Downloading…",
+                "error": None,
+            }
+            await setup_event.wait()
+            tasks[task_id] = {
+                "state": "done",
+                "progress_pct": 100,
+                "message": "Memory layer ready.",
+                "error": None,
+            }
+
+        async def fake_deploy(req):
+            return {"success": True, "name": req.name, "ip": "10.0.0.42",
+                    "llm_key": "sk-test", "steps": ["deployment_complete"],
+                    "container": f"taos-agent-{req.name}"}
+
+        monkeypatch.setattr("tinyagentos.deployer.deploy_agent", fake_deploy)
+
+        with patch("tinyagentos.routes.taosmd._run_setup", fake_run_setup):
+            resp_a = await client.post("/api/agents/deploy", json={
+                "name": "concurrent-a",
+                "framework": "none",
+                "model": "test-model",
+                "memory_plugin": "taosmd",
+                "memory_config": None,
+            })
+            resp_b = await client.post("/api/agents/deploy", json={
+                "name": "concurrent-b",
+                "framework": "none",
+                "model": "test-model",
+                "memory_plugin": "taosmd",
+                "memory_config": None,
+            })
+            assert resp_a.status_code == 200
+            assert resp_b.status_code == 200
+            assert setup_call_count == 1
+
+            setup_event.set()
+            await asyncio.sleep(1.0)
+
+            for name in ("concurrent-a", "concurrent-b"):
+                detail = await client.get(f"/api/agents/{name}")
+                assert detail.status_code == 200
+                assert detail.json().get("status") == "running"
+
+    async def test_advancing_progress_avoids_timeout(
+        self, client, app, tmp_data_dir, monkeypatch
+    ):
+        """A pull that keeps advancing progress_pct past 300 simulated seconds
+        must not mark the deploy failed."""
+        import asyncio
+        import json
+        from unittest.mock import patch
+
+        default_data = {
+            "device_id": "local",
+            "tier_id": "standard",
+            "tier_name": "Standard",
+            "models_skipped": True,
+        }
+        (tmp_data_dir / "taosmd_default.json").write_text(json.dumps(default_data))
+
+        class _FakeCatalog:
+            def all_models(self, capability=None):
+                return [{"name": "test-model", "id": "test-model"}]
+
+        app.state.backend_catalog = _FakeCatalog()
+        app.state.cluster_manager._workers.clear()
+
+        async def fake_deploy(req):
+            return {"success": True, "name": req.name, "ip": "10.0.0.42",
+                    "llm_key": "sk-test", "steps": ["deployment_complete"],
+                    "container": f"taos-agent-{req.name}"}
+
+        monkeypatch.setattr("tinyagentos.deployer.deploy_agent", fake_deploy)
+
+        _original_sleep = asyncio.sleep
+        sleep_calls = []
+
+        async def fake_sleep(seconds):
+            sleep_calls.append(seconds)
+            await _original_sleep(0)
+
+        async def fake_run_setup(tasks, task_id, *args, **kwargs):
+            for i in range(600):
+                if i % 50 == 0:
+                    tasks[task_id] = {
+                        "state": "downloading",
+                        "progress_pct": min(99, i // 6),
+                        "message": f"Downloading model {min(99, i // 6)}%",
+                        "error": None,
+                    }
+                await _original_sleep(0)
+            tasks[task_id] = {
+                "state": "done",
+                "progress_pct": 100,
+                "message": "Memory layer ready.",
+                "error": None,
+            }
+
+        with patch("tinyagentos.routes.taosmd._run_setup", fake_run_setup):
+            with patch("asyncio.sleep", fake_sleep):
+                resp = await client.post("/api/agents/deploy", json={
+                    "name": "advancing-progress",
+                    "framework": "none",
+                    "model": "test-model",
+                    "memory_plugin": "taosmd",
+                    "memory_config": None,
+                })
+                assert resp.status_code == 200
+
+                for _ in range(300):
+                    await asyncio.sleep(1.0)
+
+                detail = await client.get("/api/agents/advancing-progress")
+                assert detail.status_code == 200
+                assert detail.json().get("status") != "failed"
+                deploy_status = app.state.deploy_tasks.get("advancing-progress", {}).get("status")
+                assert deploy_status != "failed"
+                setup_task = app.state.taosmd_setup_tasks.get(
+                    next(iter(app.state.taosmd_setup_tasks))
+                )
+                assert setup_task is not None
+                assert setup_task.get("progress_pct", 0) > 0
+                assert len(sleep_calls) > 300
+                assert len(sleep_calls) > 300
+
+    async def test_deploy_clears_models_skipped_on_success(
+        self, client, app, tmp_data_dir, monkeypatch
+    ):
+        """When _run_setup marks the deferred task done, the deploy must clear
+        models_skipped in taosmd_default.json so future deploys don't start
+        another pull."""
+        import asyncio
+        import json
+        from unittest.mock import patch
+
+        default_data = {
+            "device_id": "local",
+            "tier_id": "standard",
+            "tier_name": "Standard",
+            "models_skipped": True,
+        }
+        (tmp_data_dir / "taosmd_default.json").write_text(json.dumps(default_data))
+
+        class _FakeCatalog:
+            def all_models(self, capability=None):
+                return [{"name": "test-model", "id": "test-model"}]
+
+        app.state.backend_catalog = _FakeCatalog()
+        app.state.cluster_manager._workers.clear()
+
+        async def fake_run_setup(tasks, task_id, *args, **kwargs):
+            tasks[task_id] = {
+                "state": "done",
+                "progress_pct": 100,
+                "message": "Memory layer ready.",
+                "error": None,
+            }
+
+        async def fake_deploy(req):
+            return {"success": True, "name": req.name, "ip": "10.0.0.42",
+                    "llm_key": "sk-test", "steps": ["deployment_complete"],
+                    "container": f"taos-agent-{req.name}"}
+
+        monkeypatch.setattr("tinyagentos.deployer.deploy_agent", fake_deploy)
+
+        with patch("tinyagentos.routes.taosmd._run_setup", fake_run_setup):
+            resp = await client.post("/api/agents/deploy", json={
+                "name": "models-skipped-cleared",
+                "framework": "none",
+                "model": "test-model",
+                "memory_plugin": "taosmd",
+                "memory_config": None,
+            })
+            assert resp.status_code == 200
+            await asyncio.sleep(0.2)
+
+        default_after = json.loads((tmp_data_dir / "taosmd_default.json").read_text())
+        assert default_after.get("models_skipped") is False
+
+    async def test_stall_guard_preserves_selfheal_task_id(
+        self, client, app, tmp_data_dir, monkeypatch
+    ):
+        """When progress stalls for 600 simulated seconds and the deploy fails,
+        taosmd_selfheal_task_id must remain the original task id so a retry
+        re-attaches instead of starting a duplicate pull."""
+        import asyncio
+        import json
+        from unittest.mock import patch
+
+        default_data = {
+            "device_id": "local",
+            "tier_id": "standard",
+            "tier_name": "Standard",
+            "models_skipped": True,
+        }
+        (tmp_data_dir / "taosmd_default.json").write_text(json.dumps(default_data))
+
+        class _FakeCatalog:
+            def all_models(self, capability=None):
+                return [{"name": "test-model", "id": "test-model"}]
+
+        app.state.backend_catalog = _FakeCatalog()
+        app.state.cluster_manager._workers.clear()
+
+        captured_task_id = None
+
+        async def fake_run_setup(tasks, task_id, *args, **kwargs):
+            nonlocal captured_task_id
+            captured_task_id = task_id
+            tasks[task_id] = {
+                "state": "running",
+                "progress_pct": 0,
+                "message": "Starting…",
+                "error": None,
+            }
+
+        async def fake_deploy(req):
+            return {"success": True, "name": req.name, "ip": "10.0.0.42",
+                    "llm_key": "sk-test", "steps": ["deployment_complete"],
+                    "container": f"taos-agent-{req.name}"}
+
+        monkeypatch.setattr("tinyagentos.deployer.deploy_agent", fake_deploy)
+
+        _original_sleep = asyncio.sleep
+        sleep_calls = []
+
+        async def fake_sleep(seconds):
+            sleep_calls.append(seconds)
+            await _original_sleep(0)
+
+        with patch("tinyagentos.routes.taosmd._run_setup", fake_run_setup):
+            with patch("asyncio.sleep", fake_sleep):
+                resp = await client.post("/api/agents/deploy", json={
+                    "name": "stall-guard",
+                    "framework": "none",
+                    "model": "test-model",
+                    "memory_plugin": "taosmd",
+                    "memory_config": None,
+                })
+                assert resp.status_code == 200
+                for _ in range(600):
+                    await asyncio.sleep(1.0)
+
+        assert captured_task_id is not None
+        assert app.state.taosmd_selfheal_task_id == captured_task_id

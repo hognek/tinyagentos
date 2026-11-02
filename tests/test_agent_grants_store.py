@@ -44,6 +44,52 @@ class TestAgentGrantsStore:
         finally:
             await store.close()
 
+    async def test_add_grant_preserves_existing_expiry_when_new_is_none(self, tmp_path):
+        store = await self._store(tmp_path)
+        try:
+            await store.add_grant("agent-a", "scope-x", expires_at="2030-01-01T00:00:00+00:00")
+            await store.add_grant("agent-a", "scope-x")
+            grants = await store.list_grants("agent-a")
+            assert len(grants) == 1
+            assert grants[0]["expires_at"] == "2030-01-01T00:00:00+00:00"
+        finally:
+            await store.close()
+
+    async def test_add_grant_uses_earlier_of_two_bounded_expiries(self, tmp_path):
+        store = await self._store(tmp_path)
+        try:
+            await store.add_grant("agent-a", "scope-x", expires_at="2030-01-01T00:00:00+00:00")
+            await store.add_grant("agent-a", "scope-x", expires_at="2027-01-01T00:00:00+00:00")
+            grants = await store.list_grants("agent-a")
+            assert len(grants) == 1
+            assert grants[0]["expires_at"] == "2027-01-01T00:00:00+00:00"
+        finally:
+            await store.close()
+
+    async def test_add_grant_keeps_earlier_not_later_when_new_is_later(self, tmp_path):
+        store = await self._store(tmp_path)
+        try:
+            await store.add_grant("agent-a", "scope-x", expires_at="2027-01-01T00:00:00+00:00")
+            await store.add_grant("agent-a", "scope-x", expires_at="2030-01-01T00:00:00+00:00")
+            grants = await store.list_grants("agent-a")
+            assert len(grants) == 1
+            assert grants[0]["expires_at"] == "2027-01-01T00:00:00+00:00"
+        finally:
+            await store.close()
+
+    async def test_add_grant_renew_true_overrides_with_later_expiry(self, tmp_path):
+        store = await self._store(tmp_path)
+        try:
+            await store.add_grant("agent-a", "scope-x", expires_at="2027-01-01T00:00:00+00:00")
+            await store.add_grant(
+                "agent-a", "scope-x", expires_at="2030-01-01T00:00:00+00:00", renew=True
+            )
+            grants = await store.list_grants("agent-a")
+            assert len(grants) == 1
+            assert grants[0]["expires_at"] == "2030-01-01T00:00:00+00:00"
+        finally:
+            await store.close()
+
     async def test_add_grant_idempotent_replace(self, tmp_path):
         store = await self._store(tmp_path)
         try:
@@ -185,6 +231,131 @@ class TestAgentGrantsStore:
         finally:
             await store.close()
 
+    # ── revoke_grant (taOS #2148: grants could be granted but never revoked) ──
+    async def test_revoke_grant_removes_the_row(self, tmp_path):
+        store = await self._store(tmp_path)
+        try:
+            await store.add_grant("agent-r", "files_read", project_id="proj-A")
+            assert (
+                await store.revoke_grant("agent-r", "files_read", project_id="proj-A")
+                is True
+            )
+            assert await store.list_grants("agent-r") == []
+        finally:
+            await store.close()
+
+    async def test_revoke_grant_missing_key_is_false_and_keeps_the_others(self, tmp_path):
+        store = await self._store(tmp_path)
+        try:
+            await store.add_grant("agent-r", "files_read", project_id="proj-B")
+            assert (
+                await store.revoke_grant("agent-r", "files_read", project_id="proj-A")
+                is False
+            )
+            grants = await store.list_grants("agent-r")
+            assert len(grants) == 1
+            assert grants[0]["project_id"] == "proj-B"
+        finally:
+            await store.close()
+
+    async def test_revoke_grant_spares_other_scopes_and_projects(self, tmp_path):
+        """Acceptance: revoking ONE scope on ONE project must leave the
+        identity's other scopes and other projects intact."""
+        store = await self._store(tmp_path)
+        try:
+            await store.add_grant("agent-r", "files_read", project_id="proj-A")
+            await store.add_grant("agent-r", "files_read", project_id="proj-B")
+            await store.add_grant("agent-r", "project_tasks", project_id="proj-A")
+            assert (
+                await store.revoke_grant("agent-r", "files_read", project_id="proj-A")
+                is True
+            )
+            pairs = {(g["scope"], g["project_id"]) for g in await store.list_grants("agent-r")}
+            assert pairs == {("files_read", "proj-B"), ("project_tasks", "proj-A")}
+        finally:
+            await store.close()
+
+    async def test_revoke_grant_is_null_safe_for_global_grants(self, tmp_path):
+        """A global grant (project_id NULL) and a project-bound grant of the same
+        scope are distinct keys: revoking one must never remove the other."""
+        store = await self._store(tmp_path)
+        try:
+            await store.add_grant("agent-r", "files_read")
+            await store.add_grant("agent-r", "files_read", project_id="proj-A")
+            assert await store.revoke_grant("agent-r", "files_read") is True
+            left = [(g["scope"], g["project_id"]) for g in await store.list_grants("agent-r")]
+            assert left == [("files_read", "proj-A")]
+            assert (
+                await store.revoke_grant("agent-r", "files_read", project_id="proj-A")
+                is True
+            )
+            assert await store.list_grants("agent-r") == []
+        finally:
+            await store.close()
+
+    async def test_revoke_grant_uninitialised_raises_runtime_error(self, tmp_path):
+        store = AgentGrantsStore(tmp_path / "grants.db")
+        try:
+            with pytest.raises(RuntimeError, match="not initialised"):
+                await store.revoke_grant("agent-x", "files_read")
+        finally:
+            await store.close()
+
+    # ── revoke_all_for_project ────────────────────────────────────────
+    async def test_revoke_all_for_project_returns_removed_scopes(self, tmp_path):
+        store = await self._store(tmp_path)
+        try:
+            await store.add_grant("agent-r", "project_tasks", project_id="proj-A")
+            await store.add_grant("agent-r", "canvas_read", project_id="proj-A")
+            removed = await store.revoke_all_for_project("agent-r", "proj-A")
+            assert removed == ["canvas_read", "project_tasks"]
+            assert await store.list_grants("agent-r") == []
+        finally:
+            await store.close()
+
+    async def test_revoke_all_for_project_spares_other_projects_and_globals(self, tmp_path):
+        store = await self._store(tmp_path)
+        try:
+            await store.add_grant("agent-r", "project_tasks", project_id="proj-A")
+            await store.add_grant("agent-r", "project_tasks", project_id="proj-B")
+            await store.add_grant("agent-r", "memory_read")
+            assert await store.revoke_all_for_project("agent-r", "proj-A") == [
+                "project_tasks"
+            ]
+            left = {(g["scope"], g["project_id"]) for g in await store.list_grants("agent-r")}
+            assert left == {("project_tasks", "proj-B"), ("memory_read", None)}
+        finally:
+            await store.close()
+
+    async def test_revoke_all_for_project_empty_when_none_held(self, tmp_path):
+        store = await self._store(tmp_path)
+        try:
+            await store.add_grant("agent-r", "project_tasks", project_id="proj-B")
+            assert await store.revoke_all_for_project("agent-r", "proj-A") == []
+            assert len(await store.list_grants("agent-r")) == 1
+        finally:
+            await store.close()
+
+    async def test_revoke_all_for_project_rejects_blank_project_id(self, tmp_path):
+        """Fail closed: a blank project_id would broaden the DELETE to the
+        identity's GLOBAL grants."""
+        store = await self._store(tmp_path)
+        try:
+            await store.add_grant("agent-r", "memory_read")
+            with pytest.raises(ValueError):
+                await store.revoke_all_for_project("agent-r", "")
+            assert len(await store.list_grants("agent-r")) == 1
+        finally:
+            await store.close()
+
+    async def test_revoke_all_for_project_uninitialised_raises_runtime_error(self, tmp_path):
+        store = AgentGrantsStore(tmp_path / "grants.db")
+        try:
+            with pytest.raises(RuntimeError, match="not initialised"):
+                await store.revoke_all_for_project("agent-x", "proj-A")
+        finally:
+            await store.close()
+
     async def test_existing_db_with_old_unique_upgrades_and_survives(self, tmp_path):
         db_path = tmp_path / "legacy.db"
         # Seed a DB with the OLD 2-column unique constraint and a couple rows.
@@ -232,5 +403,54 @@ class TestAgentGrantsStore:
             await store.init()
             again = await store.list_grants("agent-legacy")
             assert len(again) == 3
+        finally:
+            await store.close()
+
+    # ── expired-row bound + instant comparison ────────────────────────
+    async def test_reapproving_an_expired_bounded_grant_restores_access(self, tmp_path):
+        store = await self._store(tmp_path)
+        try:
+            await store.add_grant("agent-a", "scope-x", expires_at="2000-01-01T00:00:00+00:00")
+            grants = await store.list_grants("agent-a")
+            assert len(grants) == 1
+            assert grants[0]["expires_at"] == "2000-01-01T00:00:00+00:00"
+
+            row = await store.add_grant(
+                "agent-a", "scope-x", expires_at="2030-01-01T00:00:00+00:00"
+            )
+            active = await store.list_active_grants()
+            assert len(active) == 1, (
+                "re-approving an expired grant with a future bound must restore access"
+            )
+            assert active[0]["expires_at"] == "2030-01-01T00:00:00+00:00"
+            assert row["expires_at"] == "2030-01-01T00:00:00+00:00"
+        finally:
+            await store.close()
+
+    async def test_an_unbounded_call_does_not_revive_an_expired_grant(self, tmp_path):
+        store = await self._store(tmp_path)
+        try:
+            await store.add_grant("agent-a", "scope-x", expires_at="2000-01-01T00:00:00+00:00")
+            grants = await store.list_grants("agent-a")
+            assert len(grants) == 1
+
+            row = await store.add_grant("agent-a", "scope-x")
+            assert row["expires_at"] == "2000-01-01T00:00:00+00:00", (
+                "an unbounded re-approval of an expired grant must keep the expired row, not widen to NULL"
+            )
+            active = await store.list_active_grants()
+            assert len(active) == 0
+        finally:
+            await store.close()
+
+    async def test_min_compares_instants(self, tmp_path):
+        store = await self._store(tmp_path)
+        try:
+            # existing 2030-01-01T10:00:00+02:00 == 08:00 UTC
+            # new      2030-01-01T09:00:00+00:00 == 09:00 UTC
+            # existing is the earlier instant -> keep existing
+            await store.add_grant("agent-a", "scope-x", expires_at="2030-01-01T10:00:00+02:00")
+            row = await store.add_grant("agent-a", "scope-x", expires_at="2030-01-01T09:00:00+00:00")
+            assert row["expires_at"] == "2030-01-01T10:00:00+02:00"
         finally:
             await store.close()

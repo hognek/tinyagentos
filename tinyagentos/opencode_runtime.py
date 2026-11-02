@@ -23,6 +23,7 @@ from typing import Callable
 import httpx
 
 from tinyagentos.adapters.opencode_adapter import OpenCodeAdapter, OpenCodeConfig
+from tinyagentos.atomic_io import atomic_write_text
 
 logger = logging.getLogger(__name__)
 
@@ -157,6 +158,15 @@ class OpenCodeServerConfig:
     binary: str = "opencode"
     """Path or name of the opencode binary."""
 
+    taos_api_base_url: str | None = None
+    """Base URL of the taOS API (e.g. ``http://127.0.0.1:6969``). If set, passed as
+    ``TAOS_API_BASE_URL`` to the opencode server process so the agent can call
+    the taOS API with its scoped credential."""
+
+    taos_api_credential: str | None = None
+    """Scoped credential for the taOS API (native agent's registry JWT). If set,
+    passed as ``TAOS_API_CREDENTIAL`` to the opencode server process."""
+
 
 class OpenCodeServer:
     """Manage one host ``opencode serve`` process.
@@ -201,13 +211,7 @@ class OpenCodeServer:
             },
         }
         config_path = config_dir / "opencode.json"
-        config_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-        # The config embeds the agent's LiteLLM key in plaintext — keep it
-        # owner-only (mirrors install_hermes.sh's chmod 600 on ~/.hermes/.env).
-        try:
-            os.chmod(config_path, 0o600)
-        except OSError:
-            logger.debug("opencode_runtime: could not chmod %s", config_path)
+        atomic_write_text(config_path, json.dumps(payload, indent=2), mode=0o600)
         logger.debug("opencode_runtime: wrote config to %s", config_path)
 
     # ------------------------------------------------------- github token env
@@ -295,6 +299,12 @@ class OpenCodeServer:
         }
         if self._cfg.server_password:
             env["OPENCODE_SERVER_PASSWORD"] = self._cfg.server_password
+        # Pass taOS API credential to the opencode server so the agent can call
+        # the taOS API with its scoped credential (not the admin local token).
+        if self._cfg.taos_api_base_url:
+            env["TAOS_API_BASE_URL"] = self._cfg.taos_api_base_url
+        if self._cfg.taos_api_credential:
+            env["TAOS_API_CREDENTIAL"] = self._cfg.taos_api_credential
         if self._cfg.github_token:
             # Expose the agent's granted GitHub token to the server and every
             # shell command it spawns (git push / gh pr create). ``GH_TOKEN``
@@ -306,13 +316,11 @@ class OpenCodeServer:
 
         # Redirect output to a log file rather than PIPE: a long-lived server
         # with an unread PIPE deadlocks once the OS buffer fills, and we still
-        # want the serve logs for diagnosing the host taOS agent.
+        # want the serve logs for diagnosing the host taOS agent. Create it
+        # with mode 0600 at open time (no TOCTOU window).
         log_path = Path(self._cfg.home) / ".config" / "opencode" / "serve.log"
-        self._log_fh = open(log_path, "ab")
-        try:
-            os.chmod(log_path, 0o600)
-        except OSError:
-            pass
+        fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        self._log_fh = os.fdopen(fd, "ab")
 
         # Resolve the bare "opencode" default past the PATH gap described in
         # OpenCodeBinaryNotFoundError; an explicit binary override (tests, or

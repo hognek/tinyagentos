@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+import os
 import secrets
 import shutil
 from pathlib import Path
@@ -10,6 +12,20 @@ from tinyagentos.installers.base import AppInstaller, run_cmd
 from tinyagentos.installers.port_allocator import allocate_host_port
 
 
+logger = logging.getLogger(__name__)
+
+def _healthcheck_enabled(hc) -> bool:
+    """Return True if the healthcheck is enabled, False otherwise."""
+    if not isinstance(hc, dict):
+        return False
+    if hc.get("disable") is True:
+        return False
+    test = hc.get("test")
+    if test == ["NONE"] or test == "NONE":
+        return False
+    return True
+
+
 class DockerInstaller(AppInstaller):
     def __init__(self, apps_dir: Path | None = None):
         # tinyagentos/installers/docker_installer.py -> parents[2] is the
@@ -18,6 +34,30 @@ class DockerInstaller(AppInstaller):
 
     def _compose_path(self, app_id: str) -> Path:
         return self.apps_dir / app_id / "docker-compose.yaml"
+
+    def _get_or_create_secret_key(self, app_id: str) -> str:
+        """Load or create the per-app secret key, persisted in ``<app_dir>/.secret_key``.
+
+        Reused by both ``_write_config_files`` and ``_generate_compose`` so that
+        apps shipping ``{secret_key}`` in either ``config_files`` content or
+        ``install.env`` values get the same stable per-app secret.  The key is
+        regenerated when a prior write left it missing, empty, or malformed.
+        """
+        app_dir = self.apps_dir / app_id
+        secret_key_path = app_dir / ".secret_key"
+        secret_key = ""
+        if secret_key_path.exists():
+            secret_key = secret_key_path.read_text().strip()
+        if len(secret_key) != 64 or not all(c in "0123456789abcdef" for c in secret_key):
+            secret_key = secrets.token_hex(32)
+            app_dir.mkdir(parents=True, exist_ok=True)
+            secret_key_path.write_text(secret_key)
+            secret_key_path.chmod(0o600)
+        return secret_key
+
+    def _substitute_secret_key(self, value: str, secret_key: str) -> str:
+        """Replace the ``{secret_key}`` placeholder in a single string value."""
+        return value.replace("{secret_key}", secret_key)
 
     def _write_config_files(self, app_id: str, install_config: dict) -> None:
         """Write declarative config files from the manifest to the app directory.
@@ -68,24 +108,38 @@ class DockerInstaller(AppInstaller):
         # Persist secret_key per app so re-installs don't rotate it. It signs
         # sessions, so keep it owner-only and regenerate if a prior write left
         # it empty or malformed.
-        secret_key_path = app_dir / ".secret_key"
-        secret_key = ""
-        if secret_key_path.exists():
-            secret_key = secret_key_path.read_text().strip()
-        if len(secret_key) != 64 or not all(c in "0123456789abcdef" for c in secret_key):
-            secret_key = secrets.token_hex(32)
-            app_dir.mkdir(parents=True, exist_ok=True)
-            secret_key_path.write_text(secret_key)
-            secret_key_path.chmod(0o600)
+        secret_key = self._get_or_create_secret_key(app_id)
 
         for entry in config_files:
             path = entry["path"]
             content = entry["content"]
             if "{secret_key}" in content:
-                content = content.replace("{secret_key}", secret_key)
+                content = self._substitute_secret_key(content, secret_key)
             full_path = app_dir / path
             full_path.parent.mkdir(parents=True, exist_ok=True)
-            full_path.write_text(content)
+            # Write config file with 0600 permissions to protect any secret substitutions
+            fd = os.open(full_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w") as f:
+                f.write(content)
+            os.chmod(full_path, 0o600)
+
+    @staticmethod
+    def _is_floating_tag(image: str) -> bool:
+        """True when an image reference carries no usable version pin.
+
+        A floating tag (``:latest``, or no tag at all) means "whatever upstream
+        ships right now", so the compose service must re-pull on every
+        ``up`` instead of reusing whatever happens to be cached locally. A
+        digest-pinned reference (``repo@sha256:...``) is an exact pin even
+        though it has no colon tag, so it never floats.
+        """
+        ref = image.split("@", 1)[0]
+        # Only the part after the final slash can hold a tag; a registry host
+        # may itself contain a colon (e.g. ``localhost:5000/app``).
+        name = ref.rsplit("/", 1)[-1]
+        if ":" not in name:
+            return True
+        return name.rsplit(":", 1)[1] == "latest"
 
     @staticmethod
     def _is_named_volume(source: str) -> bool:
@@ -95,6 +149,48 @@ class DockerInstaller(AppInstaller):
         ``config``) is a named volume that must be declared at the top level.
         """
         return bool(source) and not source.startswith(("/", "./", "../", "~"))
+    @staticmethod
+    def _parse_ports(ports):
+        """Parse ports from a manifest.
+        
+        Can handle:
+        - Simple integer lists: [6333, 6334]
+        - Host:container format: ["6333:6333", "6334:6334"]
+        - Dict format: {"http": 3000, "ssh": 2222} (for gitea-lxc)
+        """
+        if isinstance(ports, dict):
+            # For dict format, extract the container ports
+            # For gitea-lxc: {"http": 3000, "ssh": 2222}
+            # We want [3000, 2222]
+            return list(ports.values())
+        
+        if isinstance(ports, list):
+            container_ports = []
+            for port in ports:
+                if isinstance(port, int):
+                    container_ports.append(port)
+                elif isinstance(port, str):
+                    if ":" in port:
+                        # Host:container format, e.g., "6333:6333"
+                        try:
+                            host_port_str, container_port_str = port.split(":", 1)
+                            host_port = int(host_port_str)
+                            container_port = int(container_port_str)
+                            container_ports.append(container_port)
+                        except ValueError:
+                            raise ValueError(f"Invalid port format: {port}. Expected host:container.")
+                    else:
+                        # Just a container port as string, e.g., "6333"
+                        try:
+                            container_ports.append(int(port))
+                        except ValueError:
+                            raise ValueError(f"Invalid port: {port}. Expected integer or host:container.")
+                else:
+                    raise ValueError(f"Invalid port type: {type(port)}. Expected int or str.")
+            return container_ports
+        
+        raise ValueError(f"Invalid ports type: {type(ports)}. Expected list or dict.")
+
 
     def _generate_compose(
         self, app_id: str, install_config: dict
@@ -114,6 +210,13 @@ class DockerInstaller(AppInstaller):
             "image": install_config["image"],
             "restart": "unless-stopped",
         }
+        # `docker compose pull` in install() already refreshes a floating tag,
+        # but `up -d` alone reuses the local cache for one. Pin
+        # pull_policy: always so an unpinned image is pulled before the
+        # container starts -- that is what makes every install and every Store
+        # update land on the current upstream release.
+        if self._is_floating_tag(str(install_config["image"])):
+            service["pull_policy"] = "always"
         named_volumes: dict[str, None] = {}
         if "volumes" in install_config:
             service["volumes"] = install_config["volumes"]
@@ -125,14 +228,126 @@ class DockerInstaller(AppInstaller):
                 if self._is_named_volume(source):
                     named_volumes[source] = None
         if "env" in install_config:
-            service["environment"] = install_config["env"]
+            # Substitute the per-app {secret_key} placeholder in every env
+            # string value (e.g. NEXTAUTH_SECRET), reusing the persisted key in
+            # <app_dir>/.secret_key so re-installs don't rotate it. The key is
+            # only created when an env value actually carries the placeholder.
+            env = install_config["env"]
+            if any("{secret_key}" in v for v in env.values() if isinstance(v, str)):
+                secret_key = self._get_or_create_secret_key(app_id)
+                env = {
+                    k: self._substitute_secret_key(v, secret_key) if isinstance(v, str) else v
+                    for k, v in env.items()
+                }
+            service["environment"] = env
+            # Add extra_hosts for host.docker.internal when referenced in env
+            # Linux Docker Engine does not resolve host.docker.internal by default
+            extra_hosts = []
+            for key, value in service["environment"].items():
+                if isinstance(value, str) and "host.docker.internal" in value:
+                    extra_hosts.append("host.docker.internal:host-gateway")
+            if extra_hosts:
+                service["extra_hosts"] = extra_hosts
+
+        # Companion services (e.g. postgres for linkwarden)
+        companions: list[dict] = install_config.get("companions", [])
+        companion_services: list[dict] = []
+        companion_names: list[str] = []
+        if companions:
+            companion_needs_secret = any(
+                isinstance(v, str) and "{secret_key}" in v
+                for comp in companions
+                for v in (comp.get("env") or {}).values()
+            )
+            secret_key = (
+                self._get_or_create_secret_key(app_id)
+                if companion_needs_secret
+                else ""
+            )
+
+            for comp in companions:
+                comp_name = comp.get("name", f"companion-{len(companion_services)}")
+                companion_names.append(comp_name)
+                comp_service = {
+                    "image": comp["image"],
+                    "restart": "unless-stopped",
+                }
+                # Copy healthcheck from manifest if declared
+                if "healthcheck" in comp:
+                    comp_service["healthcheck"] = comp["healthcheck"]
+                comp_named_volumes: dict[str, None] = {}
+                if "volumes" in comp:
+                    comp_service["volumes"] = comp["volumes"]
+                    for vol in comp["volumes"]:
+                        source = str(vol).split(":", 1)[0]
+                        if self._is_named_volume(source):
+                            comp_named_volumes[source] = None
+                if "env" in comp:
+                    comp_service["environment"] = {
+                        k: self._substitute_secret_key(v, secret_key) if isinstance(v, str) else v
+                        for k, v in comp["env"].items()
+                    }
+
+                    # Add extra_hosts for host.docker.internal when referenced in companion env
+                    extra_hosts = []
+                    for key, value in comp_service["environment"].items():
+                        if isinstance(value, str) and "host.docker.internal" in value:
+                            extra_hosts.append("host.docker.internal:host-gateway")
+                    if extra_hosts:
+                        comp_service["extra_hosts"] = extra_hosts
+                # Add default healthcheck for postgres if it doesn't have one.
+                # The installer is app-agnostic, so the user/db are derived from the
+                # companion's declared env (POSTGRES_USER/POSTGRES_DB) rather than
+                # hard-coded to one app. pg_isready tolerates a wrong user/db, so a
+                # stale hard-code here is latent, not breaking -- but it makes the
+                # healthcheck report the wrong database for any other app.
+                if comp_name == "postgres" and "healthcheck" not in comp_service:
+                    comp_env = comp_service.get("environment") or {}
+                    pg_user = comp_env.get("POSTGRES_USER") or "postgres"
+                    pg_db = comp_env.get("POSTGRES_DB") or pg_user
+                    comp_service["healthcheck"] = {
+                        "test": ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", pg_user, "-d", pg_db],
+                        "interval": "5s",
+                        "timeout": "5s",
+                        "retries": 5,
+                        "start_period": "10s"
+                    }
+                companion_services.append(comp_service)
+                for vn in comp_named_volumes:
+                    named_volumes[vn] = None
+
+
 
         # Collect the container-internal ports from the manifest.
+        # Canonical key is "ports" at the top level of install_config.
+        # Legacy key is "requires.ports" — kept for compatibility with
+        # already-installed apps and third-party manifests.
         container_ports: list[int] = []
-        if "ports" in install_config.get("requires", {}):
-            container_ports = [int(p) for p in install_config["requires"]["ports"]]
-        elif "ports" in install_config:
-            container_ports = [int(p) for p in install_config["ports"]]
+        canonical_ports = install_config.get("ports")
+        legacy_ports = install_config.get("requires", {}).get("ports")
+        if canonical_ports is not None:
+            container_ports = self._parse_ports(canonical_ports)
+            if legacy_ports is not None:
+                # Both present — canonical wins, but warn if they disagree.
+                legacy_parsed = self._parse_ports(legacy_ports)
+                if legacy_parsed != container_ports:
+                    logger.warning(
+                        "App %r: both 'ports' and 'requires.ports' present "
+                        "with different values; 'ports' (canonical) takes precedence. "
+                        "Legacy value: %s, canonical value: %s",
+                        app_id,
+                        legacy_ports,
+                        canonical_ports,
+                    )
+        elif legacy_ports is not None:
+            # Legacy only — use it but emit a single deprecation warning.
+            logger.warning(
+                "App %r: using legacy 'requires.ports' (%s); "
+                "migrate to top-level 'ports' key in the manifest.",
+                app_id,
+                legacy_ports,
+            )
+            container_ports = self._parse_ports(legacy_ports)
 
         allocated_host_port: int | None = None
         if container_ports:
@@ -154,10 +369,30 @@ class DockerInstaller(AppInstaller):
                 f"{hp}:{cport}"
                 for hp, cport in zip(host_ports, container_ports)
             ]
+        # Build the services dict: app service first, then companions
+        all_services: dict[str, dict] = {}
+        all_services[app_id] = service
+        for i, comp_service in enumerate(companion_services):
+            all_services[companion_names[i]] = comp_service
+
+        # Add depends_on configuration for the app service to manage companion startup order
+        if companion_names:
+            depends_on: dict[str, dict] = {}
+            for comp_name in companion_names:
+                comp_service = all_services[comp_name]
+                if _healthcheck_enabled(comp_service.get("healthcheck")):
+                    # Use service_healthy condition when companion has a healthcheck
+                    depends_on[comp_name] = {"condition": "service_healthy"}
+                else:
+                    # No readiness signal exists for this companion, so wait for
+                    # START only. Mapping form is required: a bare list value
+                    # ([comp_name]) is rejected by compose-go as invalid Compose.
+                    depends_on[comp_name] = {"condition": "service_started"}
+            all_services[app_id]["depends_on"] = depends_on
 
         # No top-level `version:` — it's obsolete in Compose v2 and emits a
         # warning on every command.
-        compose: dict = {"services": {app_id: service}}
+        compose: dict = {"services": all_services}
         if named_volumes:
             compose["volumes"] = named_volumes
         return compose, allocated_host_port
@@ -172,7 +407,11 @@ class DockerInstaller(AppInstaller):
 
         compose, host_port = self._generate_compose(app_id, install_config)
         compose_path = self._compose_path(app_id)
-        compose_path.write_text(yaml.dump(compose, default_flow_style=False))
+        # Write docker-compose.yaml with 0600 permissions to protect any secret substitutions
+        fd = os.open(compose_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(yaml.dump(compose, default_flow_style=False))
+        os.chmod(compose_path, 0o600)
 
         # Pull image
         code, output = await run_cmd(

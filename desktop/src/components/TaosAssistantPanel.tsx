@@ -15,6 +15,7 @@ import {
 import { CodeBlock } from "@/components/CodeBlock";
 import { useTaosAgentStore } from "@/stores/taos-agent-store";
 import { TaosAssistantSettings } from "./TaosAssistantSettings";
+import { ShellAskCard, type ShellAsk } from "./ShellAskCard";
 import {
   takeChatScreenshot,
   uploadChatAttachment,
@@ -28,6 +29,7 @@ import {
 } from "@/lib/screen-capture";
 import { useProcessStore } from "@/stores/process-store";
 import { randomId } from "@/lib/uid";
+import { copyText } from "@/lib/clipboard";
 
 export interface PendingAttachment {
   id: string;
@@ -55,6 +57,9 @@ export function TaosAssistantPanelInner({ embedded = false }: { embedded?: boole
 
   const [input, setInput] = useState("");
   const [pendingAttachments, setPendingAttachments] = useState<PendingAttachment[]>([]);
+  // Shell commands the agent asked to run this session (the `shell_ask`
+  // frames): answered inline here or in Decisions.
+  const [shellAsks, setShellAsks] = useState<ShellAsk[]>([]);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
@@ -75,7 +80,7 @@ export function TaosAssistantPanelInner({ embedded = false }: { embedded?: boole
   // Auto-scroll on new content
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages, pendingAttachments.length]);
+  }, [messages, pendingAttachments.length, shellAsks.length]);
 
   /* ---------------------------------------------------------------- */
   /*  Core send logic — shared by manual send and screenshot           */
@@ -129,6 +134,12 @@ export function TaosAssistantPanelInner({ embedded = false }: { embedded?: boole
             const obj = JSON.parse(line);
             if (obj.error) appendDelta(`\n\n_Error: ${obj.error}_`);
             else if (obj.delta) appendDelta(obj.delta);
+            else if (obj.shell_ask?.decision_id) {
+              const ask = obj.shell_ask as ShellAsk;
+              setShellAsks((prev) =>
+                prev.some((a) => a.decision_id === ask.decision_id) ? prev : [...prev, ask],
+              );
+            }
           } catch {
             // skip malformed NDJSON
           }
@@ -298,6 +309,9 @@ export function TaosAssistantPanelInner({ embedded = false }: { embedded?: boole
             }
             onSave={(newContent) => updateMessage(i, newContent)}
           />
+        ))}
+        {shellAsks.map((ask) => (
+          <ShellAskCard key={ask.decision_id} ask={ask} />
         ))}
         <div ref={messagesEndRef} />
       </div>
@@ -615,12 +629,10 @@ function MessageBubble({
   const canEdit = editable && !streaming && content && onSave;
 
   const handleCopy = async () => {
-    try {
-      await navigator.clipboard.writeText(content);
+    const ok = await copyText(content);
+    if (ok) {
       setCopied(true);
       setTimeout(() => setCopied(false), 1500);
-    } catch {
-      // ignore
     }
   };
 

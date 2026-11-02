@@ -183,7 +183,7 @@ After=network.target
 Type=simple
 User=root
 WorkingDirectory=$INSTALL_DIR
-ExecStart=$INSTALL_DIR/venv/bin/python -m uvicorn tinyagentos.app:create_app --factory --host 0.0.0.0 --port 6969
+ExecStart=$INSTALL_DIR/venv/bin/python -m tinyagentos
 ExecReload=/bin/kill -HUP \$MAINPID
 Restart=always
 RestartSec=3
@@ -200,7 +200,7 @@ systemctl enable tinyagentos
 if [ -e "/dev/rknpu" ]; then
     echo ""
     echo "Rockchip NPU detected! Consider installing rkllama for NPU-accelerated inference."
-    echo "  pip install rkllama"
+    echo "  sudo bash $INSTALL_DIR/scripts/install-rknpu.sh"
 fi
 
 # Detect if a Hailo-10H NPU is available (Raspberry Pi 5 + AI HAT+2).

@@ -24,6 +24,10 @@ import asyncio
 import base64
 import json
 import logging
+import os
+import shutil
+import signal
+import tempfile
 import uuid
 from typing import Any, Literal
 
@@ -227,3 +231,72 @@ async def desktop_stream(request: Request):
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"},
     )
+
+
+# Seconds taos-shot may take (wake the panel, capture, blank it again).
+_PANEL_SHOT_TIMEOUT = 15.0
+# One capture at a time: taos-shot wakes and blanks the one physical panel.
+_PANEL_SHOT_LOCK = asyncio.Lock()
+
+
+@router.post("/api/desktop/panel-shot")
+async def panel_shot(request: Request):
+    """Return a PNG of what is actually on the handset glass.
+
+    Unlike POST /api/desktop/screenshot (a DOM raster from the browser), this
+    runs the on-device `taos-shot` script, so it shows the real panel. The
+    panel is one physical screen, not per-user like /screenshot, so only the
+    native agent token or an admin session may capture it; any other caller
+    (a non-admin session, another agent's registry token) gets 403.
+    404 if the host has no taos-shot, 429 if a capture is already running, 504
+    on timeout, 502 if taos-shot fails or produces no image.
+    """
+    via = getattr(request.state, "via", None)
+    if not (
+        via == "registry_jwt_native_agent"
+        or (via == "session" and getattr(request.state, "is_admin", False))
+    ):
+        return JSONResponse({"detail": "forbidden"}, status_code=403)
+    exe = shutil.which("taos-shot")
+    if exe is None:
+        return JSONResponse({"detail": "no panel on this host"}, status_code=404)
+    if _PANEL_SHOT_LOCK.locked():
+        return JSONResponse({"detail": "a panel capture is already running"}, status_code=429)
+    async with _PANEL_SHOT_LOCK:
+        tmpdir = tempfile.mkdtemp()
+        try:
+            out_path = os.path.join(tmpdir, "shot.png")
+            proc = await asyncio.create_subprocess_exec(
+                exe, out_path,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+                start_new_session=True,
+            )
+            try:
+                await asyncio.wait_for(proc.communicate(), timeout=_PANEL_SHOT_TIMEOUT)
+            except (asyncio.TimeoutError, asyncio.CancelledError) as exc:
+                # Kill the whole group: a child of the script (sleep, grim)
+                # would otherwise hold the stderr pipe open after the kill.
+                # On cancellation too, or the lock is released while
+                # taos-shot is still driving the panel.
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    proc.kill()
+                await proc.wait()
+                if isinstance(exc, asyncio.CancelledError):
+                    raise
+                return JSONResponse({"detail": "panel capture timed out"}, status_code=504)
+            if proc.returncode != 0:
+                logger.warning("taos-shot exited %s", proc.returncode)
+                return JSONResponse({"detail": "panel capture failed"}, status_code=502)
+            try:
+                with open(out_path, "rb") as fh:
+                    png = fh.read()
+            except OSError:
+                png = b""
+            if not png:
+                return JSONResponse({"detail": "panel capture produced no image"}, status_code=502)
+            return Response(content=png, media_type="image/png")
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)

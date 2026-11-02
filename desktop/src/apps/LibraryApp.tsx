@@ -12,6 +12,8 @@ import {
   Activity,
   Clock,
   AlertCircle,
+  Upload,
+  Brain,
 } from "lucide-react";
 import { MobileSplitView } from "@/components/mobile/MobileSplitView";
 import { useIsMobile } from "@/hooks/use-is-mobile";
@@ -47,6 +49,9 @@ import type {
   AgentSubscription,
   ListItemsParams,
 } from "@/lib/knowledge";
+import { listLibraryJobs, retryLibraryJob } from "@/lib/library";
+import type { LibraryJob } from "@/lib/library";
+import { withCsrf } from "@/lib/csrf";
 import { useFocusTrap } from "@/hooks/use-focus-trap";
 import { useDragSource } from "@/shell/dnd/use-drag-source";
 
@@ -96,6 +101,16 @@ const SOURCE_LABELS: Record<string, string> = {
   manual: "Manual",
 };
 
+const ACCEPTED_TYPES = [".txt", ".md", ".pdf", ".html", ".json", ".csv"];
+const ACCEPTED_MIME = [
+  "text/plain",
+  "text/markdown",
+  "application/pdf",
+  "text/html",
+  "application/json",
+  "text/csv",
+];
+
 interface SourceStorage {
   source_type: string;
   bytes: number;
@@ -120,6 +135,76 @@ interface StorageViewData {
 const STORAGE_CAP_BYTES = 50 * 1024 * 1024 * 1024;
 
 /* ------------------------------------------------------------------ */
+/*  Queue (ingest pipeline jobs)                                      */
+/* ------------------------------------------------------------------ */
+
+const POLL_INTERVAL_MS = 3000;
+const ACTIVE_JOB_STATES = new Set(["queued", "processing"]);
+const FAILED_JOB_STATE = "error";
+
+function isJobActive(state: string): boolean {
+  return ACTIVE_JOB_STATES.has(state);
+}
+
+function isJobActiveOrFailed(state: string): boolean {
+  return isJobActive(state) || state === FAILED_JOB_STATE;
+}
+
+function jobStateColor(state: string): string {
+  if (state === "queued") return "bg-blue-500/15 text-blue-400 border-blue-500/30";
+  if (state === "processing") return "bg-amber-500/15 text-amber-400 border-amber-500/30";
+  if (state === "error") return "bg-red-500/15 text-red-400 border-red-500/30";
+  if (state === "done" || state === "completed") return "bg-green-500/15 text-green-400 border-green-500/30";
+  return "bg-white/10 text-shell-text-tertiary border-white/10";
+}
+
+/* ------------------------------------------------------------------ */
+/*  Library Settings (mock contract until #2060)                       */
+/* ------------------------------------------------------------------ */
+
+const LIBRARY_SETTINGS_KEY = "taos-library-settings";
+
+interface LibrarySettings {
+  preferred_quality: string;
+  storage_cap_bytes: number;
+  source_rules: Array<{ source: string; action: string; quality: string }>;
+}
+
+const QUALITY_OPTIONS = ["low", "medium", "high", "best"] as const;
+const ACTION_OPTIONS = ["download", "skip", "ask"] as const;
+
+const DEFAULT_LIBRARY_SETTINGS: LibrarySettings = {
+  preferred_quality: "high",
+  storage_cap_bytes: STORAGE_CAP_BYTES,
+  source_rules: [],
+};
+
+function loadLibrarySettings(): LibrarySettings {
+  try {
+    const raw = localStorage.getItem(LIBRARY_SETTINGS_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw) as Partial<LibrarySettings>;
+      return {
+        preferred_quality: parsed.preferred_quality ?? DEFAULT_LIBRARY_SETTINGS.preferred_quality,
+        storage_cap_bytes: parsed.storage_cap_bytes ?? DEFAULT_LIBRARY_SETTINGS.storage_cap_bytes,
+        source_rules: Array.isArray(parsed.source_rules) ? parsed.source_rules : DEFAULT_LIBRARY_SETTINGS.source_rules,
+      };
+    }
+  } catch {
+    /* ignore */
+  }
+  return { ...DEFAULT_LIBRARY_SETTINGS };
+}
+
+function saveLibrarySettings(settings: LibrarySettings): void {
+  try {
+    localStorage.setItem(LIBRARY_SETTINGS_KEY, JSON.stringify(settings));
+  } catch {
+    /* ignore */
+  }
+}
+
+/* ------------------------------------------------------------------ */
 /*  Helpers                                                            */
 /* ------------------------------------------------------------------ */
 
@@ -139,7 +224,7 @@ const mockItemBytes = (id: string): number => {
   return (Math.abs(hash) % 4000 + 100) * 1024 * 1024;
 };
 
-const deriveMockStorageData = (items: KnowledgeItem[]): StorageViewData => {
+const deriveMockStorageData = (items: KnowledgeItem[], capBytes: number): StorageViewData => {
   const itemRows: ItemStorageRow[] = items.map((item) => ({
     id: item.id,
     title: item.title || "Untitled",
@@ -157,8 +242,8 @@ const deriveMockStorageData = (items: KnowledgeItem[]): StorageViewData => {
     .sort((a, b) => b.bytes - a.bytes);
   return {
     total_bytes: totalBytes,
-    cap_bytes: STORAGE_CAP_BYTES,
-    paused_at_cap: totalBytes >= STORAGE_CAP_BYTES,
+    cap_bytes: capBytes,
+    paused_at_cap: totalBytes >= capBytes,
     sources,
     items: itemRows.sort((a, b) => b.bytes - a.bytes),
   };
@@ -228,7 +313,18 @@ export function LibraryApp({ windowId: _windowId }: { windowId: string }) {
     monitor: null,
   });
 
-  const [activeView, setActiveView] = useState<"items" | "storage">("items");
+  const [activeView, setActiveView] = useState<"items" | "storage" | "settings" | "queue">("items");
+
+  /* ---------- queue (ingest jobs) ---------- */
+  const [jobs, setJobs] = useState<LibraryJob[]>([]);
+  const [jobsLoading, setJobsLoading] = useState(false);
+  const [jobsUnavailable, setJobsUnavailable] = useState(false);
+  const queuePollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const jobsLoadedRef = useRef(false);
+
+  /* ---------- settings ---------- */
+  const [settings, setSettings] = useState<LibrarySettings>(() => loadLibrarySettings());
+  const [newSourceRule, setNewSourceRule] = useState({ source: "", action: "download" as const, quality: "high" as const });
 
   /* ---------- detail state ---------- */
   const [snapshots, setSnapshots] = useState<Snapshot[]>([]);
@@ -261,7 +357,7 @@ export function LibraryApp({ windowId: _windowId }: { windowId: string }) {
   const [mobileFiltersOpen, setMobileFiltersOpen] = useState(false);
 
   /* ---------------------------------------------------------------- */
-  /*  Data fetching                                                    */
+  /*  Data fetching (forward-declared for file upload handlers)       */
   /* ---------------------------------------------------------------- */
 
   const fetchItems = useCallback(async () => {
@@ -283,6 +379,100 @@ export function LibraryApp({ windowId: _windowId }: { windowId: string }) {
     }
     setLoading(false);
   }, [filters, search, searchMode, offset]);
+
+  /* ---------- file upload ---------- */
+  const [dragOver, setDragOver] = useState(false);
+  const [uploading, setUploading] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState(0);
+  const [embedding, setEmbedding] = useState(false);
+  const [embedAgentPickerOpen, setEmbedAgentPickerOpen] = useState(false);
+  const [embedFiles, setEmbedFiles] = useState<globalThis.File[]>([]);
+  const [embedMessage, setEmbedMessage] = useState<{ kind: "success" | "error"; text: string } | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const embedFileInputRef = useRef<HTMLInputElement>(null);
+
+  const isValidFile = useCallback((file: globalThis.File) => {
+    const ext = "." + file.name.split(".").pop()?.toLowerCase();
+    return ACCEPTED_TYPES.includes(ext) || ACCEPTED_MIME.includes(file.type);
+  }, []);
+
+  const closeEmbedPicker = useCallback(() => {
+    setEmbedAgentPickerOpen(false);
+    setEmbedFiles([]);
+  }, []);
+
+  const handleEmbedConfirm = useCallback(async (agentName: string) => {
+    if (embedFiles.length === 0) return;
+    setEmbedding(true);
+    setEmbedMessage(null);
+    try {
+      // Step 1: stage each file on the server; the response filename is the
+      // server-side name, which can differ from file.name.
+      const serverNames: string[] = [];
+      for (const file of embedFiles) {
+        const formData = new FormData();
+        formData.append("file", file);
+        const upRes = await fetch("/api/import/upload", withCsrf({ method: "POST", body: formData }));
+        if (!upRes.ok) {
+          const errText = await upRes.text().catch(() => "");
+          setEmbedMessage({
+            kind: "error",
+            text: `Upload failed for ${file.name}: ${upRes.status} ${errText || upRes.statusText}`,
+          });
+          return;
+        }
+        const upData = await upRes.json().catch(() => null);
+        if (!upData || typeof upData.filename !== "string") {
+          setEmbedMessage({ kind: "error", text: `Upload failed for ${file.name}: no filename returned` });
+          return;
+        }
+        serverNames.push(upData.filename);
+      }
+      // Step 2: embed the staged files into the chosen agent.
+      const res = await fetch("/api/import/embed", withCsrf({
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ agent_name: agentName, files: serverNames }),
+      }));
+      if (res.ok) {
+        const data = await res.json().catch(() => null);
+        if (data && typeof data === "object" && (data as Record<string, unknown>).embedded === true) {
+          setEmbedMessage({
+            kind: "success",
+            text: `Embedded ${serverNames.length} file${serverNames.length === 1 ? "" : "s"} into ${agentName}`,
+          });
+          setEmbedAgentPickerOpen(false);
+          setEmbedFiles([]);
+        } else {
+          const body = data as Record<string, unknown> | null;
+          const files = Array.isArray(body?.files) ? body.files : [];
+          const failedFiles = files
+            .filter((f: unknown) => f && typeof f === "object" && (f as Record<string, unknown>).embedded === false)
+            .map((f: unknown) => String((f as Record<string, unknown>).filename ?? "unknown"));
+          setEmbedMessage({
+            kind: "error",
+            text: failedFiles.length > 0
+              ? `Embed failed for: ${failedFiles.join(", ")}`
+              : "Embed failed",
+          });
+        }
+      } else {
+        const errText = await res.text().catch(() => "");
+        setEmbedMessage({ kind: "error", text: `Embed failed: ${res.status} ${errText || res.statusText}` });
+      }
+    } catch (err) {
+      setEmbedMessage({
+        kind: "error",
+        text: `Embed error: ${err instanceof Error ? err.message : String(err)}`,
+      });
+    } finally {
+      setEmbedding(false);
+    }
+  }, [embedFiles]);
+
+  /* ---------------------------------------------------------------- */
+  /*  Data fetching (remaining)                                        */
+  /* ---------------------------------------------------------------- */
 
   useEffect(() => {
     fetchItems();
@@ -329,6 +519,128 @@ export function LibraryApp({ windowId: _windowId }: { windowId: string }) {
     const r = await listRules();
     setRules(r);
   }, []);
+
+  /* ---------- queue (ingest jobs) ---------- */
+
+  const queueActive = activeView === "queue";
+
+  const fetchJobs = useCallback(async () => {
+    const isInitial = !jobsLoadedRef.current;
+    if (isInitial) setJobsLoading(true);
+    try {
+      const data = await listLibraryJobs();
+      const next = Array.isArray(data?.jobs) ? data.jobs : [];
+      setJobs(next);
+      setJobsUnavailable(false);
+      jobsLoadedRef.current = true;
+      return next;
+    } catch {
+      setJobs([]);
+      setJobsUnavailable(true);
+      jobsLoadedRef.current = true;
+      return [];
+    } finally {
+      if (isInitial) setJobsLoading(false);
+    }
+  }, []);
+
+  // Poll every 3s while there are active jobs; stop once the queue is idle
+  // (no queued/processing jobs). Re-arming happens inside `tick` so the
+  // interval is created/destroyed deterministically as job state changes.
+  useEffect(() => {
+    if (!queueActive) {
+      if (queuePollRef.current) {
+        clearInterval(queuePollRef.current);
+        queuePollRef.current = null;
+      }
+      return;
+    }
+    let cancelled = false;
+
+    const tick = async () => {
+      const next = await fetchJobs();
+      if (cancelled) return;
+      const stillActive = next.some((j) => isJobActive(j.state));
+      if (stillActive && !queuePollRef.current) {
+        queuePollRef.current = setInterval(tick, POLL_INTERVAL_MS);
+      } else if (!stillActive && queuePollRef.current) {
+        clearInterval(queuePollRef.current);
+        queuePollRef.current = null;
+      }
+    };
+
+    void tick();
+    return () => {
+      cancelled = true;
+      if (queuePollRef.current) {
+        clearInterval(queuePollRef.current);
+        queuePollRef.current = null;
+      }
+    };
+  }, [queueActive, fetchJobs]);
+
+  const handleRetryJob = useCallback(
+    async (jobId: string) => {
+      const ok = await retryLibraryJob(jobId);
+      if (ok) {
+        void fetchJobs();
+      }
+    },
+    [fetchJobs],
+  );
+
+  /* ---------- file upload (ingest pipeline) ---------- */
+
+  const uploadOneToLibrary = useCallback(async (file: globalThis.File): Promise<boolean> => {
+    const formData = new FormData();
+    formData.append("file", file);
+    formData.append("title", file.name);
+    try {
+      const res = await fetch("/api/library/ingest", withCsrf({ method: "POST", body: formData }));
+      if (res.ok) return true;
+      const errText = await res.text().catch(() => "");
+      console.error("Upload failed:", res.status, errText);
+      alert(`Upload failed: ${res.status} ${errText || res.statusText}`);
+    } catch (err) {
+      console.error("Upload error:", err);
+      alert(`Upload error: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    return false;
+  }, []);
+
+  const handleFiles = useCallback(async (fileList: globalThis.File[]) => {
+    const valid = Array.from(fileList).filter(isValidFile);
+    if (valid.length === 0) return;
+    setUploading(true);
+    setUploadProgress(0);
+    try {
+      let done = 0;
+      for (const file of valid) {
+        await uploadOneToLibrary(file);
+        done += 1;
+        setUploadProgress(Math.round((done / valid.length) * 100));
+      }
+      // Show the new items in the processing queue.
+      await fetchJobs();
+    } finally {
+      setUploading(false);
+      setUploadProgress(0);
+    }
+  }, [isValidFile, uploadOneToLibrary, fetchJobs]);
+
+  const handleDrop = useCallback((e: React.DragEvent) => {
+    e.preventDefault();
+    setDragOver(false);
+    const dropped = Array.from(e.dataTransfer.files);
+    void handleFiles(dropped);
+  }, [handleFiles]);
+
+  const handleFileInput = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
+    if (e.target.files) {
+      void handleFiles(Array.from(e.target.files));
+    }
+    e.target.value = "";
+  }, [handleFiles]);
 
   const openDetail = useCallback(
     async (item: KnowledgeItem) => {
@@ -478,6 +790,32 @@ export function LibraryApp({ windowId: _windowId }: { windowId: string }) {
   const handleDeleteRule = useCallback(async (id: number) => {
     await deleteRule(id);
     setRules((prev) => prev.filter((r) => r.id !== id));
+  }, []);
+
+  /* ---------- settings handlers ---------- */
+
+  const handleAddSourceRule = useCallback(() => {
+    if (!newSourceRule.source) return;
+    setSettings((prev) => {
+      const next = {
+        ...prev,
+        source_rules: [...prev.source_rules, { ...newSourceRule }],
+      };
+      saveLibrarySettings(next);
+      return next;
+    });
+    setNewSourceRule({ source: "", action: "download", quality: "high" });
+  }, [newSourceRule]);
+
+  const handleDeleteSourceRule = useCallback((index: number) => {
+    setSettings((prev) => {
+      const next = {
+        ...prev,
+        source_rules: prev.source_rules.filter((_, i) => i !== index),
+      };
+      saveLibrarySettings(next);
+      return next;
+    });
   }, []);
 
   /* ---------------------------------------------------------------- */
@@ -692,7 +1030,7 @@ export function LibraryApp({ windowId: _windowId }: { windowId: string }) {
             </div>
           )}
           <div className="flex items-center gap-1 shrink-0" role="radiogroup" aria-label="View mode">
-            {(["items", "storage"] as const).map((v) => (
+            {(["items", "storage", "settings", "queue"] as const).map((v) => (
               <Button
                 key={v}
                 variant={activeView === v ? "secondary" : "ghost"}
@@ -846,6 +1184,96 @@ export function LibraryApp({ windowId: _windowId }: { windowId: string }) {
             ))}
           </div>
         </div>
+      </div>
+
+      {/* File drop zone */}
+      <div className="px-4 pb-3 shrink-0">
+        <Card
+          onDragOver={(e) => {
+            e.preventDefault();
+            setDragOver(true);
+          }}
+          onDragLeave={() => setDragOver(false)}
+          onDrop={handleDrop}
+          className={`border-2 border-dashed transition-colors ${
+            dragOver
+              ? "border-accent bg-accent/5"
+              : "border-white/10 hover:border-white/20"
+          }`}
+          role="region"
+          aria-label="Drop files here or click to browse"
+        >
+          <CardContent className="flex flex-col items-center justify-center gap-3 p-6">
+            <Upload size={32} className="text-shell-text-tertiary" />
+            <div className="text-center">
+              <p className="text-sm text-shell-text-secondary">
+                Drag and drop files here
+              </p>
+              <p className="text-xs text-shell-text-tertiary mt-1">
+                {ACCEPTED_TYPES.join(", ")}
+              </p>
+            </div>
+            <div className="flex flex-wrap items-center justify-center gap-2">
+              <Button
+                variant="secondary"
+                size="sm"
+                onClick={() => fileInputRef.current?.click()}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" || e.key === " ") {
+                    e.preventDefault();
+                    fileInputRef.current?.click();
+                  }
+                }}
+              >
+                Browse
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                className="gap-1.5"
+                onClick={() => {
+                  setEmbedMessage(null);
+                  setEmbedFiles([]);
+                  setEmbedAgentPickerOpen(true);
+                }}
+              >
+                <Brain size={12} />
+                Embed files into an agent
+              </Button>
+            </div>
+            {embedMessage && !embedAgentPickerOpen && (
+              <p
+                role={embedMessage.kind === "error" ? "alert" : "status"}
+                className={`text-xs ${embedMessage.kind === "error" ? "text-red-400" : "text-emerald-400"}`}
+              >
+                {embedMessage.text}
+              </p>
+            )}
+            <input
+              ref={fileInputRef}
+              type="file"
+              multiple
+              accept={ACCEPTED_TYPES.join(",")}
+              onChange={handleFileInput}
+              className="hidden"
+              aria-label="Select files to import"
+            />
+            {uploading && (
+              <div className="w-full space-y-1.5">
+                <div className="flex items-center justify-between text-xs text-shell-text-secondary">
+                  <span>Uploading...</span>
+                  <span className="tabular-nums">{uploadProgress}%</span>
+                </div>
+                <div className="h-2 w-full rounded-full bg-white/5" role="progressbar" aria-valuenow={uploadProgress} aria-valuemin={0} aria-valuemax={100}>
+                  <div
+                    className="h-full rounded-full bg-accent transition-all"
+                    style={{ width: `${uploadProgress}%` }}
+                  />
+                </div>
+              </div>
+            )}
+          </CardContent>
+        </Card>
       </div>
 
       {/* Items */}
@@ -1008,7 +1436,7 @@ export function LibraryApp({ windowId: _windowId }: { windowId: string }) {
       </div>
     </main>
   ) : (() => {
-    const data = deriveMockStorageData(items);
+    const data = deriveMockStorageData(items, settings.storage_cap_bytes);
     const totalPct = Math.min(100, (data.total_bytes / data.cap_bytes) * 100);
     return (
       <main className="flex-1 flex flex-col overflow-hidden">
@@ -1103,6 +1531,259 @@ export function LibraryApp({ windowId: _windowId }: { windowId: string }) {
       </main>
     );
   })();
+
+  /* ---------------------------------------------------------------- */
+  /*  Settings View UI                                                  */
+  /* ---------------------------------------------------------------- */
+
+  const settingsViewUI = (
+    <main className="flex-1 flex flex-col overflow-hidden">
+      <div className="flex flex-col gap-2 px-4 py-3 border-b border-white/5 shrink-0">
+        <span className="text-xs font-medium">Library Settings</span>
+        <span className="text-[11px] text-shell-text-tertiary">(mock until #2060)</span>
+      </div>
+      <div className="flex-1 overflow-y-auto p-4 space-y-6">
+        {/* Preferred Quality */}
+        <section>
+          <p className="text-[10px] uppercase tracking-wider text-shell-text-tertiary mb-2">Preferred Quality</p>
+          <div className="space-y-1">
+            <label className="text-xs text-shell-text-secondary" htmlFor="preferred-quality">
+              Default download quality
+            </label>
+            <select
+              id="preferred-quality"
+              value={settings.preferred_quality}
+              onChange={(e) => {
+                const next = { ...settings, preferred_quality: e.target.value };
+                saveLibrarySettings(next);
+                setSettings(next);
+              }}
+              className="flex h-9 w-full rounded-lg border border-white/10 bg-shell-bg-deep px-3 text-sm text-shell-text focus-visible:outline-none focus-visible:border-accent/40"
+            >
+              {QUALITY_OPTIONS.map((q) => (
+                <option key={q} value={q}>{q}</option>
+              ))}
+            </select>
+          </div>
+        </section>
+
+        {/* Storage Cap */}
+        <section>
+          <p className="text-[10px] uppercase tracking-wider text-shell-text-tertiary mb-2">Storage Cap</p>
+          <div className="space-y-1">
+            <label className="text-xs text-shell-text-secondary" htmlFor="storage-cap">
+              Maximum storage (bytes)
+            </label>
+            <Input
+              id="storage-cap"
+              type="number"
+              value={settings.storage_cap_bytes}
+              onChange={(e) => {
+                const next = { ...settings, storage_cap_bytes: parseInt(e.target.value) || 0 };
+                saveLibrarySettings(next);
+                setSettings(next);
+              }}
+              className="text-xs"
+            />
+            <p className="text-[11px] text-shell-text-tertiary">
+              {fmtBytes(settings.storage_cap_bytes)}
+            </p>
+          </div>
+        </section>
+
+        {/* Per-source Rules */}
+        <section>
+          <p className="text-[10px] uppercase tracking-wider text-shell-text-tertiary mb-2">Per-source Rules</p>
+          {settings.source_rules.length > 0 ? (
+            <table className="w-full text-xs">
+              <thead>
+                <tr className="text-shell-text-tertiary border-b border-white/5">
+                  <th className="text-left pb-1.5 font-normal" scope="col">Source</th>
+                  <th className="text-left pb-1.5 font-normal" scope="col">Action</th>
+                  <th className="text-left pb-1.5 font-normal" scope="col">Quality</th>
+                  <th className="pb-1.5 w-8"></th>
+                </tr>
+              </thead>
+              <tbody>
+                {settings.source_rules.map((rule, idx) => (
+                  <tr key={`${rule.source}-${rule.action}-${rule.quality}-${idx}`} className="border-t border-white/5">
+                    <td className="py-1.5 pr-2 text-shell-text-secondary">{rule.source}</td>
+                    <td className="py-1.5 pr-2 text-shell-text-secondary">{rule.action}</td>
+                    <td className="py-1.5 pr-2 text-shell-text-secondary">{rule.quality}</td>
+                    <td className="py-1.5">
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        className="h-6 w-6 hover:text-red-400 hover:bg-red-500/15"
+                        onClick={() => handleDeleteSourceRule(idx)}
+                        aria-label={`Delete rule for ${rule.source}`}
+                      >
+                        <Trash2 size={11} />
+                      </Button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          ) : (
+            <p className="text-xs text-shell-text-tertiary italic">No source rules yet</p>
+          )}
+
+          {/* Add rule form */}
+          <div className="border-t border-white/5 pt-3 mt-3 space-y-2">
+            <p className="text-[10px] text-shell-text-tertiary uppercase tracking-wider">Add rule</p>
+            <div className="grid grid-cols-3 gap-2">
+              <div className="space-y-1">
+                <label className="text-[10px] text-shell-text-tertiary" htmlFor="rule-source">Source</label>
+                <select
+                  id="rule-source"
+                  value={newSourceRule.source}
+                  onChange={(e) => setNewSourceRule((prev) => ({ ...prev, source: e.target.value }))}
+                  className="flex h-7 w-full rounded-lg border border-white/10 bg-shell-bg-deep px-2 text-xs text-shell-text focus-visible:outline-none focus-visible:border-accent/40"
+                >
+                  <option value="">Select...</option>
+                  {SOURCE_TYPES.map((s) => (
+                    <option key={s} value={s}>{s}</option>
+                  ))}
+                </select>
+              </div>
+              <div className="space-y-1">
+                <label className="text-[10px] text-shell-text-tertiary" htmlFor="rule-action">Action</label>
+                <select
+                  id="rule-action"
+                  value={newSourceRule.action}
+                  onChange={(e) => setNewSourceRule((prev) => ({ ...prev, action: e.target.value as typeof prev.action }))}
+                  className="flex h-7 w-full rounded-lg border border-white/10 bg-shell-bg-deep px-2 text-xs text-shell-text focus-visible:outline-none focus-visible:border-accent/40"
+                >
+                  {ACTION_OPTIONS.map((a) => (
+                    <option key={a} value={a}>{a}</option>
+                  ))}
+                </select>
+              </div>
+              <div className="space-y-1">
+                <label className="text-[10px] text-shell-text-tertiary" htmlFor="rule-quality">Quality</label>
+                <select
+                  id="rule-quality"
+                  value={newSourceRule.quality}
+                  onChange={(e) => setNewSourceRule((prev) => ({ ...prev, quality: e.target.value as typeof prev.quality }))}
+                  className="flex h-7 w-full rounded-lg border border-white/10 bg-shell-bg-deep px-2 text-xs text-shell-text focus-visible:outline-none focus-visible:border-accent/40"
+                >
+                  {QUALITY_OPTIONS.map((q) => (
+                    <option key={q} value={q}>{q}</option>
+                  ))}
+                </select>
+              </div>
+            </div>
+            <Button
+              size="sm"
+              className="text-xs"
+              onClick={handleAddSourceRule}
+              disabled={!newSourceRule.source}
+              aria-label="Add source rule"
+            >
+              Add rule
+            </Button>
+          </div>
+        </section>
+      </div>
+    </main>
+  );
+
+  /* ------------------------------------------------------------------ */
+  /*  Queue View UI (ingest pipeline jobs)                               */
+  /* ------------------------------------------------------------------ */
+
+  const queuePolling = queueActive && jobs.some((j) => isJobActive(j.state));
+  const displayableJobs = jobs.filter((j) => isJobActiveOrFailed(j.state));
+
+  const queueViewUI = (
+    <main className="flex-1 flex flex-col overflow-hidden">
+      <div className="flex flex-col gap-2 px-4 py-3 border-b border-white/5 shrink-0">
+        <div className="flex items-center gap-2">
+          <span className="text-xs font-medium">Ingest Queue</span>
+        </div>
+        <div className="flex items-center gap-1.5 text-[11px] text-shell-text-tertiary">
+          {jobsUnavailable ? (
+            <>
+              <span className="w-2 h-2 rounded-full bg-red-500" aria-hidden="true" />
+              <span>Unavailable</span>
+            </>
+          ) : queuePolling ? (
+            <>
+              <span className="w-2 h-2 rounded-full bg-accent" aria-hidden="true" />
+              <span>Polling every 3s</span>
+            </>
+          ) : (
+            <>
+              <span className="w-2 h-2 rounded-full bg-shell-text-tertiary/50" aria-hidden="true" />
+              <span>Idle</span>
+            </>
+          )}
+        </div>
+      </div>
+      <div className="flex-1 overflow-y-auto p-3">
+        {jobsLoading ? (
+          <p className="text-xs text-shell-text-tertiary">Loading queue...</p>
+        ) : jobsUnavailable ? (
+          <div className="flex flex-col items-center justify-center h-full gap-3 text-shell-text-tertiary">
+            <AlertCircle size={36} className="opacity-30" />
+            <p className="text-sm">Queue unavailable</p>
+          </div>
+        ) : displayableJobs.length === 0 ? (
+          <div className="flex flex-col items-center justify-center h-full gap-3 text-shell-text-tertiary">
+            <Clock size={36} className="opacity-30" />
+            <p className="text-sm">No active or failed jobs</p>
+          </div>
+        ) : (
+          <table className="w-full text-xs">
+            <thead>
+              <tr className="text-shell-text-tertiary border-b border-white/5">
+                <th className="text-left pb-1.5 font-normal" scope="col">Stage</th>
+                <th className="text-left pb-1.5 font-normal" scope="col">Item</th>
+                <th className="text-left pb-1.5 font-normal" scope="col">State</th>
+                <th className="text-left pb-1.5 font-normal" scope="col">Error</th>
+                <th className="w-28 text-right pb-1.5 font-normal" scope="col">Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              {displayableJobs.map((job) => (
+                <tr key={job.id} className="border-t border-white/5">
+                  <td className="py-1.5 pr-2 text-shell-text-secondary font-mono">{job.stage || "—"}</td>
+                  <td className="py-1.5 pr-2 text-shell-text-tertiary truncate max-w-[140px]" title={job.item_id}>
+                    {job.item_id}
+                  </td>
+                  <td className="py-1.5 pr-2">
+                    <span
+                      className={`text-[10px] px-1.5 py-0.5 rounded border ${jobStateColor(job.state)}`}
+                    >
+                      {job.state}
+                    </span>
+                  </td>
+                  <td className="py-1.5 pr-2 text-shell-text-secondary break-words max-w-xs">
+                    {job.error || "—"}
+                  </td>
+                  <td className="py-1.5 text-right">
+                    {job.state === FAILED_JOB_STATE && (
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        className="text-xs gap-1 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/40"
+                        onClick={() => handleRetryJob(job.id)}
+                        aria-label={`Retry job ${job.id}`}
+                      >
+                        <RefreshCw size={11} />
+                        Retry
+                      </Button>
+                    )}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
+    </main>
+  );
 
   /* ---------------------------------------------------------------- */
   /*  Detail View UI                                                   */
@@ -1372,7 +2053,7 @@ export function LibraryApp({ windowId: _windowId }: { windowId: string }) {
       </div>
 
       {/* Action bar */}
-      <div className="border-t border-white/5 px-5 py-2.5 flex items-center gap-2 shrink-0">
+      <div data-testid="detail-action-bar" className="border-t border-white/5 px-5 py-2.5 flex items-center gap-2 shrink-0">
         {selectedItem.source_url && (
           <Button
             variant="outline"
@@ -1669,6 +2350,128 @@ export function LibraryApp({ windowId: _windowId }: { windowId: string }) {
   ) : null;
 
   /* ---------------------------------------------------------------- */
+  /*  Embed Agent Picker Modal                                         */
+  /* ---------------------------------------------------------------- */
+
+  const embedAgentPickerUI = embedAgentPickerOpen ? (
+    <div
+      className={
+        isMobile
+          ? "fixed inset-0 z-50 flex items-end bg-black/50 backdrop-blur-sm"
+          : "fixed inset-0 z-50 flex items-center justify-center bg-black/50"
+      }
+      role="dialog"
+      aria-modal="true"
+      aria-label="Embed file into agent"
+      onClick={(e) => {
+        if (e.target === e.currentTarget) {
+          closeEmbedPicker();
+        }
+      }}
+    >
+      <div
+        className="bg-shell-surface border border-white/10 shadow-2xl flex flex-col"
+        style={
+          isMobile
+            ? { borderRadius: "20px 20px 0 0", width: "100%", maxHeight: "92%", overflowY: "auto" }
+            : { borderRadius: 12, width: 420, maxWidth: "90vw", maxHeight: "80vh" }
+        }
+      >
+        {/* Dialog header */}
+        <div className="flex items-center justify-between px-5 py-4 border-b border-white/5">
+          <div className="flex items-center gap-2">
+            <Brain size={15} className="text-cyan-400" />
+            <h2 className="text-sm font-semibold">Embed into Agent</h2>
+          </div>
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={closeEmbedPicker}
+            aria-label="Close embed picker"
+            className="text-xs"
+          >
+            Close
+          </Button>
+        </div>
+
+        <div className="flex-1 overflow-y-auto p-5 space-y-4">
+          <div className="space-y-2">
+            <p className="text-xs text-shell-text-secondary">1. Choose the files to embed:</p>
+            <Button
+              variant="secondary"
+              size="sm"
+              onClick={() => embedFileInputRef.current?.click()}
+              disabled={embedding}
+            >
+              Choose files
+            </Button>
+            <input
+              ref={embedFileInputRef}
+              type="file"
+              multiple
+              accept={ACCEPTED_TYPES.join(",")}
+              onChange={(e) => {
+                if (e.target.files) {
+                  setEmbedFiles(Array.from(e.target.files));
+                  setEmbedMessage(null);
+                }
+                e.target.value = "";
+              }}
+              className="hidden"
+              aria-label="Select files to embed"
+            />
+            {embedFiles.length > 0 ? (
+              <ul className="text-xs text-shell-text-secondary space-y-0.5">
+                {embedFiles.map((f, i) => (
+                  <li key={`${f.name}-${i}`}>{f.name}</li>
+                ))}
+              </ul>
+            ) : (
+              <p className="text-xs text-shell-text-tertiary italic">No files chosen</p>
+            )}
+          </div>
+          <p className="text-xs text-shell-text-secondary">2. Select an agent to embed them into:</p>
+          {agents.length === 0 ? (
+            <p className="text-xs text-shell-text-tertiary italic">No agents available</p>
+          ) : (
+            <div className="space-y-1">
+              {agents.map((ag) => (
+                <button
+                  key={ag.name}
+                  className="w-full flex items-center gap-2 px-3 py-2 rounded-lg bg-white/[0.03] border border-white/5 hover:bg-white/5 hover:border-cyan-500/40 transition-colors text-left"
+                  onClick={() => handleEmbedConfirm(ag.name)}
+                  disabled={embedding || embedFiles.length === 0}
+                >
+                  <span
+                    className="w-2.5 h-2.5 rounded-full shrink-0"
+                    style={{ backgroundColor: ag.color }}
+                    aria-hidden="true"
+                  />
+                  <span className="text-xs font-medium">{ag.name}</span>
+                </button>
+              ))}
+            </div>
+          )}
+          {embedMessage && (
+            <p
+              role={embedMessage.kind === "error" ? "alert" : "status"}
+              className={`text-xs ${embedMessage.kind === "error" ? "text-red-400" : "text-emerald-400"}`}
+            >
+              {embedMessage.text}
+            </p>
+          )}
+          {embedding && (
+            <div className="flex items-center gap-2 text-xs text-cyan-400">
+              <div className="w-4 h-4 border-2 border-cyan-400 border-t-transparent rounded-full animate-spin" />
+              Embedding into agent...
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  ) : null;
+
+  /* ---------------------------------------------------------------- */
   /*  Root render                                                      */
   /* ---------------------------------------------------------------- */
 
@@ -1689,6 +2492,10 @@ export function LibraryApp({ windowId: _windowId }: { windowId: string }) {
               {!isMobile && sidebarUI}
               {listViewUI}
             </div>
+          ) : activeView === "settings" ? (
+            settingsViewUI
+          ) : activeView === "queue" ? (
+            queueViewUI
           ) : (
             storageViewUI
           )
@@ -1706,6 +2513,7 @@ export function LibraryApp({ windowId: _windowId }: { windowId: string }) {
         }
       />
       {categoryManagerUI}
+      {embedAgentPickerUI}
     </div>
   );
 }

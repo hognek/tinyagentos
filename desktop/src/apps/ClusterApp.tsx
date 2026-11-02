@@ -3,21 +3,33 @@ import { MobileSplitView } from "@/components/mobile/MobileSplitView";
 import {
   Network, RefreshCw, ExternalLink, Copy, Check, Trash2, Wand2,
   Cpu, MemoryStick, HardDrive, CircuitBoard, Zap, Server, Monitor,
-  X, Plus,
+  X, Plus, Shield, ShieldOff, LogOut, Bluetooth, Loader2,
+  SignalHigh, SignalMedium, SignalLow, SignalZero,
 } from "lucide-react";
-import { Button, Card, CardContent } from "@/components/ui";
-import type { ClusterWorker, WorkerStatus } from "@/lib/cluster";
+import { Button, Card, CardContent, Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui";
+import { ConfirmDialog } from "@/components/ConfirmDialog";
+import type { ClusterWorker, ClusterDevice, WorkerStatus, BleScanDevice, ClusterMap, ClusterResources } from "@/lib/cluster";
+import {
+  CapabilityMapList,
+  CapabilityMapDetail,
+  PlacementOverview,
+} from "./ClusterApp.capabilityMap";
+import { ClusterResourcesPanel } from "./ClusterApp.resources";
 import {
   workerStatus,
   workerHardwareSummary,
   workerShortIp,
   formatRelativeSeconds,
   normalizeBackendName,
+  bleSignalLevel,
   STATUS_PILL_CLASS,
   STATUS_LABEL,
 } from "@/lib/cluster";
+import { useRefreshOnFocus } from "@/hooks/use-refresh-on-focus";
+import { copyText } from "@/lib/clipboard";
 
 type SortKey = "name" | "status" | "last_seen";
+type Tab = "nodes" | "map" | "resources" | "devices";
 
 const STATUS_ORDER: Record<WorkerStatus, number> = {
   online: 0,
@@ -37,6 +49,28 @@ function StatusPill({ status }: { status: WorkerStatus }) {
   );
 }
 
+/** Small badge marking a node that was paired over Bluetooth and never runs jobs. */
+function DeviceBadge() {
+  return (
+    <span
+      className="text-[10px] px-1.5 py-0.5 rounded-full bg-white/[0.05] border border-white/10 text-shell-text-tertiary font-semibold"
+      aria-label="Device"
+      title="Paired device -- does not run jobs"
+    >
+      Device
+    </span>
+  );
+}
+
+function BleSignalIcon({ rssi }: { rssi?: number }) {
+  const level = bleSignalLevel(rssi);
+  const label = `Signal: ${level}`;
+  if (level === "strong") return <SignalHigh size={12} className="text-emerald-300" aria-label={label} />;
+  if (level === "medium") return <SignalMedium size={12} className="text-amber-300" aria-label={label} />;
+  if (level === "weak") return <SignalLow size={12} className="text-red-300" aria-label={label} />;
+  return <SignalZero size={12} className="text-shell-text-tertiary" aria-label={label} />;
+}
+
 function WorkerListCard({
   worker,
   selected,
@@ -47,6 +81,7 @@ function WorkerListCard({
   onSelect: () => void;
 }) {
   const status = workerStatus(worker);
+  const isDevice = worker.kind === "device";
   const backends = worker.backends ?? [];
   const capabilities = worker.capabilities ?? [];
   const activeSet = new Set(capabilities);
@@ -74,50 +109,159 @@ function WorkerListCard({
             {"\u00b7"} {workerShortIp(worker)}
           </span>
         </div>
-        <StatusPill status={status} />
+        <div className="flex items-center gap-1 shrink-0">
+          {isDevice && <DeviceBadge />}
+          <StatusPill status={status} />
+        </div>
+      </div>
+      {isDevice ? null : (
+        <>
+          <div className="text-[10px] text-shell-text-tertiary truncate">
+            {workerHardwareSummary(worker)}
+          </div>
+          <div className="mt-1.5 flex flex-wrap gap-1">
+            {backends.length === 0 ? (
+              <span className="text-[9px] text-shell-text-tertiary italic">No backends loaded</span>
+            ) : (
+              backends.slice(0, 4).map((b, i) => (
+                <span
+                  key={`${worker.name}-lb-${i}`}
+                  className="text-[9px] px-1.5 py-0.5 rounded-full bg-sky-500/15 text-sky-200 font-medium"
+                >
+                  {normalizeBackendName(b.name ?? b.type ?? "backend")}
+                </span>
+              ))
+            )}
+            {capabilities.slice(0, 4).map((c) => (
+              <span
+                key={`${worker.name}-lc-${c}`}
+                className="text-[9px] px-1.5 py-0.5 rounded-full bg-cyan-500/15 text-cyan-200 font-medium"
+                aria-label={`Current capability: ${c}`}
+              >
+                {c}
+              </span>
+            ))}
+            {latentCaps.slice(0, 3).map((c) => (
+              <span
+                key={`${worker.name}-lp-${c}`}
+                className="text-[9px] px-1.5 py-0.5 rounded-full bg-white/[0.03] border border-white/10 text-shell-text-tertiary font-medium"
+                aria-label={`Potential capability: ${c}`}
+                title="Hardware can support this — install a model with this capability to enable it"
+              >
+                {c}
+              </span>
+            ))}
+            {latentCaps.length > 3 && (
+              <span
+                className="text-[9px] px-1.5 py-0.5 rounded-full bg-white/[0.03] border border-white/10 text-shell-text-tertiary font-medium"
+                aria-label={`${latentCaps.length - 3} more potential capabilities`}
+              >
+                +{latentCaps.length - 3} more
+              </span>
+            )}
+          </div>
+        </>
+      )}
+    </button>
+  );
+}
+
+function DeviceListCard({
+  device,
+  selected,
+  onSelect,
+  onRevoke,
+  onBlock,
+  onUnblock,
+}: {
+  device: ClusterDevice;
+  selected: boolean;
+  onSelect: () => void;
+  onRevoke: (d: ClusterDevice) => void;
+  onBlock: (d: ClusterDevice) => void;
+  onUnblock: (d: ClusterDevice) => void;
+}) {
+  const live = device.live_token;
+  return (
+    <button
+      type="button"
+      onClick={onSelect}
+      aria-pressed={selected}
+      aria-label={`Select device ${device.display_name || device.device_id}`}
+      className={`w-full text-left p-2.5 rounded-lg border transition-colors ${
+        selected
+          ? "border-accent/50 bg-accent/10"
+          : "border-white/5 bg-white/[0.02] hover:bg-white/[0.04]"
+      }`}
+    >
+      <div className="flex items-center justify-between gap-2 mb-1">
+        <div className="flex items-center gap-1.5 min-w-0">
+          <span className="text-[12px] font-semibold text-shell-text truncate">
+            {device.display_name || device.device_id}
+          </span>
+          <span className="text-[10px] text-shell-text-tertiary">
+            {"\u00b7"} {device.platform}
+          </span>
+        </div>
+        <span
+          className={`text-[10px] px-1.5 py-0.5 rounded-full font-semibold border ${
+            live
+              ? "bg-emerald-500/15 text-emerald-300 border-emerald-500/25"
+              : "bg-red-500/15 text-red-300 border-red-500/25"
+          }`}
+          aria-label={live ? "Token live" : "Token dead"}
+        >
+          {live ? "live" : "dead"}
+        </span>
       </div>
       <div className="text-[10px] text-shell-text-tertiary truncate">
-        {workerHardwareSummary(worker)}
+        last seen {formatRelativeSeconds(device.last_seen || device.registered_at)}
       </div>
-      <div className="mt-1.5 flex flex-wrap gap-1">
-        {backends.length === 0 ? (
-          <span className="text-[9px] text-shell-text-tertiary italic">No backends loaded</span>
-        ) : (
-          backends.slice(0, 4).map((b, i) => (
-            <span
-              key={`${worker.name}-lb-${i}`}
-              className="text-[9px] px-1.5 py-0.5 rounded-full bg-sky-500/15 text-sky-200 font-medium"
-            >
-              {normalizeBackendName(b.name ?? b.type ?? "backend")}
-            </span>
-          ))
+      <div className="mt-1.5 flex gap-1">
+         {device.live_token && (
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={(e) => {
+              e.stopPropagation();
+              onRevoke(device);
+            }}
+            aria-label="Revoke device"
+            className="hover:bg-red-500/15 hover:text-red-300"
+            title="Sign this device out. Revoking cancels nothing already approved."
+          >
+            <LogOut size={13} />
+            Revoke
+          </Button>
         )}
-        {capabilities.slice(0, 4).map((c) => (
-          <span
-            key={`${worker.name}-lc-${c}`}
-            className="text-[9px] px-1.5 py-0.5 rounded-full bg-cyan-500/15 text-cyan-200 font-medium"
-            aria-label={`Current capability: ${c}`}
+        {device.blocked ? (
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={(e) => {
+              e.stopPropagation();
+              onUnblock(device);
+            }}
+            aria-label="Unblock device"
+            title="Allow this device to re-pair"
           >
-            {c}
-          </span>
-        ))}
-        {latentCaps.slice(0, 3).map((c) => (
-          <span
-            key={`${worker.name}-lp-${c}`}
-            className="text-[9px] px-1.5 py-0.5 rounded-full bg-white/[0.03] border border-white/10 text-shell-text-tertiary font-medium"
-            aria-label={`Potential capability: ${c}`}
-            title="Hardware can support this — install a model with this capability to enable it"
+            <ShieldOff size={13} />
+            Unblock
+          </Button>
+        ) : (
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={(e) => {
+              e.stopPropagation();
+              onBlock(device);
+            }}
+            aria-label="Block device"
+            title="Block this device. It stays signed out and cannot re-pair until unblocked."
           >
-            {c}
-          </span>
-        ))}
-        {latentCaps.length > 3 && (
-          <span
-            className="text-[9px] px-1.5 py-0.5 rounded-full bg-white/[0.03] border border-white/10 text-shell-text-tertiary font-medium"
-            aria-label={`${latentCaps.length - 3} more potential capabilities`}
-          >
-            +{latentCaps.length - 3} more
-          </span>
+            <Shield size={13} />
+            Block
+          </Button>
         )}
       </div>
     </button>
@@ -160,16 +304,23 @@ function WorkerDetail({
   onRefresh,
   onDeregister,
   onOptimise,
+  onNodeRevoke,
+  onNodeBlock,
+  onNodeUnblock,
   busy,
 }: {
   worker: ClusterWorker;
   onRefresh: () => void;
   onDeregister: (name: string) => Promise<void>;
   onOptimise: () => Promise<void>;
+  onNodeRevoke: (name: string) => Promise<void>;
+  onNodeBlock: (name: string) => Promise<void>;
+  onNodeUnblock: (name: string) => Promise<void>;
   busy: boolean;
 }) {
   const [copied, setCopied] = useState<"name" | "url" | null>(null);
   const status = workerStatus(worker);
+  const isDevice = worker.kind === "device";
   const hw = worker.hardware ?? {};
   const cpu = hw.cpu ?? {};
   const gpu = hw.gpu ?? {};
@@ -185,12 +336,10 @@ function WorkerDetail({
     : [];
 
   const copy = useCallback(async (kind: "name" | "url", value: string) => {
-    try {
-      await navigator.clipboard.writeText(value);
+    const ok = await copyText(value);
+    if (ok) {
       setCopied(kind);
       window.setTimeout(() => setCopied(null), 1200);
-    } catch {
-      /* no-op: clipboard may be unavailable */
     }
   }, []);
 
@@ -209,6 +358,7 @@ function WorkerDetail({
           <div className="flex items-center gap-2 flex-wrap">
             <h2 className="text-sm font-semibold text-shell-text">{worker.name}</h2>
             <StatusPill status={status} />
+            {isDevice && <DeviceBadge />}
             {worker.tier_id && (
               <span
                 className="text-[9px] px-1.5 py-0.5 rounded-full bg-white/[0.05] border border-white/10 text-shell-text-tertiary font-mono"
@@ -255,6 +405,8 @@ function WorkerDetail({
           </div>
         </Section>
 
+        {!isDevice && (
+        <>
         {/* GPU */}
         <Section title="GPU" icon={<CircuitBoard size={14} className="text-cyan-400" />}>
           {gpu.type && gpu.type !== "none" ? (
@@ -440,6 +592,8 @@ function WorkerDetail({
             </div>
           )}
         </Section>
+        </>
+        )}
 
         {/* Actions */}
         <Section title="Actions" icon={<Wand2 size={14} className="text-white/70" />}>
@@ -476,6 +630,8 @@ function WorkerDetail({
               {copied === "url" ? <Check size={13} /> : <Copy size={13} />}
               {copied === "url" ? "Copied" : "Copy URL"}
             </Button>
+            {!isDevice && (
+            <>
             <Button
               size="sm"
               variant="outline"
@@ -502,11 +658,54 @@ function WorkerDetail({
               variant="outline"
               disabled
               aria-label="Restart worker (coming soon)"
-              title="Coming soon \u2014 no backend endpoint yet"
+              title="Coming soon -- no backend endpoint yet"
             >
               <RefreshCw size={13} />
               Restart
             </Button>
+            </>
+            )}
+            {worker.blocked ? (
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() => onNodeUnblock(worker.name)}
+                disabled={busy}
+                aria-label={`Unblock node ${worker.name}`}
+                title="Clear the block. The old signing key stays dead; the node must re-pair."
+              >
+                <ShieldOff size={13} />
+                Unblock
+              </Button>
+            ) : (
+              <>
+                {worker.live_token !== false && (
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={() => onNodeRevoke(worker.name)}
+                    disabled={busy}
+                    className="hover:bg-red-500/15 hover:text-red-300"
+                    aria-label={`Revoke node ${worker.name}`}
+                    title="Revoke this node's signing key. The node is signed out; nothing already approved is cancelled."
+                  >
+                    <LogOut size={13} />
+                    Revoke
+                  </Button>
+                )}
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={() => onNodeBlock(worker.name)}
+                  disabled={busy}
+                  aria-label={`Block node ${worker.name}`}
+                  title="Block this node. It stays signed out and cannot re-pair until unblocked."
+                >
+                  <Shield size={13} />
+                  Block
+                </Button>
+              </>
+            )}
             <Button
               size="sm"
               variant="outline"
@@ -520,6 +719,123 @@ function WorkerDetail({
               Deregister
             </Button>
           </div>
+          <p className="text-[10px] text-shell-text-tertiary mt-2">
+            Revoking or blocking signs the node out -- it cannot authenticate
+            again. This cancels nothing already approved: in-flight tasks and
+            completed work are unaffected. Unblock (not re-pair) restores
+            pairing if the node was blocked.
+          </p>
+        </Section>
+      </div>
+    </div>
+  );
+}
+
+function DeviceDetail({
+  device,
+  onRevoke,
+  onBlock,
+  onUnblock,
+  busy,
+}: {
+  device: ClusterDevice;
+  onRevoke: (d: ClusterDevice) => void;
+  onBlock: (d: ClusterDevice) => Promise<void>;
+  onUnblock: (d: ClusterDevice) => Promise<void>;
+  busy: boolean;
+}) {
+  const status = device.live_token ? "online" : "offline";
+  return (
+    <div className="flex flex-col h-full min-h-0 overflow-hidden">
+      <div className="flex flex-wrap items-start justify-between gap-2 px-4 py-3 border-b border-white/5 shrink-0">
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center gap-2 flex-wrap">
+            <h2 className="text-sm font-semibold text-shell-text">
+              {device.display_name || device.device_id}
+            </h2>
+            <StatusPill status={status} />
+          </div>
+          <p className="text-[11px] text-shell-text-tertiary mt-0.5 break-all">
+            {device.platform}
+            {device.last_seen !== undefined
+              ? `  \u00b7  last seen ${formatRelativeSeconds(device.last_seen || device.registered_at)}`
+              : ""}
+          </p>
+        </div>
+      </div>
+      <div className="flex-1 overflow-y-auto p-4 space-y-3">
+        <Section title="Identity" icon={<Monitor size={14} className="text-emerald-400" />}>
+          <div className="grid grid-cols-2 md:grid-cols-3 gap-3">
+            <LabelValue label="Device ID" value={device.device_id} />
+            <LabelValue label="Platform" value={device.platform} />
+            <LabelValue
+              label="Token"
+              value={device.live_token ? "live" : "signed out"}
+            />
+            <LabelValue
+              label="Blocked"
+              value={device.blocked ? "yes" : "no"}
+            />
+            <LabelValue
+              label="Last seen"
+              value={formatRelativeSeconds(device.last_seen || device.registered_at)}
+            />
+            <LabelValue
+              label="Registered"
+              value={formatRelativeSeconds(device.registered_at)}
+            />
+          </div>
+        </Section>
+        <Section title="Actions" icon={<Wand2 size={14} className="text-white/70" />}>
+          <div className="flex flex-wrap gap-2">
+            {device.blocked ? (
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() => onUnblock(device)}
+                disabled={busy}
+                aria-label={`Unblock device ${device.device_id}`}
+                title="Clear the block. The old token stays dead; the device must re-pair."
+              >
+                <ShieldOff size={13} />
+                Unblock
+              </Button>
+            ) : (
+              <>
+                {device.live_token && (
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={() => onRevoke(device)}
+                    disabled={busy}
+                    className="hover:bg-red-500/15 hover:text-red-300"
+                    aria-label={`Revoke device ${device.device_id}`}
+                    title="Revoke this device's token. The device is signed out; nothing already approved is cancelled."
+                  >
+                    <LogOut size={13} />
+                    Revoke
+                  </Button>
+                )}
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={() => onBlock(device)}
+                  disabled={busy}
+                  aria-label={`Block device ${device.device_id}`}
+                  title="Block this device. It stays signed out and cannot re-pair until unblocked."
+                >
+                  <Shield size={13} />
+                  Block
+                </Button>
+              </>
+            )}
+          </div>
+          <p className="text-[10px] text-shell-text-tertiary mt-2">
+            Revoking or blocking signs the device out -- it cannot authenticate
+            again. This cancels nothing already approved: active sessions and
+            completed work are unaffected. A blocked device can re-pair once
+            unblocked; a revoked-only device can re-pair freely.
+          </p>
         </Section>
       </div>
     </div>
@@ -529,12 +845,36 @@ function WorkerDetail({
 export function ClusterApp({ windowId: _windowId }: { windowId: string }) {
   const [workers, setWorkers] = useState<ClusterWorker[]>([]);
   const [selected, setSelected] = useState<string | null>(null);
+  const [devices, setDevices] = useState<ClusterDevice[]>([]);
+  const [selectedDevice, setSelectedDevice] = useState<string | null>(null);
+  const [activeTab, setActiveTab] = useState<Tab>("nodes");
   const [sortKey, setSortKey] = useState<SortKey>("name");
   const [loading, setLoading] = useState(true);
+  const [devicesLoading, setDevicesLoading] = useState(false);
+  // #897: read-only capability map + live placement aggregate.
+  const [clusterMap, setClusterMap] = useState<ClusterMap | null>(null);
+  const [selectedCapability, setSelectedCapability] = useState<string | null>(null);
+  const [mapLoading, setMapLoading] = useState(false);
+  const [mapError, setMapError] = useState<string | null>(null);
+  // Agent offices S10: read-only resource inventory for the Resources tab.
+  const [clusterResources, setClusterResources] = useState<ClusterResources | null>(null);
+  const [resourcesLoading, setResourcesLoading] = useState(false);
+  const [resourcesError, setResourcesError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
+  const [confirmDialog, setConfirmDialog] = useState<{
+    title: string;
+    message: string;
+    onConfirm: () => void;
+  } | null>(null);
   // True after user explicitly hits "back"; suppresses auto-select on refresh.
   const userNavigatedBack = useRef(false);
+  // Monotonic id for the map fetch: tab activation, focus refresh and the
+  // manual refresh button can overlap, and an older response must not
+  // overwrite a newer map (or a newer error) with stale data.
+  const mapRequestId = useRef(0);
+  // Same guard for the resources fetch.
+  const resourcesRequestId = useRef(0);
 
   const showToast = useCallback((msg: string) => {
     setToast(msg);
@@ -566,6 +906,117 @@ export function ClusterApp({ windowId: _windowId }: { windowId: string }) {
     const interval = setInterval(fetchWorkers, 10_000);
     return () => clearInterval(interval);
   }, [fetchWorkers]);
+
+  const fetchDevices = useCallback(async () => {
+    setDevicesLoading(true);
+    try {
+      const res = await fetch("/api/devices", { headers: { Accept: "application/json" } });
+      if (res.ok) {
+        const json = await res.json();
+        if (Array.isArray(json.items)) {
+          setDevices(json.items as ClusterDevice[]);
+          setSelectedDevice((cur) => {
+            if (cur && json.items.some((d: ClusterDevice) => d.device_id === cur))
+              return cur;
+            return json.items.length > 0 ? json.items[0].device_id : null;
+          });
+        }
+      }
+    } catch {
+      /* ignore */
+    }
+    setDevicesLoading(false);
+  }, []);
+
+  const fetchMap = useCallback(async () => {
+    const requestId = ++mapRequestId.current;
+    setMapLoading(true);
+    try {
+      const res = await fetch("/api/cluster/map", { headers: { Accept: "application/json" } });
+      if (requestId !== mapRequestId.current) return; // superseded by a newer request
+      if (!res.ok) {
+        // Surface the failure instead of rendering it as "no capabilities":
+        // an empty map and a rejected request look identical otherwise.
+        setMapError(
+          res.status === 403
+            ? "Admin session required to view the cluster map."
+            : `Could not load the capability map (${res.status}).`,
+        );
+        return;
+      }
+      const json = (await res.json()) as ClusterMap;
+      if (requestId !== mapRequestId.current) return;
+      if (json && Array.isArray(json.nodes) && Array.isArray(json.capabilities)) {
+        setClusterMap(json);
+        setMapError(null);
+        setSelectedCapability((cur: string | null) =>
+          cur && json.capabilities.some((c) => c.capability === cur) ? cur : null,
+        );
+      } else {
+        // A 200 with an unusable body is a failure, not an empty cluster —
+        // otherwise a stale error would stay on screen next to a "success".
+        setMapError("Unexpected capability map response.");
+      }
+    } catch {
+      if (requestId !== mapRequestId.current) return;
+      setMapError("Could not load the capability map.");
+    } finally {
+      if (requestId === mapRequestId.current) setMapLoading(false);
+    }
+  }, []);
+
+  const fetchResources = useCallback(async () => {
+    const requestId = ++resourcesRequestId.current;
+    setResourcesLoading(true);
+    try {
+      const res = await fetch("/api/cluster/resources", { headers: { Accept: "application/json" } });
+      if (requestId !== resourcesRequestId.current) return; // superseded by a newer request
+      if (!res.ok) {
+        setResourcesError(
+          res.status === 403
+            ? "Admin session required to view cluster resources."
+            : `Could not load cluster resources (${res.status}).`,
+        );
+        return;
+      }
+      const json = (await res.json()) as ClusterResources;
+      if (requestId !== resourcesRequestId.current) return;
+      if (json && Array.isArray(json.resources) && Array.isArray(json.errors)) {
+        setClusterResources(json);
+        setResourcesError(null);
+      } else {
+        setResourcesError("Unexpected cluster resources response.");
+      }
+    } catch {
+      if (requestId !== resourcesRequestId.current) return;
+      setResourcesError("Could not load cluster resources.");
+    } finally {
+      if (requestId === resourcesRequestId.current) setResourcesLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (activeTab === "devices") {
+      fetchDevices();
+    } else if (activeTab === "map") {
+      fetchMap();
+    } else if (activeTab === "resources") {
+      fetchResources();
+    } else {
+      fetchWorkers();
+    }
+  }, [activeTab, fetchDevices, fetchMap, fetchResources, fetchWorkers]);
+
+  useRefreshOnFocus(
+    activeTab === "devices"
+      ? fetchDevices
+      : activeTab === "map"
+        ? fetchMap
+        : activeTab === "resources"
+          ? fetchResources
+          : fetchWorkers,
+    1000,
+  );
 
   const sortedWorkers = useMemo(() => {
     const list = [...workers];
@@ -672,47 +1123,464 @@ export function ClusterApp({ windowId: _windowId }: { windowId: string }) {
     setAddBusy(false);
   }, [addIp, addPin, showToast, fetchWorkers]);
 
+  // Bluetooth (BLE) pairing: scan for nearby taOSusb-style boards, then pair
+  // by matching a short code the controller and the board both display.
+  const [addTab, setAddTab] = useState<"manual" | "bluetooth">("manual");
+  const [bleDevices, setBleDevices] = useState<BleScanDevice[]>([]);
+  const [bleScanning, setBleScanning] = useState(false);
+  const [bleScanned, setBleScanned] = useState(false);
+  const [bleScanError, setBleScanError] = useState<"unavailable" | "error" | null>(null);
+  const [pairSession, setPairSession] = useState<{
+    session: string;
+    code: string;
+    board_id: string;
+    name: string;
+  } | null>(null);
+  const [pairStarting, setPairStarting] = useState(false);
+  const [pairConfirming, setPairConfirming] = useState(false);
+  const [pairError, setPairError] = useState<string | null>(null);
+  const [labelPin, setLabelPin] = useState("");
+  const [pinRequired, setPinRequired] = useState(false);
+  const pairCodeRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (pairSession && pairCodeRef.current) {
+      pairCodeRef.current.focus();
+    }
+  }, [pairSession]);
+
+  const handleBleScan = useCallback(async () => {
+    setBleScanning(true);
+    setBleScanError(null);
+    try {
+      const res = await fetch("/api/cluster/ble/scan?seconds=6", {
+        headers: { Accept: "application/json" },
+      });
+      if (res.status === 503) {
+        setBleScanError("unavailable");
+        setBleDevices([]);
+      } else if (res.ok) {
+        const json = await res.json();
+        setBleDevices(Array.isArray(json?.devices) ? (json.devices as BleScanDevice[]) : []);
+      } else {
+        setBleScanError("error");
+        setBleDevices([]);
+      }
+    } catch {
+      setBleScanError("error");
+      setBleDevices([]);
+    }
+    setBleScanned(true);
+    setBleScanning(false);
+  }, []);
+
+  const cancelBlePairSession = useCallback((session: string) => {
+    fetch("/api/cluster/ble/pair/cancel", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session }),
+    }).catch(() => {
+      /* fire and forget */
+    });
+  }, []);
+
+  const handleBlePairStart = useCallback(async (device: BleScanDevice) => {
+    setPairStarting(true);
+    setPairError(null);
+    try {
+      const res = await fetch("/api/cluster/ble/pair/start", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Accept: "application/json" },
+        body: JSON.stringify({ address: device.address }),
+      });
+      if (res.ok) {
+        const json = await res.json();
+        setLabelPin("");
+        setPairSession({
+          session: json.session,
+          code: json.code,
+          board_id: json.board_id,
+          name: json.name,
+        });
+        setPinRequired(json.pin_required ?? false);
+      } else if (res.status === 409) {
+        setPairError("This device isn't pairable right now. It may already be paired, or be pausing after failed attempts. Wait a minute and try again.");
+      } else if (res.status === 504) {
+        setPairError("The device stopped responding.");
+      } else if (res.status === 429) {
+        setPairError("Another pairing is in progress.");
+      } else {
+        const j = await res.json().catch(() => ({}));
+        setPairError(j?.error ? String(j.error) : `Pairing failed (${res.status})`);
+      }
+    } catch (e) {
+      setPairError(e instanceof Error ? e.message : "Network error");
+    }
+    setPairStarting(false);
+  }, []);
+
+  const handleBlePairConfirm = useCallback(async () => {
+    if (!pairSession) return;
+    setPairConfirming(true);
+    setPairError(null);
+    try {
+      const body = JSON.stringify({
+        session: pairSession.session,
+        ...(labelPin.trim() ? { label_pin: labelPin.trim() } : {}),
+      });
+      const res = await fetch("/api/cluster/ble/pair/confirm", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Accept: "application/json" },
+        body,
+      });
+      if (res.ok) {
+        const json = await res.json();
+        showToast(`Device "${json?.node?.name ?? pairSession.name}" paired`);
+        setPairSession(null);
+        setLabelPin("");
+        setPinRequired(false);
+        setAddOpen(false);
+        setBleDevices([]);
+        setBleScanned(false);
+        fetchWorkers();
+      } else if (res.status === 404) {
+        setPairError("Pairing timed out, start again.");
+      } else if (res.status === 502) {
+        const j = await res.json().catch(() => ({}));
+        setPairError(j?.why ? String(j.why) : "The device rejected pairing.");
+      } else if (res.status === 400) {
+        const j = await res.json().catch(() => ({}));
+        if (j.error === "label_pin_required") {
+          setPairError("This board needs the PIN from its label.");
+        } else if (j.error === "invalid_label_pin") {
+          setPairError("The label PIN is 4 to 12 digits.");
+        } else {
+          setPairError(j?.error ? String(j.error) : `Confirm failed (${res.status})`);
+        }
+      } else {
+        const j = await res.json().catch(() => ({}));
+        setPairError(j?.error ? String(j.error) : `Confirm failed (${res.status})`);
+      }
+    } catch (e) {
+      setPairError(e instanceof Error ? e.message : "Network error");
+    }
+    setPairConfirming(false);
+  }, [pairSession, labelPin, showToast, fetchWorkers]);
+
+  const handleBlePairCancel = useCallback(() => {
+    if (pairSession) cancelBlePairSession(pairSession.session);
+    setPairSession(null);
+    setLabelPin("");
+    setPinRequired(false);
+    setPairError(null);
+  }, [pairSession, cancelBlePairSession]);
+
+  const closeAddModal = useCallback(() => {
+    if (addBusy || pairStarting || pairConfirming) return;
+    if (pairSession) cancelBlePairSession(pairSession.session);
+    setAddOpen(false);
+    setAddTab("manual");
+    setPairSession(null);
+    setLabelPin("");
+    setPinRequired(false);
+    setPairError(null);
+  }, [addBusy, pairStarting, pairConfirming, pairSession, cancelBlePairSession]);
+
+  const handleNodeRevoke = useCallback(
+    async (name: string) => {
+      setBusy(true);
+      try {
+        const res = await fetch(`/api/cluster/workers/${encodeURIComponent(name)}/revoke`, {
+          method: "POST",
+        });
+        if (res.ok) {
+          showToast(`Node "${name}" revoked`);
+          fetchWorkers();
+        } else {
+          const j = await res.json().catch(() => ({}));
+          showToast(j.error ? `Revoke failed: ${j.error}` : `Revoke failed (${res.status})`);
+        }
+      } catch (e) {
+        showToast(e instanceof Error ? e.message : "Network error");
+      }
+      setBusy(false);
+    },
+    [fetchWorkers, showToast],
+  );
+
+  const handleNodeBlock = useCallback(
+    async (name: string) => {
+      setBusy(true);
+      try {
+        const res = await fetch(`/api/cluster/workers/${encodeURIComponent(name)}/block`, {
+          method: "POST",
+        });
+        if (res.ok) {
+          showToast(`Node "${name}" blocked`);
+          fetchWorkers();
+        } else {
+          const j = await res.json().catch(() => ({}));
+          showToast(j.error ? `Block failed: ${j.error}` : `Block failed (${res.status})`);
+        }
+      } catch (e) {
+        showToast(e instanceof Error ? e.message : "Network error");
+      }
+      setBusy(false);
+    },
+    [fetchWorkers, showToast],
+  );
+
+  const handleNodeUnblock = useCallback(
+    async (name: string) => {
+      setBusy(true);
+      try {
+        const res = await fetch(`/api/cluster/workers/${encodeURIComponent(name)}/unblock`, {
+          method: "POST",
+        });
+        if (res.ok) {
+          showToast(`Node "${name}" unblocked`);
+          fetchWorkers();
+        } else {
+          const j = await res.json().catch(() => ({}));
+          showToast(j.error ? `Unblock failed: ${j.error}` : `Unblock failed (${res.status})`);
+        }
+      } catch (e) {
+        showToast(e instanceof Error ? e.message : "Network error");
+      }
+      setBusy(false);
+    },
+    [fetchWorkers, showToast],
+  );
+
+  const handleDeviceRevoke = useCallback(
+    (device: ClusterDevice) => {
+      setConfirmDialog({
+        title: `Revoke ${device.display_name || device.device_id}?`,
+        message: "This signs the device out. Nothing already approved is cancelled.",
+        onConfirm: async () => {
+          setBusy(true);
+          try {
+            const res = await fetch(
+              `/api/devices/${encodeURIComponent(device.device_id)}`,
+              { method: "DELETE" },
+            );
+            if (res.ok) {
+              showToast("Device revoked");
+              fetchDevices();
+            } else {
+              const j = await res.json().catch(() => ({}));
+              showToast(j.error ? `Revoke failed: ${j.error}` : `Revoke failed (${res.status})`);
+            }
+          } catch (e) {
+            showToast(e instanceof Error ? e.message : "Network error");
+          }
+          setBusy(false);
+          setConfirmDialog(null);
+        },
+      });
+    },
+    [fetchDevices, showToast],
+  );
+
+  const handleDeviceBlock = useCallback(
+    async (device: ClusterDevice) => {
+      setBusy(true);
+      try {
+        const res = await fetch(
+          `/api/devices/${encodeURIComponent(device.device_id)}/block`,
+          { method: "POST" },
+        );
+        if (res.ok) {
+          showToast("Device blocked");
+          fetchDevices();
+        } else {
+          const j = await res.json().catch(() => ({}));
+          showToast(j.error ? `Block failed: ${j.error}` : `Block failed (${res.status})`);
+        }
+      } catch (e) {
+        showToast(e instanceof Error ? e.message : "Network error");
+      }
+      setBusy(false);
+    },
+    [fetchDevices, showToast],
+  );
+
+  const handleDeviceUnblock = useCallback(
+    async (device: ClusterDevice) => {
+      setBusy(true);
+      try {
+        const res = await fetch(
+          `/api/devices/${encodeURIComponent(device.device_id)}/unblock`,
+          { method: "POST" },
+        );
+        if (res.ok) {
+          showToast("Device unblocked");
+          fetchDevices();
+        } else {
+          const j = await res.json().catch(() => ({}));
+          showToast(j.error ? `Unblock failed: ${j.error}` : `Unblock failed (${res.status})`);
+        }
+      } catch (e) {
+        showToast(e instanceof Error ? e.message : "Network error");
+      }
+      setBusy(false);
+    },
+    [fetchDevices, showToast],
+  );
+
   return (
     <div className="flex flex-col h-full min-h-0 overflow-hidden bg-shell-bg text-shell-text select-none">
-      {/* Toolbar */}
+       {/* Toolbar */}
       <div className="flex items-center justify-between gap-2 px-4 py-3 border-b border-white/5 shrink-0">
         <div className="flex items-center gap-2 min-w-0">
           <Network size={18} className="text-accent shrink-0" />
           <h1 className="text-sm font-semibold shrink-0">Cluster</h1>
-          <span className="text-xs text-shell-text-tertiary truncate">
-            {workers.length} worker{workers.length === 1 ? "" : "s"}
-          </span>
+          <div className="flex items-center gap-0.5 text-xs bg-white/[0.04] rounded-md border border-white/10 p-0.5">
+            <button
+              type="button"
+              onClick={() => {
+                setActiveTab("nodes");
+                setSelected(null);
+                setSelectedDevice(null);
+              }}
+              className={`px-2 py-1 rounded text-xs font-medium transition-colors ${
+                activeTab === "nodes"
+                  ? "bg-accent text-white"
+                  : "text-shell-text-tertiary hover:text-shell-text hover:bg-white/[0.06]"
+              }`}
+              aria-label="Show nodes"
+            >
+              Nodes
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setActiveTab("map");
+                setSelected(null);
+                setSelectedDevice(null);
+              }}
+              className={`px-2 py-1 rounded text-xs font-medium transition-colors ${
+                activeTab === "map"
+                  ? "bg-accent text-white"
+                  : "text-shell-text-tertiary hover:text-shell-text hover:bg-white/[0.06]"
+              }`}
+              aria-label="Show capability map"
+            >
+              Map
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={activeTab === "resources"}
+              aria-controls="cluster-resources-panel"
+              onClick={() => {
+                setActiveTab("resources");
+                setSelected(null);
+                setSelectedDevice(null);
+              }}
+              className={`px-2 py-1 rounded text-xs font-medium transition-colors ${
+                activeTab === "resources"
+                  ? "bg-accent text-white"
+                  : "text-shell-text-tertiary hover:text-shell-text hover:bg-white/[0.06]"
+              }`}
+              aria-label="Show cluster resources"
+            >
+              Resources
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setActiveTab("devices");
+                setSelected(null);
+                setSelectedDevice(null);
+              }}
+              className={`px-2 py-1 rounded text-xs font-medium transition-colors ${
+                activeTab === "devices"
+                  ? "bg-accent text-white"
+                  : "text-shell-text-tertiary hover:text-shell-text hover:bg-white/[0.06]"
+              }`}
+              aria-label="Show devices"
+            >
+              Devices
+            </button>
+          </div>
+          {activeTab === "nodes" && (
+            <span className="text-xs text-shell-text-tertiary truncate">
+              {workers.length} worker{workers.length === 1 ? "" : "s"}
+            </span>
+          )}
+          {activeTab === "devices" && (
+            <span className="text-xs text-shell-text-tertiary truncate">
+              {devices.length} device{devices.length === 1 ? "" : "s"}
+            </span>
+          )}
+          {activeTab === "resources" && (
+            <span className="text-xs text-shell-text-tertiary truncate">
+              {clusterResources?.resources.length ?? 0} resource
+              {(clusterResources?.resources.length ?? 0) === 1 ? "" : "s"}
+            </span>
+          )}
+          {activeTab === "map" && (
+            <span className="text-xs text-shell-text-tertiary truncate">
+              {clusterMap?.capabilities.length ?? 0}{" "}
+              {(clusterMap?.capabilities.length ?? 0) === 1 ? "capability" : "capabilities"} across{" "}
+              {clusterMap?.nodes.length ?? 0} node
+              {(clusterMap?.nodes.length ?? 0) === 1 ? "" : "s"}
+            </span>
+          )}
         </div>
         <div className="flex items-center gap-1.5 shrink-0">
-          <Button
-            variant="ghost"
-            size="sm"
-            onClick={() => setAddOpen(true)}
-            aria-label="Add a worker"
-            className="gap-1.5"
-          >
-            <Plus size={14} />
-            Add worker
-          </Button>
-          <label htmlFor="cluster-sort" className="sr-only">
-            Sort by
-          </label>
-          <select
-            id="cluster-sort"
-            value={sortKey}
-            onChange={(e) => setSortKey(e.target.value as SortKey)}
-            className="h-8 rounded-md border border-white/10 bg-shell-bg-deep px-2 text-xs text-shell-text focus-visible:outline-none focus-visible:border-accent/40 focus-visible:ring-2 focus-visible:ring-accent/20 transition-colors"
-            aria-label="Sort workers"
-          >
-            <option value="name">Name</option>
-            <option value="status">Status</option>
-            <option value="last_seen">Last seen</option>
-          </select>
+          {activeTab === "nodes" && (
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => setAddOpen(true)}
+              aria-label="Add a device"
+              className="gap-1.5"
+            >
+              <Plus size={14} />
+              Add device
+            </Button>
+          )}
+          {activeTab === "nodes" && (
+            <>
+              <label htmlFor="cluster-sort" className="sr-only">
+                Sort by
+              </label>
+              <select
+                id="cluster-sort"
+                value={sortKey}
+                onChange={(e) => setSortKey(e.target.value as SortKey)}
+                className="h-8 rounded-md border border-white/10 bg-shell-bg-deep px-2 text-xs text-shell-text focus-visible:outline-none focus-visible:border-accent/40 focus-visible:ring-2 focus-visible:ring-accent/20 transition-colors"
+                aria-label="Sort workers"
+              >
+                <option value="name">Name</option>
+                <option value="status">Status</option>
+                <option value="last_seen">Last seen</option>
+              </select>
+            </>
+          )}
           <Button
             variant="ghost"
             size="icon"
-            onClick={fetchWorkers}
-            aria-label="Refresh worker list"
+            onClick={
+              activeTab === "devices"
+                ? fetchDevices
+                : activeTab === "map"
+                  ? fetchMap
+                  : activeTab === "resources"
+                    ? fetchResources
+                    : fetchWorkers
+            }
+            aria-label={
+              activeTab === "devices"
+                ? "Refresh device list"
+                : activeTab === "map"
+                  ? "Refresh capability map"
+                  : activeTab === "resources"
+                    ? "Refresh cluster resources"
+                    : "Refresh worker list"
+            }
           >
             <RefreshCw size={14} />
           </Button>
@@ -721,60 +1589,165 @@ export function ClusterApp({ windowId: _windowId }: { windowId: string }) {
 
       {/* Master-detail */}
       <div className="flex-1 min-h-0 overflow-hidden">
+        {activeTab === "resources" ? (
+          <div
+            id="cluster-resources-panel"
+            role="tabpanel"
+            aria-label="Cluster resources"
+            className="h-full overflow-y-auto"
+          >
+            <ClusterResourcesPanel
+              data={clusterResources}
+              loading={resourcesLoading}
+              error={resourcesError}
+            />
+          </div>
+        ) : (
         <MobileSplitView
-          listTitle="Cluster"
-          detailTitle={selectedWorker?.name ?? ""}
+          listTitle={
+            activeTab === "devices"
+              ? "Cluster devices"
+              : activeTab === "map"
+                ? "Capabilities"
+                : "Cluster"
+          }
+          detailTitle={
+            activeTab === "devices"
+              ? selectedDevice ?? ""
+              : activeTab === "map"
+                ? selectedCapability ?? "Placement"
+                : selectedWorker?.name ?? ""
+          }
           listWidth={288}
-          selectedId={selected}
-          onBack={() => { userNavigatedBack.current = true; setSelected(null); }}
+          selectedId={
+            activeTab === "devices"
+              ? selectedDevice
+              : activeTab === "map"
+                ? selectedCapability
+                : selected
+          }
+          onBack={() => {
+            userNavigatedBack.current = true;
+            if (activeTab === "devices") setSelectedDevice(null);
+            else if (activeTab === "map") setSelectedCapability(null);
+            else setSelected(null);
+          }}
           list={
-            <div className="p-3 space-y-2" aria-label="Cluster worker list">
-              {loading ? (
-                <div className="text-[11px] text-shell-text-tertiary px-2 py-6 text-center">
-                  Loading workers...
-                </div>
-              ) : sortedWorkers.length === 0 ? (
-                <div className="flex flex-col items-center gap-2 py-6 text-center">
-                  <p className="text-[11px] text-shell-text-tertiary">No workers registered yet.</p>
-                  <Button
-                    variant="secondary"
-                    size="sm"
-                    onClick={() => setAddOpen(true)}
-                    className="gap-1.5"
-                    aria-label="Add a worker"
-                  >
-                    <Plus size={14} />
-                    Add worker
-                  </Button>
-                  <a
-                    href="https://github.com/jaylfc/tinyagentos#distributed-compute-cluster"
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="text-[10px] text-shell-text-tertiary hover:text-shell-text-secondary underline underline-offset-2"
-                    aria-label="How to add a worker (opens docs in new tab)"
-                  >
-                    or read the docs
-                  </a>
-                </div>
-              ) : (
-                sortedWorkers.map((w) => (
-                  <WorkerListCard
-                    key={w.name}
-                    worker={w}
-                    selected={selected === w.name}
-                    onSelect={() => { userNavigatedBack.current = false; setSelected(w.name); }}
-                  />
-                ))
-              )}
-            </div>
+            activeTab === "devices" ? (
+              <div className="p-3 space-y-2" aria-label="Cluster device list">
+                {devicesLoading ? (
+                  <div className="text-[11px] text-shell-text-tertiary px-2 py-6 text-center">
+                    Loading devices...
+                  </div>
+                ) : devices.length === 0 ? (
+                  <div className="flex flex-col items-center gap-2 py-6 text-center">
+                    <p className="text-[11px] text-shell-text-tertiary">No devices paired yet.</p>
+                  </div>
+                ) : (
+                  devices
+                    .slice()
+                    .sort((a, b) => (a.display_name || a.device_id).localeCompare(b.display_name || b.device_id))
+                    .map((d) => (
+                      <DeviceListCard
+                        key={d.device_id}
+                        device={d}
+                        selected={selectedDevice === d.device_id}
+                        onSelect={() => {
+                          userNavigatedBack.current = false;
+                          setSelectedDevice(d.device_id);
+                        }}
+                        onRevoke={handleDeviceRevoke}
+                        onBlock={handleDeviceBlock}
+                        onUnblock={handleDeviceUnblock}
+                      />
+                    ))
+                )}
+              </div>
+            ) : activeTab === "map" ? (
+              <div className="p-3 space-y-2" aria-label="Cluster capability map">
+                <CapabilityMapList
+                  map={clusterMap}
+                  selected={selectedCapability}
+                  onSelect={(capability) => {
+                    userNavigatedBack.current = false;
+                    setSelectedCapability(capability);
+                  }}
+                  loading={mapLoading}
+                  error={mapError}
+                />
+              </div>
+            ) : (
+              <div className="p-3 space-y-2" aria-label="Cluster worker list">
+                {loading ? (
+                  <div className="text-[11px] text-shell-text-tertiary px-2 py-6 text-center">
+                    Loading workers...
+                  </div>
+                ) : sortedWorkers.length === 0 ? (
+                  <div className="flex flex-col items-center gap-2 py-6 text-center">
+                    <p className="text-[11px] text-shell-text-tertiary">No workers registered yet.</p>
+                    <Button
+                      variant="secondary"
+                      size="sm"
+                      onClick={() => setAddOpen(true)}
+                      className="gap-1.5"
+                      aria-label="Add a device"
+                    >
+                      <Plus size={14} />
+                      Add device
+                    </Button>
+                    <a
+                      href="https://github.com/jaylfc/tinyagentos#distributed-compute-cluster"
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="text-[10px] text-shell-text-tertiary hover:text-shell-text-secondary underline underline-offset-2"
+                      aria-label="How to add a worker (opens docs in new tab)"
+                    >
+                      or read the docs
+                    </a>
+                  </div>
+                ) : (
+                  sortedWorkers.map((w) => (
+                    <WorkerListCard
+                      key={w.name}
+                      worker={w}
+                      selected={selected === w.name}
+                      onSelect={() => { userNavigatedBack.current = false; setSelected(w.name); }}
+                    />
+                  ))
+                )}
+              </div>
+            )
           }
           detail={
-            selectedWorker ? (
+            activeTab === "devices" ? (
+              selectedDevice ? (
+                <DeviceDetail
+                  device={devices.find((d) => d.device_id === selectedDevice) as ClusterDevice}
+                  onRevoke={handleDeviceRevoke}
+                  onBlock={handleDeviceBlock}
+                  onUnblock={handleDeviceUnblock}
+                  busy={busy}
+                />
+              ) : (
+                <div className="flex items-center justify-center h-full text-shell-text-tertiary text-sm">
+                  {devicesLoading ? "Loading..." : "No device selected"}
+                </div>
+              )
+            ) : activeTab === "map" ? (
+              selectedCapability ? (
+                <CapabilityMapDetail map={clusterMap} capability={selectedCapability} />
+              ) : (
+                <PlacementOverview map={clusterMap} />
+              )
+            ) : selectedWorker ? (
               <WorkerDetail
                 worker={selectedWorker}
                 onRefresh={fetchWorkers}
                 onDeregister={handleDeregister}
                 onOptimise={handleOptimise}
+                onNodeRevoke={handleNodeRevoke}
+                onNodeBlock={handleNodeBlock}
+                onNodeUnblock={handleNodeUnblock}
                 busy={busy}
               />
             ) : (
@@ -784,65 +1757,240 @@ export function ClusterApp({ windowId: _windowId }: { windowId: string }) {
             )
           }
         />
+        )}
       </div>
 
-      {/* Add worker (manual / free-tier) modal */}
+      {/* Add device modal (manual worker pairing / free-tier, or Bluetooth) */}
       {addOpen && (
         <div
           className="absolute inset-0 z-50 flex items-center justify-center bg-black/50 p-4"
           role="dialog"
           aria-modal="true"
-          aria-label="Add a worker"
-          onClick={() => !addBusy && setAddOpen(false)}
+          aria-label="Add a device"
+          onClick={closeAddModal}
         >
           <div
             className="w-full max-w-sm rounded-xl border border-white/10 bg-shell-bg-deep p-5 shadow-2xl"
             onClick={(e) => e.stopPropagation()}
           >
             <div className="flex items-center justify-between mb-3">
-              <h3 className="text-sm font-semibold text-shell-text">Add a worker</h3>
-              <Button variant="ghost" size="icon" onClick={() => setAddOpen(false)} aria-label="Close">
+              <h3 className="text-sm font-semibold text-shell-text">Add a device</h3>
+              <Button variant="ghost" size="icon" onClick={closeAddModal} aria-label="Close">
                 <X size={14} />
               </Button>
             </div>
-            <p className="text-[11px] text-shell-text-tertiary mb-3 leading-relaxed">
-              Install the worker on the other machine. It shows a PIN. Enter that machine's
-              IP and the PIN below, then it joins the cluster. For one-tap setup from anywhere,
-              taOSgo handles this automatically.
-            </p>
-            <label className="block text-[10px] uppercase tracking-wide text-shell-text-tertiary mb-1" htmlFor="add-worker-ip">
-              Worker IP address
-            </label>
-            <input
-              id="add-worker-ip"
-              value={addIp}
-              onChange={(e) => setAddIp(e.target.value)}
-              placeholder="192.168.1.50"
-              autoComplete="off"
-              className="w-full h-9 mb-3 rounded-md border border-white/10 bg-shell-bg px-2.5 text-sm text-shell-text focus-visible:outline-none focus-visible:border-accent/40 focus-visible:ring-2 focus-visible:ring-accent/20"
-            />
-            <label className="block text-[10px] uppercase tracking-wide text-shell-text-tertiary mb-1" htmlFor="add-worker-pin">
-              Pairing PIN
-            </label>
-            <input
-              id="add-worker-pin"
-              value={addPin}
-              onChange={(e) => setAddPin(e.target.value)}
-              placeholder="shown on the worker"
-              autoComplete="off"
-              onKeyDown={(e) => { if (e.key === "Enter") submitAddWorker(); }}
-              className="w-full h-9 mb-4 rounded-md border border-white/10 bg-shell-bg px-2.5 text-sm font-mono tracking-widest text-shell-text focus-visible:outline-none focus-visible:border-accent/40 focus-visible:ring-2 focus-visible:ring-accent/20"
-            />
-            <div className="flex justify-end gap-2">
-              <Button variant="ghost" size="sm" onClick={() => setAddOpen(false)} disabled={addBusy}>
-                Cancel
-              </Button>
-              <Button variant="default" size="sm" onClick={submitAddWorker} disabled={addBusy}>
-                {addBusy ? "Authorising..." : "Add worker"}
-              </Button>
-            </div>
+
+            <Tabs value={addTab} onValueChange={(v) => setAddTab(v as "manual" | "bluetooth")}>
+              <TabsList aria-label="Add device method" className="mb-3 w-full">
+                <TabsTrigger value="manual" className="flex-1">
+                  Worker (address + PIN)
+                </TabsTrigger>
+                <TabsTrigger value="bluetooth" className="flex-1">
+                  Bluetooth
+                </TabsTrigger>
+              </TabsList>
+
+              <TabsContent value="manual">
+                <p className="text-[11px] text-shell-text-tertiary mb-3 leading-relaxed">
+                  Install the worker on the other machine. It shows a PIN. Enter that machine's
+                  IP and the PIN below, then it joins the cluster. For one-tap setup from anywhere,
+                  taOSgo handles this automatically.
+                </p>
+                <label className="block text-[10px] uppercase tracking-wide text-shell-text-tertiary mb-1" htmlFor="add-worker-ip">
+                  Worker IP address
+                </label>
+                <input
+                  id="add-worker-ip"
+                  value={addIp}
+                  onChange={(e) => setAddIp(e.target.value)}
+                  placeholder="192.168.1.50"
+                  autoComplete="off"
+                  className="w-full h-9 mb-3 rounded-md border border-white/10 bg-shell-bg px-2.5 text-sm text-shell-text focus-visible:outline-none focus-visible:border-accent/40 focus-visible:ring-2 focus-visible:ring-accent/20"
+                />
+                <label className="block text-[10px] uppercase tracking-wide text-shell-text-tertiary mb-1" htmlFor="add-worker-pin">
+                  Pairing PIN
+                </label>
+                <input
+                  id="add-worker-pin"
+                  value={addPin}
+                  onChange={(e) => setAddPin(e.target.value)}
+                  placeholder="shown on the worker"
+                  autoComplete="off"
+                  onKeyDown={(e) => { if (e.key === "Enter") submitAddWorker(); }}
+                  className="w-full h-9 mb-4 rounded-md border border-white/10 bg-shell-bg px-2.5 text-sm font-mono tracking-widest text-shell-text focus-visible:outline-none focus-visible:border-accent/40 focus-visible:ring-2 focus-visible:ring-accent/20"
+                />
+                <div className="flex justify-end gap-2">
+                  <Button variant="ghost" size="sm" onClick={closeAddModal} disabled={addBusy}>
+                    Cancel
+                  </Button>
+                  <Button variant="default" size="sm" onClick={submitAddWorker} disabled={addBusy}>
+                    {addBusy ? "Authorising..." : "Add worker"}
+                  </Button>
+                </div>
+              </TabsContent>
+
+              <TabsContent value="bluetooth">
+                {pairSession ? (
+                  <div>
+                    <p className="text-[11px] text-shell-text-tertiary mb-2">
+                      Pairing with {pairSession.name}. If the device has a screen, check it
+                      shows the same code.
+                    </p>
+                    <div
+                      ref={pairCodeRef}
+                      tabIndex={-1}
+                      aria-label={`Pairing code ${pairSession.code.split("").join(" ")}`}
+                      className="py-3 text-center outline-none"
+                    >
+                      <span
+                        aria-hidden="true"
+                        className="text-3xl font-mono font-bold tracking-[0.2em] text-shell-text"
+                      >
+                        {pairSession.code.slice(0, 3)} {pairSession.code.slice(3)}
+                      </span>
+                    </div>
+                    <div className="mb-3">
+                      <label className="block text-[10px] text-shell-text-tertiary mb-1" htmlFor="label-pin">
+                        Label PIN
+                      </label>
+                      <input
+                        id="label-pin"
+                        data-testid="label-pin-input"
+                        type="text"
+                        inputMode="numeric"
+                        autoComplete="off"
+                        value={labelPin}
+                        onChange={(e) => setLabelPin(e.target.value)}
+                        aria-describedby="label-pin-help"
+                        aria-required={pinRequired}
+                        aria-label="Label PIN"
+                        role="textbox"
+                        className="w-full h-9 mb-1 rounded-md border border-white/10 bg-shell-bg px-2.5 text-sm text-shell-text focus-visible:outline-none focus-visible:border-accent/40 focus-visible:ring-2 focus-visible:ring-accent/20"
+                      />
+                      <p id="label-pin-help" className="text-[10px] text-shell-text-tertiary">
+                        The PIN printed on the board's label. Leave empty if your board has no label.
+                      </p>
+                    </div>
+                    {pairError && (
+                      <p className="text-[11px] text-red-300 mt-1" role="alert">
+                        {pairError}
+                      </p>
+                    )}
+                    <div className="flex justify-end gap-2 mt-3">
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        onClick={handleBlePairCancel}
+                        disabled={pairConfirming}
+                      >
+                        Cancel
+                      </Button>
+                      <Button
+                        variant="default"
+                        size="sm"
+                        onClick={handleBlePairConfirm}
+                        disabled={pairConfirming || (pinRequired && (labelPin.trim().length < 4 || labelPin.trim().length > 12))}
+                      >
+                        {pairConfirming ? "Pairing..." : "Pair"}
+                      </Button>
+                    </div>
+                  </div>
+                ) : bleScanError === "unavailable" ? (
+                  <div className="py-6 text-center">
+                    <Bluetooth size={20} className="mx-auto mb-2 text-shell-text-tertiary" />
+                    <p className="text-[11px] text-shell-text-tertiary">
+                      Bluetooth isn't available on this controller.
+                    </p>
+                  </div>
+                ) : (
+                  <div>
+                    <div aria-live="polite" className="min-h-[2rem]">
+                      {bleScanned && !bleScanning && bleDevices.length === 0 ? (
+                        <div className="py-4 text-center">
+                          <p className="text-[11px] text-shell-text-tertiary mb-3">
+                            No taOS devices found. Power the device on; it stays pairable
+                            until it's paired.
+                          </p>
+                        </div>
+                      ) : bleDevices.length > 0 ? (
+                        <div className="space-y-1.5 mb-3 max-h-56 overflow-y-auto" aria-label="Nearby Bluetooth devices">
+                          {bleDevices.map((d) => {
+                            const paired = d.paired === true || d.state === "paired";
+                            const disabled = paired || !d.pairable;
+                            const label = paired ? "Already paired" : "Not pairable";
+                            return (
+                              <div
+                                key={d.address}
+                                className="flex items-center justify-between gap-2 p-2 rounded-md border border-white/5 bg-white/[0.02]"
+                              >
+                                <div className="flex items-center gap-2 min-w-0">
+                                  <BleSignalIcon rssi={d.rssi} />
+                                  <span className="text-[12px] text-shell-text truncate">{d.name}</span>
+                                </div>
+                                <Button
+                                  size="sm"
+                                  variant="outline"
+                                  disabled={disabled || pairStarting}
+                                  onClick={() => handleBlePairStart(d)}
+                                  aria-label={disabled ? `${d.name}: ${label.toLowerCase()}` : `Pair with ${d.name}`}
+                                >
+                                  {disabled ? label : pairStarting ? "Starting..." : "Pair"}
+                                </Button>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      ) : !bleScanning ? (
+                        <p className="text-[11px] text-shell-text-tertiary mb-3">
+                          Search for nearby taOS devices over Bluetooth.
+                        </p>
+                      ) : null}
+                    </div>
+
+                    {bleScanError === "error" && (
+                      <p className="text-[11px] text-red-300 mb-2" role="alert">
+                        Scan failed. Try again.
+                      </p>
+                    )}
+                    {pairError && (
+                      <p className="text-[11px] text-red-300 mb-2" role="alert">
+                        {pairError}
+                      </p>
+                    )}
+
+                    <Button
+                      variant="secondary"
+                      size="sm"
+                      onClick={handleBleScan}
+                      disabled={bleScanning}
+                      className="gap-1.5 w-full justify-center"
+                      aria-label={bleScanned ? "Search again" : "Search"}
+                    >
+                      {bleScanning ? (
+                        <Loader2 size={14} className="animate-spin" />
+                      ) : (
+                        <Bluetooth size={14} />
+                      )}
+                      {bleScanning ? "Searching nearby…" : bleScanned ? "Search again" : "Search"}
+                    </Button>
+                  </div>
+                )}
+              </TabsContent>
+            </Tabs>
           </div>
         </div>
+      )}
+
+      {confirmDialog && (
+        <ConfirmDialog
+          open={true}
+          title={confirmDialog.title}
+          message={confirmDialog.message}
+          confirmLabel="Revoke"
+          danger={true}
+          onConfirm={confirmDialog.onConfirm}
+          onCancel={() => setConfirmDialog(null)}
+        />
       )}
 
       {/* Toast */}

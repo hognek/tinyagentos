@@ -8,6 +8,10 @@ Endpoints
 POST /api/peer/inbox   — receive a signed envelope from a contact
 POST /api/peer/chat    — receive a chat message envelope
 POST /api/peer/ack     — acknowledge delivery of an envelope
+
+POST /api/peer/handshake lives on ``handshake_router`` (no bearer): the
+sender has no token for us yet.  It is authenticated by the signature over
+the key in the envelope body plus our own outgoing friend-request edge.
 """
 
 from __future__ import annotations
@@ -15,20 +19,31 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import time
+import urllib.parse
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
+from tinyagentos.collab_settings import read_collab_settings
+from tinyagentos.contacts_store import generate_peer_token
+from tinyagentos.hub import relationships
+from tinyagentos.hub.identity import fingerprint as _fingerprint
 from tinyagentos.peer import (
-    resolve_local_identity_id,
+    build_envelope,
+    local_contact_id,
     verify_envelope,
     verify_envelope_signature,
 )
+from tinyagentos.rate_limit import MovingWindowLimiter, retry_after_headers
+from tinyagentos.routes.hub import _normalize_endpoints
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/peer", tags=["peer"])
+# The handshake is the one peer route a sender calls before it holds a token
+# for us, so it cannot sit behind ``_peer_auth_dep``.  Keep it on its own
+# router so the bearer dependency on ``router`` stays unconditional.
+handshake_router = APIRouter(prefix="/api/peer", tags=["peer"])
 # Auth is enforced centrally via the router-level ``_peer_auth_dep`` dependency
 # (Kilo #2).  Route handlers read the authenticated ``contact_id`` from
 # ``request.state.peer_contact_id`` — no per-route call to ``_authenticate_peer``
@@ -39,50 +54,44 @@ _RATE_WINDOW_SECS = 60.0
 _RATE_MAX_PER_WINDOW = 60
 _MAX_ENVELOPE_BYTES = 32 * 1024  # 32 KB
 
-# In-memory per-contact rate limiter: contact_id -> (window_start, count).
-# Per-process only — under multi-worker deployments each worker maintains its
-# own counter, so the effective aggregate limit is 60×N/min across N workers.
+# In-memory per-contact rate limiter.  Bounded and monotonic-clocked by the
+# shared limiter (tinyagentos.rate_limit).
 # FIXME(post-MVP): back with a shared store (Redis or sqlite contacts.db) for
-# accurate cross-worker limits.  The current eviction (``_RATE_HITS_MAX_SIZE``)
-# keeps memory bounded but does not coordinate across processes.
-_rate_hits: dict[str, tuple[float, int]] = {}
-# Max entries before stale-window cleanup triggers.  Keeps the dict bounded
-# for long-running servers that see many distinct contacts over time.
-_RATE_HITS_MAX_SIZE = 2000
+# accurate cross-worker limits.  The shared limiter keeps memory bounded but
+# does not coordinate across processes.
+_limiter = MovingWindowLimiter(_RATE_MAX_PER_WINDOW, _RATE_WINDOW_SECS)
+# contact_id -> the request timestamps still inside its window.  Aliased here
+# so tests and an operator can reset a window; the limiter mutates it in place.
+_rate_hits = _limiter.hits
+# Handshakes are keyed by sender fingerprint, separately from the bearer routes.
+_handshake_limiter = MovingWindowLimiter(_RATE_MAX_PER_WINDOW, _RATE_WINDOW_SECS)
 
 
-def _rate_limit_ok(contact_id: str) -> bool:
-    """Fixed-window per-contact rate limiter.
+def _safe_endpoints(raw) -> list[dict]:
+    """Filter endpoints to only valid http/https dict entries with a hostname.
 
-    Returns False when the contact has exceeded 60 requests in the current
-    60-second window.  Evicts entries with expired windows when the dict
-    grows past ``_RATE_HITS_MAX_SIZE`` to prevent unbounded memory growth.
+    Takes the output of _normalize_endpoints and keeps only dict entries whose
+    'url' is a string with scheme 'http' or 'https' and a truthy hostname.
+    Everything else (ints, dicts without url, non-http schemes, etc.) is dropped.
     """
-    now = time.time()
-    window_start, count = _rate_hits.get(contact_id, (now, 0))
-    if now - window_start >= _RATE_WINDOW_SECS:
-        window_start, count = now, 0
-
-    # Opportunistic eviction: when the dict exceeds the max size, sweep out
-    # every entry whose window has expired.  This is O(n) but only runs
-    # occasionally when the dict is full.
-    if len(_rate_hits) >= _RATE_HITS_MAX_SIZE:
-        expired = [
-            cid for cid, (ws, _) in _rate_hits.items()
-            if now - ws >= _RATE_WINDOW_SECS
-        ]
-        for cid in expired:
-            del _rate_hits[cid]
-        # LRU fallback (Kilo #5): when all windows are still active
-        # (>2000 concurrent contacts each within 60s), evict the oldest
-        # entry so the dict does not grow unbounded under sustained load.
-        if len(_rate_hits) >= _RATE_HITS_MAX_SIZE:
-            oldest = min(_rate_hits.keys(), key=lambda cid: _rate_hits[cid][0])
-            del _rate_hits[oldest]
-
-    count += 1
-    _rate_hits[contact_id] = (window_start, count)
-    return count <= _RATE_MAX_PER_WINDOW
+    normalized = _normalize_endpoints(raw)
+    kept = []
+    for e in normalized:
+        if not isinstance(e, dict):
+            continue
+        url = e.get("url")
+        if not isinstance(url, str):
+            continue
+        try:
+            parts = urllib.parse.urlsplit(url)
+        except (ValueError, TypeError):
+            continue
+        if parts.scheme not in ("http", "https"):
+            continue
+        if not parts.hostname:
+            continue
+        kept.append(e)
+    return kept
 
 
 # ---------------------------------------------------------------------------
@@ -121,6 +130,11 @@ async def _authenticate_peer(request: Request) -> str:
     if store is None:
         raise HTTPException(status_code=503, detail="peer channel not available")
 
+    # Per-instance panic kill-switch (D1 level 3): blocks all peer traffic.
+    from tinyagentos.delegation_handler import is_peer_disabled
+    if is_peer_disabled(request):
+        raise HTTPException(status_code=503, detail="peer routes disabled (per-instance panic)")
+
     auth = request.headers.get("authorization", "")
     if not auth.lower().startswith("bearer "):
         raise HTTPException(status_code=401, detail="bearer token required")
@@ -138,6 +152,29 @@ async def _authenticate_peer(request: Request) -> str:
     return contact_id
 
 
+async def _collab_enabled_dep(request: Request) -> None:
+    """Router-level dependency: 503 while the collaboration kill switch is off.
+
+    Runs BEFORE ``_peer_auth_dep``, so a disabled instance does no bearer
+    lookup and no signature work for any caller.  The switch is read from
+    disk on every request so a flip in Settings is immediate.
+
+    Routes outside ``router`` (the handshake route) call this directly.
+    """
+    if not read_collab_settings(request.app.state.data_dir).enabled:
+        raise HTTPException(status_code=503, detail="collaboration disabled")
+
+
+def _raise_if_contact_paused(request: Request, contact_id: str) -> None:
+    """403 when *contact_id* is in the kill switch's paused list.
+
+    Call it once the caller's contact_id is known and before any nonce is
+    recorded, so a paused contact cannot burn nonces.
+    """
+    if read_collab_settings(request.app.state.data_dir).is_paused(contact_id):
+        raise HTTPException(status_code=403, detail="contact paused")
+
+
 async def _peer_auth_dep(request: Request) -> str:
     """Router-level dependency: authenticate EVERY /api/peer route.
 
@@ -147,17 +184,188 @@ async def _peer_auth_dep(request: Request) -> str:
     so route handlers can read it directly.
     """
     contact_id = await _authenticate_peer(request)
+    _raise_if_contact_paused(request, contact_id)
     request.state.peer_contact_id = contact_id
     return contact_id
 
 
-# Apply the dependency to the router now that _peer_auth_dep is defined.
+# Apply the dependencies to the router now that both are defined.  The kill
+# switch goes first so it precedes the bearer lookup.
 router.dependencies.append(Depends(_peer_auth_dep))
+router.dependencies.insert(0, Depends(_collab_enabled_dep))
+
+
+def _reject_legacy_row(contact_id: str, contact_rec: dict) -> None:
+    """403 unless the contact row is keyed on its own pinned signing key.
+
+    contact_id is ``hub:<fingerprint(ed25519_pub)>`` for every row written by
+    friend-accept.  A row keyed any other way (a username-form id from the
+    pre-fingerprint schema, or a non-hex key) can never be matched by name:
+    it is refused, so a renamed or colliding username cannot be impersonated.
+    """
+    try:
+        canonical = f"hub:{_fingerprint(contact_rec.get('ed25519_pub') or '')}"
+    except (TypeError, ValueError):
+        canonical = None
+    if contact_id != canonical:
+        logger.warning(
+            "peer: contact row %s is not keyed on its signing fingerprint; refusing",
+            contact_id,
+        )
+        raise HTTPException(
+            status_code=403,
+            detail="contact row is not keyed on its signing-key fingerprint",
+        )
+
+
+def _enforce_size_cap(request: Request, envelope: dict) -> None:
+    """413 when the request or the re-serialised envelope exceeds the cap."""
+    # Size limit: reject on Content-Length before we re-serialise.
+    cl = request.headers.get("content-length")
+    if cl is not None:
+        try:
+            cl_int = int(cl)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="invalid Content-Length")
+        if cl_int > _MAX_ENVELOPE_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=f"request too large: {cl_int} bytes > {_MAX_ENVELOPE_BYTES}",
+            )
+    raw = json.dumps(envelope, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    if len(raw) > _MAX_ENVELOPE_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"envelope too large: {len(raw)} bytes > {_MAX_ENVELOPE_BYTES}",
+        )
 
 
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
+
+
+@handshake_router.post("/handshake")
+async def peer_handshake(body: PeerEnvelope, request: Request):
+    """Complete the token exchange a friend-accept started on the other node.
+
+    The accepter pinned us, minted a token for us, and sends it here signed
+    with the key in ``body.signing_pubkey``.  We accept it only when that key
+    is the one the ``from`` id names, the signature verifies, and WE asked
+    them to be friends (an outgoing request edge, or an existing friendship),
+    with no block.  We then pin them, store their token as our outbound
+    token, mint ours, and reply with it in a signed ``handshake_reply``.
+    """
+    store = request.app.state.contacts_store
+    if store is None:
+        raise HTTPException(status_code=503, detail="peer channel not available")
+
+    # Collaboration kill switch: before any work is done for an
+    # unauthenticated caller.
+    await _collab_enabled_dep(request)
+
+    _enforce_size_cap(request, body.envelope)
+    envelope = body.envelope
+
+    ok, err = verify_envelope(envelope, expected_kind="handshake")
+    if not ok:
+        raise HTTPException(status_code=400, detail=f"invalid envelope: {err}")
+
+    hs = envelope.get("body")
+    if not isinstance(hs, dict):
+        raise HTTPException(status_code=400, detail="handshake body required")
+    signing_pubkey = hs.get("signing_pubkey")
+    encryption_pubkey = hs.get("encryption_pubkey")
+    their_token = hs.get("inbound_token")
+    if not isinstance(signing_pubkey, str) or not isinstance(encryption_pubkey, str):
+        raise HTTPException(status_code=400, detail="handshake pubkeys required")
+    if not isinstance(their_token, str) or not their_token:
+        raise HTTPException(status_code=400, detail="handshake inbound_token required")
+
+    try:
+        fp = _fingerprint(signing_pubkey)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=403, detail="invalid signing key")
+    contact_id = f"hub:{fp}"
+    _raise_if_contact_paused(request, contact_id)
+    if envelope.get("from") != contact_id:
+        raise HTTPException(
+            status_code=403, detail="from does not match the signing key fingerprint",
+        )
+    local_id = await asyncio.to_thread(local_contact_id)
+    if envelope.get("to") != local_id:
+        raise HTTPException(
+            status_code=403,
+            detail=f"envelope addressed to {envelope.get('to')!r}, not {local_id!r}",
+        )
+    if not verify_envelope_signature(envelope, signing_pubkey):
+        raise HTTPException(status_code=403, detail="invalid signature")
+
+    from tinyagentos.routes.hub import _get_store
+
+    hub = await _get_store(request)
+    if await hub.has_edge(fp, relationships.REL_BLOCK) or not (
+        await hub.has_edge(fp, relationships.REL_REQUEST_OUT)
+        or await hub.has_edge(fp, relationships.REL_FRIEND)
+    ):
+        raise HTTPException(status_code=403, detail="no friend request to this peer")
+
+    if not _handshake_limiter.check(fp):
+        raise HTTPException(
+            status_code=429,
+            detail="rate limit exceeded (60/min/peer)",
+            headers=retry_after_headers(_handshake_limiter.retry_after(fp)),
+        )
+
+    if not await store.record_nonce(envelope["nonce"], contact_id, "handshake"):
+        raise HTTPException(status_code=409, detail="nonce replay detected")
+
+    author = await hub.get_author(fp)
+    username = (author or {}).get("username") or ""
+    await store.add_contact(
+        contact_id=contact_id,
+        hub_username=username,
+        display_name=username or contact_id,
+        ed25519_pub=signing_pubkey,
+        x25519_pub=encryption_pubkey,
+        peer_fingerprint=fp,
+    )
+    our_token = generate_peer_token()
+
+    # If a peer link already exists (live or revoked), keep its recorded
+    # endpoints.  A repeat handshake must not allow the sender to rewrite the
+    # SSRF allowance.  Only on first handshake do we accept endpoints from the
+    # envelope, and even then only valid http/https entries with a hostname.
+    existing = await store.get_peer_link(contact_id)
+    if existing is not None:
+        endpoints = existing.get("endpoints") or []
+    else:
+        endpoints = _safe_endpoints(hs.get("endpoints"))
+
+    await store.establish_peer_link(
+        contact_id=contact_id,
+        inbound_token=our_token,
+        outbound_token=their_token,
+        endpoints=endpoints,
+    )
+    if not await hub.has_edge(fp, relationships.REL_FRIEND):
+        from tinyagentos.hub import identity
+
+        statement = relationships.sign_statement(
+            relationships.build_friend_statement(
+                fp, author=identity.signing_fingerprint(),
+            )
+        )
+        await hub.put_relationship(fp, relationships.REL_FRIEND, statement=statement)
+
+    reply = await asyncio.to_thread(
+        build_envelope,
+        to_contact_id=contact_id,
+        kind="handshake_reply",
+        body={"inbound_token": our_token, "reply_to": envelope["nonce"]},
+    )
+    logger.info("peer handshake accepted: contact=%s", contact_id)
+    return {"status": "accepted", "envelope": reply}
 
 
 @router.post("/inbox")
@@ -171,27 +379,14 @@ async def peer_inbox(body: PeerEnvelope, request: Request):
     store = request.app.state.contacts_store
 
     # Rate limit
-    if not _rate_limit_ok(contact_id):
-        raise HTTPException(status_code=429, detail="rate limit exceeded (60/min/contact)")
-
-    # Size limit — reject on Content-Length before we re-serialise.
-    cl = request.headers.get("content-length")
-    if cl is not None:
-        try:
-            cl_int = int(cl)
-        except ValueError:
-            raise HTTPException(status_code=400, detail="invalid Content-Length")
-        if cl_int > _MAX_ENVELOPE_BYTES:
-            raise HTTPException(
-                status_code=413,
-                detail=f"request too large: {cl_int} bytes > {_MAX_ENVELOPE_BYTES}",
-            )
-    raw = json.dumps(body.envelope, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-    if len(raw) > _MAX_ENVELOPE_BYTES:
+    if not _limiter.check(contact_id):
         raise HTTPException(
-            status_code=413,
-            detail=f"envelope too large: {len(raw)} bytes > {_MAX_ENVELOPE_BYTES}",
+            status_code=429,
+            detail="rate limit exceeded (60/min/contact)",
+            headers=retry_after_headers(_limiter.retry_after(contact_id)),
         )
+
+    _enforce_size_cap(request, body.envelope)
 
     envelope = body.envelope
 
@@ -203,10 +398,8 @@ async def peer_inbox(body: PeerEnvelope, request: Request):
             detail=f"from field {from_field!r} does not match authenticated contact {contact_id!r}",
         )
 
-    # Verify recipient: envelope["to"] must match the local hub identity.
-    local_id = await asyncio.to_thread(resolve_local_identity_id, request.app.state.data_dir)
-    if local_id is None:
-        raise HTTPException(status_code=503, detail="hub identity not configured")
+    # Verify recipient: envelope["to"] must be this node's hub:<fingerprint>.
+    local_id = await asyncio.to_thread(local_contact_id)
     to_field = envelope.get("to", "")
     if to_field != local_id:
         raise HTTPException(
@@ -224,6 +417,7 @@ async def peer_inbox(body: PeerEnvelope, request: Request):
     if contact_rec is None:
         raise HTTPException(status_code=404, detail="contact not found")
 
+    _reject_legacy_row(contact_id, contact_rec)
     sender_pubkey = contact_rec.get("ed25519_pub", "")
     if not verify_envelope_signature(envelope, sender_pubkey):
         raise HTTPException(status_code=403, detail="invalid signature")
@@ -237,25 +431,53 @@ async def peer_inbox(body: PeerEnvelope, request: Request):
     if not await store.record_nonce(nonce, contact_id, kind):
         raise HTTPException(status_code=409, detail="nonce replay detected")
 
-    # Mark peer as seen
-    await store.mark_peer_seen(contact_id)
+    # Mark peer as seen and surface the due outbox rows for delivery.
+    # Delivery itself is not performed here.
+    peer_outbox = getattr(request.app.state, "peer_outbox", None)
+    await store.mark_peer_seen(contact_id, peer_outbox=peer_outbox)
 
-    # Dispatch the envelope by kind.
+    # Log the envelope kind for debugging; dispatch known kinds to their handlers.
     kind = envelope.get("kind", "unknown")
     body_data = envelope.get("body", {})
 
     if kind == "collab_invite":
-        return await _handle_collab_invite(request, contact_id, envelope, body_data)
+        return await _handle_collab_invite(
+            request, contact_id, envelope, body_data, contact_rec=contact_rec,
+        )
 
     if kind in ("collab_invite_accept", "collab_invite_decline"):
         return await _handle_collab_response(request, contact_id, envelope, body_data, kind)
+
+    # Dispatch delegation requests to the cross-user collab handler (D1).
+    # This MUST sit above the unrecognised-kind log so a delegation request
+    # does not log "no dispatch" and then dispatch.
+    if kind == "delegation_request":
+        from tinyagentos.delegation_handler import process_delegation_request
+
+        result = await process_delegation_request(
+            request, contact_id=contact_id, envelope_body=body_data,
+        )
+        # Return a summary to the peer; do NOT leak handler internals (the full
+        # result dict) verbatim.
+        return {
+            "status": result.get("status", "unknown"),
+            "decision_id": result.get("decision_id"),
+            "invite_id": result.get("invite_id"),
+            "agent_slug": result.get("agent_slug"),
+        }
+
+    # Dispatch delegation_status — the remote instance is notifying us that a
+    # delegation request was approved and an invite was minted.  Persist it
+    # durably (invite_id in decision metadata) so the local agent runner can
+    # poll for and redeem the invite, rather than only logging it.
+    if kind == "delegation_status":
+        return await _handle_delegation_status(request, contact_id, envelope, body_data)
 
     # Log unrecognised kinds for debugging; they are accepted but not dispatched.
     logger.info(
         "peer_inbox: contact=%s kind=%s nonce=%s (unrecognised kind — accepted, no dispatch)",
         contact_id, kind, envelope.get("nonce", "?"),
     )
-
     return {"status": "received", "kind": kind, "nonce": envelope.get("nonce")}
 
 
@@ -270,27 +492,14 @@ async def peer_chat(body: PeerEnvelope, request: Request):
     contact_id = request.state.peer_contact_id
     store = request.app.state.contacts_store
 
-    if not _rate_limit_ok(contact_id):
-        raise HTTPException(status_code=429, detail="rate limit exceeded")
-
-    # Size limit — reject on Content-Length before we re-serialise.
-    cl = request.headers.get("content-length")
-    if cl is not None:
-        try:
-            cl_int = int(cl)
-        except ValueError:
-            raise HTTPException(status_code=400, detail="invalid Content-Length")
-        if cl_int > _MAX_ENVELOPE_BYTES:
-            raise HTTPException(
-                status_code=413,
-                detail=f"request too large: {cl_int} bytes > {_MAX_ENVELOPE_BYTES}",
-            )
-    raw = json.dumps(body.envelope, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-    if len(raw) > _MAX_ENVELOPE_BYTES:
+    if not _limiter.check(contact_id):
         raise HTTPException(
-            status_code=413,
-            detail=f"envelope too large: {len(raw)} bytes > {_MAX_ENVELOPE_BYTES}",
+            status_code=429,
+            detail="rate limit exceeded",
+            headers=retry_after_headers(_limiter.retry_after(contact_id)),
         )
+
+    _enforce_size_cap(request, body.envelope)
 
     envelope = body.envelope
     if envelope.get("kind") != "chat":
@@ -304,10 +513,8 @@ async def peer_chat(body: PeerEnvelope, request: Request):
             detail=f"from field {from_field!r} does not match authenticated contact {contact_id!r}",
         )
 
-    # Verify recipient: envelope["to"] must match the local hub identity.
-    local_id = await asyncio.to_thread(resolve_local_identity_id, request.app.state.data_dir)
-    if local_id is None:
-        raise HTTPException(status_code=503, detail="hub identity not configured")
+    # Verify recipient: envelope["to"] must be this node's hub:<fingerprint>.
+    local_id = await asyncio.to_thread(local_contact_id)
     to_field = envelope.get("to", "")
     if to_field != local_id:
         raise HTTPException(
@@ -323,6 +530,7 @@ async def peer_chat(body: PeerEnvelope, request: Request):
     if contact_rec is None:
         raise HTTPException(status_code=404, detail="contact not found")
 
+    _reject_legacy_row(contact_id, contact_rec)
     if not verify_envelope_signature(envelope, contact_rec.get("ed25519_pub", "")):
         raise HTTPException(status_code=403, detail="invalid signature")
 
@@ -361,8 +569,12 @@ async def peer_ack(body: PeerAck, request: Request):
             detail=f"contact_id {body.contact_id!r} does not match authenticated contact {contact_id!r}",
         )
 
-    if not _rate_limit_ok(contact_id):
-        raise HTTPException(status_code=429, detail="rate limit exceeded")
+    if not _limiter.check(contact_id):
+        raise HTTPException(
+            status_code=429,
+            detail="rate limit exceeded",
+            headers=retry_after_headers(_limiter.retry_after(contact_id)),
+        )
 
     # Nonce replay protection — record the ack's envelope_id as a nonce.
     # Without this a valid contact can replay POST /ack indefinitely.  A
@@ -381,6 +593,136 @@ async def peer_ack(body: PeerAck, request: Request):
 
 
 # ---------------------------------------------------------------------------
+# Delegation status handler
+# ---------------------------------------------------------------------------
+
+
+async def _handle_delegation_status(
+    request: Request,
+    contact_id: str,
+    envelope: dict,
+    body_data: dict,
+) -> dict:
+    """Handle an incoming delegation_status envelope — the sponsor notifying
+    us that a delegation request was approved and a sponsored invite minted.
+
+    Persists a durable decision record with ``invite_id`` in metadata so the
+    local agent runner can poll for and redeem the invite — the equivalent of
+    how ``collab_invite`` persists into ``decision_store``.  Without a durable
+    landing place the approval result would be dropped on the floor (logged,
+    then gone) and the delegation could never complete cross-instance.
+
+    The envelope body is expected to contain:
+      invite_id, agent_slug, project_id
+    """
+    decision_store = getattr(request.app.state, "decision_store", None)
+    if decision_store is None:
+        logger.warning(
+            "peer_inbox: delegation_status received but decision_store not available"
+        )
+        return {"status": "received", "kind": "delegation_status", "dispatched": False}
+
+    invite_id = body_data.get("invite_id", "")
+    agent_slug = body_data.get("agent_slug", "unknown")
+    project_id = body_data.get("project_id", "")
+
+    if not invite_id:
+        logger.warning(
+            "peer_inbox: delegation_status missing invite_id from contact=%s",
+            contact_id,
+        )
+        return {"status": "received", "kind": "delegation_status", "dispatched": False}
+
+    question = (
+        f"Delegation request approved: agent '{agent_slug}' was granted a "
+        f"sponsored invite for project {project_id}. Invite id: {invite_id}"
+    )
+
+    metadata: dict = {
+        "envelope_kind": "delegation_status",
+        "invite_id": invite_id,
+        "agent_slug": agent_slug,
+        "project_id": project_id,
+        "contact_id": contact_id,
+    }
+
+    # Idempotency on invite_id: nonces stop exact replays but not a sponsor
+    # retrying the same delegation_status after a 5xx (distinct nonce, same
+    # invite_id).  Look up any decision already recording this invite_id and
+    # return it instead of minting a duplicate that would pollute the feed.
+    try:
+        existing = await decision_store.find_by_metadata("invite_id", invite_id)
+    except Exception as exc:
+        logger.warning(
+            "peer_inbox: metadata lookup failed for invite_id=%s: %s",
+            invite_id, exc,
+        )
+        existing = []
+    if existing:
+        decision_id = existing[0]["id"]
+        logger.info(
+            "peer_inbox: delegation_status for invite_id=%s already recorded "
+            "as decision %s (duplicate delivery)",
+            invite_id, decision_id,
+        )
+        return {
+            "status": "received",
+            "kind": "delegation_status",
+            "decision_id": decision_id,
+            "invite_id": invite_id,
+            "dispatched": True,
+            "duplicate": True,
+        }
+
+    # Resolve the owner (the local project owner) so the decision is not
+    # ownerless and project-scoped queries surface it.  Best-effort: an absent
+    # project store or unknown project leaves user_id empty (still scoped via
+    # project_id).
+    user_id = ""
+    project_store = getattr(request.app.state, "project_store", None)
+    if project_store is not None and project_id:
+        try:
+            project = await project_store.get_project(project_id)
+            if project:
+                user_id = project.get("user_id") or ""
+        except Exception:
+            user_id = ""
+
+    try:
+        decision = await decision_store.create(
+            from_agent="system:delegation",
+            question=question,
+            type="free_text",
+            priority="normal",
+            project_id=project_id or None,
+            user_id=user_id,
+            metadata=metadata,
+        )
+        logger.info(
+            "peer_inbox: delegation_status → decision %s created for contact=%s",
+            decision["id"], contact_id,
+        )
+    except Exception as exc:
+        logger.error(
+            "peer_inbox: failed to persist delegation_status decision: %s", exc
+        )
+        return {
+            "status": "received",
+            "kind": "delegation_status",
+            "dispatched": False,
+            "error": str(exc),
+        }
+
+    return {
+        "status": "received",
+        "kind": "delegation_status",
+        "decision_id": decision["id"],
+        "invite_id": invite_id,
+        "dispatched": True,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Collab invite dispatch handlers
 # ---------------------------------------------------------------------------
 
@@ -390,6 +732,8 @@ async def _handle_collab_invite(
     contact_id: str,
     envelope: dict,
     body_data: dict,
+    *,
+    contact_rec: dict | None = None,
 ) -> dict:
     """Handle an incoming collab_invite envelope — create a Decisions card
     so the local human can accept or decline the invitation.
@@ -397,6 +741,10 @@ async def _handle_collab_invite(
     The envelope body is expected to contain:
       invite_id, project_id, project_name, project_slug, inviter,
       pin_required, display_name
+
+    The question names the inviter by the pinned contact row's display name
+    (or hub username), never by the 64-hex ``inviter`` id in the body; the id
+    is kept in the metadata for audit.
     """
     decision_store = getattr(request.app.state, "decision_store", None)
     if decision_store is None:
@@ -409,9 +757,15 @@ async def _handle_collab_invite(
     project_name = body_data.get("project_name", "unknown project")
     inviter = body_data.get("inviter", contact_id)
     pin_required = body_data.get("pin_required", True)
+    rec = contact_rec or {}
+    inviter_label = (
+        (rec.get("display_name") or "").strip()
+        or (rec.get("hub_username") or "").strip()
+        or contact_id
+    )
 
     question = (
-        f"{inviter} invites you to collaborate on project "
+        f"{inviter_label} invites you to collaborate on project "
         f"\"{project_name}\" as a human member. "
         "You will appear in the members list, can chat in the project, "
         "and can later delegate agents to work on it."

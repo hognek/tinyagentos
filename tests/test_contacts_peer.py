@@ -5,6 +5,7 @@ import json
 import time
 from pathlib import Path
 
+import httpx
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
@@ -12,6 +13,8 @@ from httpx import ASGITransport, AsyncClient
 from tinyagentos.contacts_store import ContactsStore, generate_peer_token, _hash_token
 from tinyagentos.peer import (
     build_envelope,
+    deliver_handshake,
+    local_contact_id,
     resolve_local_identity_id,
     verify_envelope,
     verify_envelope_signature,
@@ -20,6 +23,8 @@ from tinyagentos.peer import (
 
 # Local hub username used in route integration tests.
 _TEST_HUB_USERNAME = "testnode"
+# A well-formed remote contact id for envelope unit tests (any 64-hex fingerprint).
+_PEER_ID = "hub:" + "ab" * 32
 
 
 # ---------------------------------------------------------------------------
@@ -257,6 +262,69 @@ class TestContactsStore:
         c = await store.get_contact("hub:hogne")
         assert c["status"] == "revoked"
 
+    async def test_revoke_peer_link_same_timestamp(self, store):
+        """Both peer_link and contact must share the same revoked_at timestamp."""
+        await store.add_contact(
+            contact_id="hub:hogne", hub_username="hogne", display_name="H",
+            ed25519_pub="pk", x25519_pub="ek",
+        )
+        await store.establish_peer_link(
+            contact_id="hub:hogne",
+            inbound_token=generate_peer_token(),
+            outbound_token=generate_peer_token(),
+        )
+
+        before = time.time()
+        await store.revoke_peer_link("hub:hogne")
+        after = time.time()
+
+        link = await store.get_peer_link("hub:hogne")
+        c = await store.get_contact("hub:hogne")
+        assert link["revoked_at"] is not None
+        assert c["revoked_at"] is not None
+        assert link["revoked_at"] == c["revoked_at"]
+        assert before <= link["revoked_at"] <= after
+
+    async def test_set_outbound_token_refuses_stale_inbound_token(self, store):
+        # create a contact
+        await store.add_contact(
+            contact_id="hub:test",
+            hub_username="test",
+            display_name="Test",
+            ed25519_pub="pk",
+            x25519_pub="ek",
+        )
+        # establish_peer_link with inbound token A
+        inbound_a = generate_peer_token()
+        outbound_initial = generate_peer_token()
+        await store.establish_peer_link(
+            contact_id="hub:test",
+            inbound_token=inbound_a,
+            outbound_token=outbound_initial,
+        )
+        # establish_peer_link again with inbound token B (simulating a re-accept)
+        inbound_b = generate_peer_token()
+        outbound_second = generate_peer_token()
+        await store.establish_peer_link(
+            contact_id="hub:test",
+            inbound_token=inbound_b,
+            outbound_token=outbound_second,
+        )
+        # Now, the peer link should have inbound_token_hash of B and outbound_token of outbound_second
+        link = await store.get_peer_link("hub:test")
+        assert link["outbound_token"] == outbound_second
+        # Attempt to set an outbound token with the OLD inbound token A (should fail)
+        result_old = await store.set_outbound_token("hub:test", "old-token", expected_inbound_token=inbound_a)
+        assert result_old is False  # should refuse because inbound_token_hash doesn't match
+        # The outbound token should remain unchanged
+        link = await store.get_peer_link("hub:test")
+        assert link["outbound_token"] == outbound_second
+        # Now set with the NEW inbound token B (should succeed)
+        result_new = await store.set_outbound_token("hub:test", "new-token", expected_inbound_token=inbound_b)
+        assert result_new is True
+        link = await store.get_peer_link("hub:test")
+        assert link["outbound_token"] == "new-token"
+
 
 # ---------------------------------------------------------------------------
 # peer envelope crypto tests
@@ -264,15 +332,16 @@ class TestContactsStore:
 
 
 class TestPeerEnvelope:
-    def test_build_envelope_structure(self):
+    def test_build_envelope_structure(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("TAOS_DATA_DIR", str(tmp_path))
         env = build_envelope(
-            from_username="jaylfc",
-            to_username="hogne",
+            to_contact_id=_PEER_ID,
             kind="handshake",
             body={"greeting": "hello"},
         )
-        assert env["from"] == "hub:jaylfc"
-        assert env["to"] == "hub:hogne"
+        assert env["from"] == local_contact_id()
+        assert env["from"].startswith("hub:") and len(env["from"]) == 4 + 64
+        assert env["to"] == _PEER_ID
         assert env["kind"] == "handshake"
         assert env["body"] == {"greeting": "hello"}
         assert "ts" in env
@@ -280,19 +349,19 @@ class TestPeerEnvelope:
         assert "sig" in env
         assert len(env["sig"]) == 128  # 64 bytes hex
 
-    def test_build_envelope_no_body(self):
+    def test_build_envelope_no_body(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("TAOS_DATA_DIR", str(tmp_path))
         env = build_envelope(
-            from_username="jaylfc",
-            to_username="hogne",
+            to_contact_id=_PEER_ID,
             kind="ack",
         )
         assert "body" not in env
         assert env["kind"] == "ack"
 
-    def test_verify_envelope_fresh(self):
+    def test_verify_envelope_fresh(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("TAOS_DATA_DIR", str(tmp_path))
         env = build_envelope(
-            from_username="jaylfc",
-            to_username="hogne",
+            to_contact_id=_PEER_ID,
             kind="handshake",
         )
         ok, err = verify_envelope(env)
@@ -304,20 +373,20 @@ class TestPeerEnvelope:
         assert not ok
         assert "missing required field" in err
 
-    def test_verify_envelope_wrong_kind(self):
+    def test_verify_envelope_wrong_kind(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("TAOS_DATA_DIR", str(tmp_path))
         env = build_envelope(
-            from_username="jaylfc",
-            to_username="hogne",
+            to_contact_id=_PEER_ID,
             kind="handshake",
         )
         ok, err = verify_envelope(env, expected_kind="chat")
         assert not ok
         assert "unexpected kind" in err
 
-    def test_verify_envelope_too_old(self):
+    def test_verify_envelope_too_old(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("TAOS_DATA_DIR", str(tmp_path))
         env = build_envelope(
-            from_username="jaylfc",
-            to_username="hogne",
+            to_contact_id=_PEER_ID,
             kind="handshake",
         )
         # Artificially age the timestamp
@@ -326,11 +395,11 @@ class TestPeerEnvelope:
         assert not ok
         assert "too old" in err
 
-    def test_verify_envelope_nan_ts_rejected(self):
+    def test_verify_envelope_nan_ts_rejected(self, monkeypatch, tmp_path):
         """NaN timestamp must be rejected (bypass fix)."""
+        monkeypatch.setenv("TAOS_DATA_DIR", str(tmp_path))
         env = build_envelope(
-            from_username="jaylfc",
-            to_username="hogne",
+            to_contact_id=_PEER_ID,
             kind="handshake",
         )
         env["ts"] = float("nan")
@@ -338,11 +407,11 @@ class TestPeerEnvelope:
         assert not ok
         assert "non-finite" in err
 
-    def test_verify_envelope_future_ts_rejected(self):
+    def test_verify_envelope_future_ts_rejected(self, monkeypatch, tmp_path):
         """Timestamp more than 30s in the future must be rejected."""
+        monkeypatch.setenv("TAOS_DATA_DIR", str(tmp_path))
         env = build_envelope(
-            from_username="jaylfc",
-            to_username="hogne",
+            to_contact_id=_PEER_ID,
             kind="handshake",
         )
         env["ts"] = time.time() + 60  # 60s in the future
@@ -363,8 +432,7 @@ class TestPeerEnvelope:
             signing_pub = pub["signing_pubkey"]
 
             env = build_envelope(
-                from_username="jaylfc",
-                to_username="hogne",
+                to_contact_id=_PEER_ID,
                 kind="handshake",
                 body={"hello": "world"},
             )
@@ -385,13 +453,34 @@ class TestPeerEnvelope:
             signing_pub = pub["signing_pubkey"]
 
             env = build_envelope(
-                from_username="jaylfc",
-                to_username="hogne",
+                to_contact_id=_PEER_ID,
                 kind="handshake",
             )
             # Tamper with the payload
             env["kind"] = "evil"
             assert not verify_envelope_signature(env, signing_pub)
+        finally:
+            _clear()
+
+    def test_verify_envelope_signature_wrong_pubkey(self, monkeypatch, tmp_path):
+        """Verifying with a wrong pubkey must fail."""
+        from tinyagentos.hub.identity import load_or_create, clear as _clear, public_identity
+
+        monkeypatch.setenv("TAOS_DATA_DIR", str(tmp_path))
+        _clear()
+        try:
+            identity = load_or_create()
+            pub = public_identity()
+            signing_pub = pub["signing_pubkey"]
+
+            env = build_envelope(
+                to_contact_id=_PEER_ID,
+                kind="handshake",
+            )
+
+            wrong_pub = ("a" * 20) + signing_pub[20:]
+            assert wrong_pub != signing_pub
+            assert not verify_envelope_signature(env, wrong_pub)
         finally:
             _clear()
 
@@ -407,8 +496,7 @@ class TestPeerEnvelope:
             signing_pub = pub["signing_pubkey"]
 
             env = build_envelope(
-                from_username="jaylfc",
-                to_username="hogne",
+                to_contact_id=_PEER_ID,
                 kind="handshake",
             )
             original_sig = env["sig"]
@@ -539,6 +627,38 @@ class TestPeerRoutes:
 
         assert 429 in statuses, f"expected 429 in statuses, got: {set(statuses)}"
 
+    async def test_inbox_429_carries_retry_after(
+        self, client_with_contacts, app_with_contacts
+    ):
+        """A throttled peer must be told when its window reopens."""
+        from tinyagentos.routes import peer as peer_routes
+
+        store = app_with_contacts.state.contacts_store
+        await store.add_contact(
+            contact_id="hub:retry", hub_username="retry", display_name="R",
+            ed25519_pub="pk", x25519_pub="ek",
+        )
+        inbound = generate_peer_token()
+        await store.establish_peer_link(
+            contact_id="hub:retry",
+            inbound_token=inbound,
+            outbound_token=generate_peer_token(),
+        )
+        headers = {"Authorization": f"Bearer {inbound}"}
+
+        peer_routes._rate_hits.clear()
+        try:
+            last = None
+            for _ in range(peer_routes._RATE_MAX_PER_WINDOW + 1):
+                last = await client_with_contacts.post(
+                    "/api/peer/inbox", json={"envelope": {}}, headers=headers,
+                )
+            assert last.status_code == 429
+            retry_after = int(last.headers["retry-after"])
+            assert 1 <= retry_after <= int(peer_routes._RATE_WINDOW_SECS)
+        finally:
+            peer_routes._rate_hits.clear()
+
     async def test_inbox_envelope_too_large(self, client_with_contacts, app_with_contacts):
         store = app_with_contacts.state.contacts_store
         await store.add_contact(
@@ -577,10 +697,9 @@ class TestPeerRoutes:
             outbound_token=generate_peer_token(),
         )
 
-        # Envelope claims to be from "jaylfc" but auth token is for "spoofer"
+        # Envelope is from THIS node's id but the auth token belongs to "spoofer"
         env = build_envelope(
-            from_username="jaylfc",  # impersonation!
-            to_username=_TEST_HUB_USERNAME,
+            to_contact_id=local_contact_id(),
             kind="handshake",
         )
         resp = await client_with_contacts.post(
@@ -592,22 +711,24 @@ class TestPeerRoutes:
 
     async def test_inbox_wrong_to_field(self, client_with_contacts, app_with_contacts):
         """Envelope addressed to a different identity must be rejected."""
+        from tinyagentos.hub.identity import public_identity as _hub_pub
+        self_id = local_contact_id()
+
         store = app_with_contacts.state.contacts_store
         await store.add_contact(
-            contact_id="hub:wrong-to", hub_username="wrong-to", display_name="W",
-            ed25519_pub="pk", x25519_pub="ek",
+            contact_id=self_id, hub_username="wrong-to", display_name="W",
+            ed25519_pub=_hub_pub()["signing_pubkey"], x25519_pub="ek",
         )
         inbound = generate_peer_token()
         await store.establish_peer_link(
-            contact_id="hub:wrong-to",
+            contact_id=self_id,
             inbound_token=inbound,
             outbound_token=generate_peer_token(),
         )
 
         # Envelope addressed to a different hub identity, from the authenticated contact.
         env = build_envelope(
-            from_username="wrong-to",
-            to_username="someone-else",  # wrong recipient
+            to_contact_id=_PEER_ID,  # wrong recipient
             kind="handshake",
         )
         resp = await client_with_contacts.post(
@@ -630,22 +751,22 @@ class TestPeerRoutes:
         from tinyagentos.hub.identity import public_identity as _hub_pub
         signing_pub = _hub_pub()["signing_pubkey"]
 
+        self_id = local_contact_id()
         store = app_with_contacts.state.contacts_store
         await store.add_contact(
-            contact_id="hub:nonce-test", hub_username="nonce-test", display_name="N",
+            contact_id=self_id, hub_username="nonce-test", display_name="N",
             ed25519_pub=signing_pub, x25519_pub="ek",
         )
         inbound = generate_peer_token()
         await store.establish_peer_link(
-            contact_id="hub:nonce-test",
+            contact_id=self_id,
             inbound_token=inbound,
             outbound_token=generate_peer_token(),
         )
 
         # Envelope from the authenticated contact to the local node.
         env = build_envelope(
-            from_username="nonce-test",
-            to_username=_TEST_HUB_USERNAME,
+            to_contact_id=self_id,
             kind="handshake",
         )
 
@@ -666,6 +787,49 @@ class TestPeerRoutes:
             headers=headers,
         )
         assert resp2.status_code == 409, f"replay should be 409, got {resp2.status_code}: {resp2.text}"
+
+    async def test_inbox_drain_failure_does_not_block_dispatch(
+        self, client_with_contacts, app_with_contacts, monkeypatch
+    ):
+        """If the outbox drain raises, peer_inbox must still return 2xx."""
+        local_id = resolve_local_identity_id()
+        from tinyagentos.hub.identity import public_identity as _hub_pub
+        signing_pub = _hub_pub()["signing_pubkey"]
+
+        self_id = local_contact_id()
+        store = app_with_contacts.state.contacts_store
+        await store.add_contact(
+            contact_id=self_id, hub_username="drain-fail", display_name="D",
+            ed25519_pub=signing_pub, x25519_pub="ek",
+        )
+        inbound = generate_peer_token()
+        await store.establish_peer_link(
+            contact_id=self_id,
+            inbound_token=inbound,
+            outbound_token=generate_peer_token(),
+        )
+
+        env = build_envelope(
+            to_contact_id=self_id,
+            kind="handshake",
+        )
+        headers = {"Authorization": f"Bearer {inbound}"}
+
+        async def _boom(*args, **kwargs):
+            raise RuntimeError("drain boom")
+
+        monkeypatch.setattr(
+            app_with_contacts.state.peer_outbox,
+            "drain_for_contact",
+            _boom,
+        )
+
+        resp = await client_with_contacts.post(
+            "/api/peer/inbox",
+            json={"envelope": env},
+            headers=headers,
+        )
+        assert resp.status_code == 200, f"expected 200, got {resp.status_code}: {resp.text}"
 
     async def test_peer_routes_csrf_exempt(self, client_with_contacts, app_with_contacts):
         """Peer routes should work without a CSRF token (bearer-only auth)."""
@@ -712,3 +876,297 @@ class TestPeerRoutes:
         data = resp.json()
         assert data["status"] == "acked"
         assert data["envelope_id"] == "test-nonce-123"
+
+    async def test_inbox_tampered_signature_rejected(self, client_with_contacts, app_with_contacts):
+        """A tampered envelope must be rejected with 403 at the route level."""
+        local_id = resolve_local_identity_id()
+
+        from tinyagentos.hub.identity import public_identity as _hub_pub
+        self_id = local_contact_id()
+
+        store = app_with_contacts.state.contacts_store
+        await store.add_contact(
+            contact_id=self_id, hub_username="tamper-test", display_name="T",
+            ed25519_pub=_hub_pub()["signing_pubkey"], x25519_pub="ek",
+        )
+        inbound = generate_peer_token()
+        await store.establish_peer_link(
+            contact_id=self_id,
+            inbound_token=inbound,
+            outbound_token=generate_peer_token(),
+        )
+
+        env = build_envelope(
+            to_contact_id=self_id,
+            kind="handshake",
+        )
+        env["kind"] = "evil"
+
+        resp = await client_with_contacts.post(
+            "/api/peer/inbox",
+            json={"envelope": env},
+            headers={"Authorization": f"Bearer {inbound}"},
+        )
+        assert resp.status_code == 403, f"expected 403, got {resp.status_code}: {resp.text}"
+
+    async def test_inbox_future_timestamp_rejected(self, client_with_contacts, app_with_contacts):
+        """An envelope with a future timestamp must be rejected with 400."""
+        local_id = resolve_local_identity_id()
+
+        from tinyagentos.hub.identity import public_identity as _hub_pub
+        self_id = local_contact_id()
+
+        store = app_with_contacts.state.contacts_store
+        await store.add_contact(
+            contact_id=self_id, hub_username="future-ts", display_name="F",
+            ed25519_pub=_hub_pub()["signing_pubkey"], x25519_pub="ek",
+        )
+        inbound = generate_peer_token()
+        await store.establish_peer_link(
+            contact_id=self_id,
+            inbound_token=inbound,
+            outbound_token=generate_peer_token(),
+        )
+
+        env = build_envelope(
+            to_contact_id=self_id,
+            kind="handshake",
+        )
+        env["ts"] = time.time() + 400
+
+        resp = await client_with_contacts.post(
+            "/api/peer/inbox",
+            json={"envelope": env},
+            headers={"Authorization": f"Bearer {inbound}"},
+        )
+        assert resp.status_code == 400, f"expected 400, got {resp.status_code}: {resp.text}"
+
+    async def test_peer_token_non_peer_route_401(self, app_with_contacts):
+        """A peer token must not grant access to non-peer routes."""
+        store = app_with_contacts.state.contacts_store
+        await store.add_contact(
+            contact_id="hub:hogne", hub_username="hogne", display_name="H",
+            ed25519_pub="pk", x25519_pub="ek",
+        )
+        inbound = generate_peer_token()
+        await store.establish_peer_link(
+            contact_id="hub:hogne",
+            inbound_token=inbound,
+            outbound_token=generate_peer_token(),
+        )
+
+        transport = ASGITransport(app=app_with_contacts)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.get(
+                "/api/projects",
+                headers={"Authorization": f"Bearer {inbound}"},
+            )
+            assert resp.status_code == 401
+
+    async def test_chat_rate_limit(self, client_with_contacts, app_with_contacts):
+        """Verify rate limiting kicks in after 60 requests to /chat."""
+        store = app_with_contacts.state.contacts_store
+        await store.add_contact(
+            contact_id="hub:chat-rl", hub_username="chat-rl", display_name="C",
+            ed25519_pub="pk", x25519_pub="ek",
+        )
+        inbound = generate_peer_token()
+        await store.establish_peer_link(
+            contact_id="hub:chat-rl",
+            inbound_token=inbound,
+            outbound_token=generate_peer_token(),
+        )
+
+        headers = {"Authorization": f"Bearer {inbound}"}
+        statuses = []
+        for _ in range(65):
+            resp = await client_with_contacts.post(
+                "/api/peer/chat",
+                json={"envelope": {"kind": "chat"}},
+                headers=headers,
+            )
+            statuses.append(resp.status_code)
+
+        assert 429 in statuses, f"expected 429 in statuses, got: {set(statuses)}"
+
+    async def test_chat_envelope_too_large(self, client_with_contacts, app_with_contacts):
+        """Verify /chat rejects oversized envelopes with 413."""
+        store = app_with_contacts.state.contacts_store
+        await store.add_contact(
+            contact_id="hub:chat-big", hub_username="chat-big", display_name="B",
+            ed25519_pub="pk", x25519_pub="ek",
+        )
+        inbound = generate_peer_token()
+        await store.establish_peer_link(
+            contact_id="hub:chat-big",
+            inbound_token=inbound,
+            outbound_token=generate_peer_token(),
+        )
+
+        big_body = "x" * (33 * 1024)
+        resp = await client_with_contacts.post(
+            "/api/peer/chat",
+            json={"envelope": {"kind": "chat", "body": big_body}},
+            headers={"Authorization": f"Bearer {inbound}"},
+        )
+        assert resp.status_code == 413
+
+    async def test_ack_rate_limit(self, client_with_contacts, app_with_contacts):
+        """Verify rate limiting kicks in after 60 requests to /ack."""
+        store = app_with_contacts.state.contacts_store
+        await store.add_contact(
+            contact_id="hub:ack-rl", hub_username="ack-rl", display_name="A",
+            ed25519_pub="pk", x25519_pub="ek",
+        )
+        inbound = generate_peer_token()
+        await store.establish_peer_link(
+            contact_id="hub:ack-rl",
+            inbound_token=inbound,
+            outbound_token=generate_peer_token(),
+        )
+
+        headers = {"Authorization": f"Bearer {inbound}"}
+        statuses = []
+        for i in range(65):
+            resp = await client_with_contacts.post(
+                "/api/peer/ack",
+                json={"envelope_id": f"ack-rl-nonce-{i}", "contact_id": "hub:ack-rl"},
+                headers=headers,
+            )
+            statuses.append(resp.status_code)
+
+        assert 429 in statuses, f"expected 429 in statuses, got: {set(statuses)}"
+
+
+# ---------------------------------------------------------------------------
+# deliver_handshake tests (SSRF guard + dict endpoint handling)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestDeliverHandshake:
+    """Tests for peer.deliver_handshake: SSRF guard + dict endpoint handling."""
+
+    @staticmethod
+    def _mock_client(seen: dict) -> httpx.AsyncClient:
+        """Build an httpx client with a MockTransport that records POSTs."""
+
+        def handler(req: httpx.Request) -> httpx.Response:
+            seen["called"] = True
+            seen["url"] = str(req.url)
+            return httpx.Response(200)
+
+        return httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    async def test_ssrf_blocks_cgnat_tailnet_endpoint(self):
+        """deliver_handshake must not POST to a literal CGNAT (100.64/10) address.
+
+        The A2A bus lives in this range; a CGNAT-blind guard would let it
+        through.  Uses a literal IP (NOT a rebinding test) to probe the real
+        gap proven on #2556.
+        """
+        seen = {}
+        client = self._mock_client(seen)
+        try:
+            result = await deliver_handshake(
+                {"envelope": "test"}, ["http://100.64.0.1/"],
+                http_client=client,
+            )
+            assert result is False
+            assert "called" not in seen
+        finally:
+            await client.aclose()
+
+    async def test_ssrf_blocks_rfc1918_lan_endpoint(self):
+        """deliver_handshake must not POST to a literal RFC1918 LAN address."""
+        seen = {}
+        client = self._mock_client(seen)
+        try:
+            result = await deliver_handshake(
+                {"envelope": "test"}, ["http://192.168.1.1/"],
+                http_client=client,
+            )
+            assert result is False
+            assert "called" not in seen
+        finally:
+            await client.aclose()
+
+    async def test_ssrf_blocks_loopback_endpoint(self):
+        """Baseline: loopback (127.0.0.1) is also blocked."""
+        seen = {}
+        client = self._mock_client(seen)
+        try:
+            result = await deliver_handshake(
+                {"envelope": "test"}, ["http://127.0.0.1/"],
+                http_client=client,
+            )
+            assert result is False
+            assert "called" not in seen
+        finally:
+            await client.aclose()
+
+    async def test_delivers_to_public_endpoint(self):
+        """A public endpoint must succeed (guard does not block legit delivery)."""
+        seen = {}
+        client = self._mock_client(seen)
+        try:
+            result = await deliver_handshake(
+                {"envelope": "test"}, ["http://93.184.216.34/"],
+                http_client=client,
+            )
+            assert result is True
+            assert seen["url"] == "http://93.184.216.34/api/peer/handshake"
+        finally:
+            await client.aclose()
+
+    async def test_delivers_to_dict_endpoints_from_stored_link(self, store):
+        """deliver_handshake handles dict-format endpoints from get_peer_link.
+
+        Drives the REAL stored-link path: establish_peer_link -> get_peer_link
+        -> deliver_handshake.  Before the fix this raised AttributeError
+        because deliver_handshake called .rstrip on dicts.
+        """
+        await store.add_contact(
+            contact_id="hub:dict-ep",
+            hub_username="dict-ep",
+            display_name="D",
+            ed25519_pub="pk",
+            x25519_pub="ek",
+        )
+        # Dict endpoints, exactly as _try_handshake normalizes them.
+        await store.establish_peer_link(
+            contact_id="hub:dict-ep",
+            inbound_token=generate_peer_token(),
+            outbound_token=generate_peer_token(),
+            endpoints=[{"kind": "hub", "url": "http://93.184.216.34/", "priority": 0}],
+        )
+        link = await store.get_peer_link("hub:dict-ep")
+        assert isinstance(link["endpoints"][0], dict)  # real dict form
+
+        seen = {}
+        client = self._mock_client(seen)
+        try:
+            envelope = {"from": "hub:local", "to": "hub:dict-ep", "kind": "handshake"}
+            # Must NOT raise AttributeError.
+            result = await deliver_handshake(
+                envelope, link["endpoints"], http_client=client,
+            )
+            assert result is True
+            assert seen["url"] == "http://93.184.216.34/api/peer/handshake"
+        finally:
+            await client.aclose()
+
+    async def test_skips_blocked_then_delivers_next(self):
+        """A blocked endpoint is skipped; delivery proceeds to the next."""
+        seen = {}
+        client = self._mock_client(seen)
+        try:
+            result = await deliver_handshake(
+                {"envelope": "test"},
+                ["http://100.64.0.1/", "http://93.184.216.34/"],
+                http_client=client,
+            )
+            assert result is True
+            assert seen["url"] == "http://93.184.216.34/api/peer/handshake"
+        finally:
+            await client.aclose()

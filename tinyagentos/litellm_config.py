@@ -1,20 +1,19 @@
-"""Pure config-generation logic for the LiteLLM proxy.
+"""The model table the LLM gateway routes with.
 
-Contains the functions that build a LiteLLM configuration dict from the
-TinyAgentOS backend list.  Process-management concerns (subprocess, PIDs,
-start/stop) live in ``tinyagentos.llm_proxy``; import direction is strictly
-one-way: ``llm_proxy`` imports from here, never the reverse.
+``build_model_list`` turns the TinyAgentOS backend list into the routing
+table (model name -> backend) that ``llm_gateway.resolve`` and
+``llm_gateway.embeddings`` read. Its entries keep the LiteLLM-shaped
+``litellm_params`` keys they had when this table also fed the LiteLLM proxy
+config; that writer and the proxy are gone (LiteLLM removal stage 2b-2a).
+The module keeps its name until the cosmetic rename (stage 2b-2b).
 """
 from __future__ import annotations
 
 import logging
-import os
-import secrets as _secrets
-from pathlib import Path
 
 import httpx
 
-from tinyagentos.providers import CHAT_BACKEND_TYPE_MAP, CLOUD_TYPES as CLOUD_BACKEND_TYPES, NEEDS_API_BASE_TYPES
+from tinyagentos.providers import ALL_TYPES, BACKEND_TYPE_MAP, CHAT_BACKEND_TYPE_MAP, CLOUD_TYPES as CLOUD_BACKEND_TYPES, NEEDS_API_BASE_TYPES
 
 logger = logging.getLogger(__name__)
 
@@ -23,67 +22,6 @@ logger = logging.getLogger(__name__)
 # LiteLLM routes it to whatever concrete embedding model the host has.
 # See docs/design/framework-agnostic-runtime.md.
 EMBEDDING_ALIAS = "taos-embedding-default"
-
-# Per-install master key cache — keyed by resolved data_dir so multiple
-# data dirs in the same process (tests) don't collide.
-_master_key_cache: dict[str, str] = {}
-
-
-def get_litellm_master_key(data_dir: Path | None = None) -> str:
-    """Return the per-install LiteLLM master key, generating it on first use.
-
-    The key is stored at ``<data_dir>/.litellm_master_key`` with mode 0600.
-    On first call for a given data_dir the file is created with a random key;
-    subsequent calls (same process or new process) re-read it from disk.
-
-    When ``data_dir`` is None the call falls back to a process-lifetime
-    in-memory key so callers that don't know the data dir (e.g. tests) still
-    get a consistent value within a single process.
-
-    The master key is used only to authorise admin operations against the
-    LiteLLM proxy (key generation, key deletion, /v1/models).  Per-agent
-    virtual keys stored in Postgres are independent tokens and are NOT
-    invalidated when the master key changes.
-    """
-    cache_key = str(data_dir) if data_dir is not None else "__in_memory__"
-    if cache_key in _master_key_cache:
-        return _master_key_cache[cache_key]
-
-    if data_dir is not None:
-        key_path = Path(data_dir) / ".litellm_master_key"
-        if key_path.exists():
-            key = key_path.read_text().strip()
-            if key:
-                _master_key_cache[cache_key] = key
-                return key
-        # Generate and persist a new per-install key using O_CREAT|O_EXCL so
-        # only one concurrent caller wins the creation race.  The loser gets
-        # EEXIST (FileExistsError) and reads whatever the winner wrote.
-        key = "sk-taos-" + _secrets.token_urlsafe(32)
-        key_path.parent.mkdir(parents=True, exist_ok=True)
-        encoded = key.encode()
-        try:
-            fd = os.open(str(key_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-            try:
-                os.write(fd, encoded)
-            finally:
-                os.close(fd)
-            logger.info("Generated new per-install LiteLLM master key at %s", key_path)
-        except FileExistsError:
-            # Another process/thread won the race — read the key it wrote.
-            key = key_path.read_text().strip()
-            if not key:
-                raise RuntimeError(
-                    f"LiteLLM master key file {key_path} exists but is empty; "
-                    "remove it and restart to regenerate."
-                )
-    else:
-        # No data dir — generate an in-memory key for this process lifetime.
-        key = "sk-taos-" + _secrets.token_urlsafe(32)
-
-    _master_key_cache[cache_key] = key
-    return key
-
 
 def _is_embedding_model(name: str) -> bool:
     """Classify a model name as embedding vs chat.
@@ -130,6 +68,30 @@ def _discover_ollama_models(url: str, timeout: float = 2.0) -> list[str]:
         return []
 
 
+def _discover_openai_compatible_models(url: str, timeout: float = 2.0, api_key: str | None = None) -> list[str]:
+    """Probe an OpenAI-compatible backend (llama-cpp, lmstudio) for its loaded model names.
+
+    Returns ``[]`` on any failure (backend down, network error, schema
+    drift) — the caller treats an empty list as "no models to auto-wire"
+    and falls back to the ``default`` alias.
+
+    OpenAI /models endpoint returns: {"data": [{"id": "model-name"}, ...]}
+
+    If ``api_key`` is provided, an Authorization header is sent so
+    key-protected servers return models instead of 401.
+    """
+    try:
+        headers = {"Authorization": f"Bearer {api_key}"} if api_key else None
+        resp = httpx.get(f"{url.rstrip('/')}/models", timeout=timeout, headers=headers)
+        if resp.status_code != 200:
+            return []
+        data = resp.json()
+        return [m.get("id", "") for m in data.get("data", []) if m.get("id")]
+    except Exception as exc:
+        logger.debug("openai-compatible model probe at %s failed: %s", url, exc)
+        return []
+
+
 async def _discover_ollama_backends_concurrent(
     backends: list[dict], timeout: float = 2.0
 ) -> dict[str, list[str]]:
@@ -155,6 +117,46 @@ async def _discover_ollama_backends_concurrent(
     return {
         url: (res if isinstance(res, list) else [])
         for url, res in zip(ollama_urls, results)
+    }
+
+
+async def _discover_openai_compatible_backends_concurrent(
+    backends: list[dict], timeout: float = 2.0, keys: dict[str, str | None] | None = None
+) -> dict[str, list[str]]:
+    """Probe all OpenAI-compatible backends (llama-cpp, lmstudio) concurrently.
+
+    Mirrors ``_discover_ollama_backends_concurrent`` exactly, but targets
+    backends whose type is ``llama-cpp``, or ``lmstudio`` when ``lmstudio`` is
+    in ``ALL_TYPES`` (the same condition ``build_model_list`` uses). Each probe
+    runs ``_discover_openai_compatible_models`` in a thread via
+    ``asyncio.to_thread`` so blocking httpx calls do not stall the event loop.
+
+    If ``keys`` is provided, it maps stripped URL -> resolved API key. The key
+    for each backend's URL is passed as ``api_key`` to the probe so
+    key-protected servers return models instead of 401.
+    """
+    import asyncio
+
+    openai_urls = [
+        b.get("url", "").rstrip("/")
+        for b in backends
+        if (b.get("type") == "llama-cpp"
+            or (b.get("type") == "lmstudio" and "lmstudio" in ALL_TYPES))
+        and b.get("url")
+    ]
+    if not openai_urls:
+        return {}
+    key_map = keys or {}
+    results = await asyncio.gather(
+        *(
+            asyncio.to_thread(_discover_openai_compatible_models, url, timeout, api_key=key_map.get(url))
+            for url in openai_urls
+        ),
+        return_exceptions=True,
+    )
+    return {
+        url: (res if isinstance(res, list) else [])
+        for url, res in zip(openai_urls, results)
     }
 
 
@@ -208,16 +210,26 @@ def _local_backend_models_from_registry(
     return matched
 
 
-def generate_litellm_config(
+def build_model_list(
     backends: list[dict],
     default_model: str = "default",
     *,
     registry=None,
-    master_key: str | None = None,
     discovered: dict[str, list[str]] | None = None,
-    inhouse_keys: bool = False,
-) -> dict:
-    """Generate LiteLLM config from TinyAgentOS backend list.
+    discover: bool = True,
+) -> list[dict]:
+    """Build the routing table: every model name taOS serves, and where it goes.
+
+    This is the ONE source of routing truth. ``generate_litellm_config`` wraps
+    it for the LiteLLM proxy, and the in-process gateway
+    (``tinyagentos.llm_gateway.resolve``) reads it per request, so a model
+    name can never route to one backend through LiteLLM and another through
+    the gateway. Pure apart from the optional ollama probe.
+
+    ``discover=False`` skips the ``/api/tags`` probe for any ollama backend
+    not already in ``discovered``: only the probe-derived embedding entries
+    are then absent. The gateway uses it so a chat request never waits on a
+    2s probe per ollama backend.
 
     Emits two kinds of model_list entries:
 
@@ -285,7 +297,7 @@ def generate_litellm_config(
                 # kilocode isn't a native LiteLLM provider — must set api_base
                 if backend_type == "kilocode":
                     per_model_params["api_base"] = url
-                elif url and backend_type not in ("openai", "anthropic"):
+                elif url and backend_type not in ("openai",):
                     # For openrouter and other pass-through types, set api_base
                     # when an explicit url is provided
                     per_model_params["api_base"] = url
@@ -300,6 +312,7 @@ def generate_litellm_config(
                     "metadata": {
                         "priority": backend.get("priority", 99),
                         "backend_name": backend.get("name", ""),
+                        "backend_type": backend_type,
                     },
                 })
 
@@ -309,6 +322,7 @@ def generate_litellm_config(
             "metadata": {
                 "priority": backend.get("priority", 99),
                 "backend_name": backend.get("name", ""),
+                "backend_type": backend_type,
             },
         })
 
@@ -347,6 +361,7 @@ def generate_litellm_config(
                     "metadata": {
                         "priority": backend.get("priority", 99),
                         "backend_name": backend_name,
+                        "backend_type": backend_type,
                         "source": "local-installed",
                     },
                 })
@@ -359,65 +374,83 @@ def generate_litellm_config(
         if backend_type in ("ollama", "rkllama", "hailo-ollama"):
             _probed = (discovered or {}).get(url)
             if _probed is None:
-                _probed = _discover_ollama_models(url)
-            for discovered_name in _probed:
-                if not _is_embedding_model(discovered_name):
-                    continue
-                embed_params = {
-                    "model": f"ollama/{discovered_name}",
-                    "api_base": url,
-                }
-                model_list.append({
-                    "model_name": discovered_name,
-                    "litellm_params": embed_params,
-                    "model_info": {"mode": "embedding"},
-                    "metadata": {
-                        "priority": backend.get("priority", 99),
-                        "backend_name": backend.get("name", ""),
-                    },
-                })
-                if not aliased_embedding_claimed:
+                _probed = _discover_ollama_models(url) if discover else []
+            if _probed:
+                for discovered_name in _probed:
+                    if not _is_embedding_model(discovered_name):
+                        continue
+                    embed_params = {
+                        "model": f"ollama/{discovered_name}",
+                        "api_base": url,
+                    }
                     model_list.append({
-                        "model_name": EMBEDDING_ALIAS,
-                        "litellm_params": dict(embed_params),
+                        "model_name": discovered_name,
+                        "litellm_params": embed_params,
                         "model_info": {"mode": "embedding"},
                         "metadata": {
                             "priority": backend.get("priority", 99),
                             "backend_name": backend.get("name", ""),
-                            "aliases": discovered_name,
+                            "backend_type": backend_type,
                         },
                     })
-                    aliased_embedding_claimed = True
+                    if not aliased_embedding_claimed:
+                        model_list.append({
+                            "model_name": EMBEDDING_ALIAS,
+                            "litellm_params": dict(embed_params),
+                            "model_info": {"mode": "embedding"},
+                            "metadata": {
+                                "priority": backend.get("priority", 99),
+                                "backend_name": backend.get("name", ""),
+                                "backend_type": backend_type,
+                                "aliases": discovered_name,
+                            },
+                        })
+                        aliased_embedding_claimed = True
+        elif backend_type == "llama-cpp" or (backend_type == "lmstudio" and "lmstudio" in ALL_TYPES):
+            _probed = (discovered or {}).get(url)
+            if _probed is None:
+                # Authenticated probing (with api_key/api_key_secret) happens
+                # on the gateway request path via _discovered(); the config
+                # writer has no secrets store and calls this keyless probe.
+                _probed = _discover_openai_compatible_models(url) if discover else []
+            if _probed:
+                embed_prefix = BACKEND_TYPE_MAP.get(backend_type, "openai")
+                for discovered_name in _probed:
+                    if not _is_embedding_model(discovered_name):
+                        continue
+                    embed_params = {
+                        "model": f"{embed_prefix}/{discovered_name}",
+                        "api_base": url,
+                    }
+                    # API key from secrets reference (same precedence as the
+                    # chat entry: api_key_secret first, else api_key), so a
+                    # key-protected server accepts the embedding call.
+                    if backend.get("api_key_secret"):
+                        embed_params["api_key"] = f"os.environ/{backend['api_key_secret']}"
+                    elif backend.get("api_key"):
+                        embed_params["api_key"] = backend["api_key"]
+                    model_list.append({
+                        "model_name": discovered_name,
+                        "litellm_params": embed_params,
+                        "model_info": {"mode": "embedding"},
+                        "metadata": {
+                            "priority": backend.get("priority", 99),
+                            "backend_name": backend.get("name", ""),
+                            "backend_type": backend_type,
+                        },
+                    })
+                    if not aliased_embedding_claimed:
+                        model_list.append({
+                            "model_name": EMBEDDING_ALIAS,
+                            "litellm_params": dict(embed_params),
+                            "model_info": {"mode": "embedding"},
+                            "metadata": {
+                                "priority": backend.get("priority", 99),
+                                "backend_name": backend.get("name", ""),
+                                "backend_type": backend_type,
+                                "aliases": discovered_name,
+                            },
+                        })
+                        aliased_embedding_claimed = True
 
-    resolved_master_key = master_key if master_key is not None else get_litellm_master_key()
-    general_settings = {
-        "master_key": resolved_master_key,
-        "background_health_checks": False,
-        "disable_spend_logs": True,
-    }
-    if inhouse_keys:
-        # Authorize per-agent keys against taOS's SQLite key store via the
-        # custom_auth hook instead of LiteLLM's Postgres virtual-key table.
-        # The loader resolves this dotted path relative to the config dir, so
-        # write_config writes a sibling ``taos_auth.py`` re-exporting the hook.
-        # No DATABASE_URL is needed (the ARM / no-Postgres fix).
-        general_settings["custom_auth"] = "taos_auth.user_api_key_auth"
-        general_settings["custom_auth_run_common_checks"] = False
-    return {
-        "model_list": model_list,
-        "router_settings": {
-            "routing_strategy": "simple-shuffle",
-            "num_retries": 2,
-            "timeout": 120,
-            "enable_pre_call_checks": False,
-        },
-        "general_settings": general_settings,
-        # LiteLLM's proxy reads custom logger classes from
-        # ``litellm_settings.callbacks``. The loader (get_instance_fn) resolves
-        # the dotted path relative to the config file's directory — so the
-        # sibling ``taos_callback.py`` shim written by ``write_config`` below
-        # imports our installed module and re-exports the instance.
-        "litellm_settings": {
-            "callbacks": "taos_callback.proxy_handler_instance",
-        },
-    }
+    return model_list

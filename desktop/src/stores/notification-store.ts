@@ -40,6 +40,16 @@ interface NotificationStore {
 
 let counter = 0;
 
+// Notification sources that must stay pinned at the top of the active inbox
+// until they are archived (i.e. the server has decided the request). Reading a
+// pinned row marks it read but never unpins it; only archive removes it.
+export const PINNED_SOURCES = new Set(["auth_requests", "agent_scope_requests"]);
+
+/** A notification is pinned when it is still active and carries a grant-request source. */
+export function isPinned(n: Notification): boolean {
+  return !n.archived && PINNED_SOURCES.has(n.source);
+}
+
 // Server items archived this session. Archiving POSTs to the backend
 // (archiveServerNotification), which is the durable source of truth: once the
 // write lands, GET /api/notifications no longer returns the row. This Set is an
@@ -81,8 +91,14 @@ export const useNotificationStore = create<NotificationStore>((set, get) => ({
         (n) => !n.id.startsWith("srv-") || n.archived,
       );
       const combined = [...merged, ...kept];
-      combined.sort((a, b) => b.timestamp - a.timestamp);
-      return { notifications: combined.slice(0, 100) };
+      // Pinned grant requests always lead the active inbox (newest-first among
+      // them), then everything else newest-first. The 100-item cap applies
+      // only to the non-pinned remainder so a pinned row is never trimmed.
+      const pinned = combined.filter((n) => isPinned(n));
+      const rest = combined.filter((n) => !isPinned(n));
+      pinned.sort((a, b) => b.timestamp - a.timestamp);
+      rest.sort((a, b) => b.timestamp - a.timestamp);
+      return { notifications: [...pinned, ...rest.slice(0, 100)] };
     });
   },
 
@@ -97,15 +113,22 @@ export const useNotificationStore = create<NotificationStore>((set, get) => ({
   },
 
   dismiss(id) {
-    if (id.startsWith("srv-")) {
-      dismissedServerIds.add(id);
-      void archiveServerNotification(id);
-    }
-    set((s) => ({
-      notifications: s.notifications.map((n) =>
-        n.id === id ? { ...n, archived: true } : n,
-      ),
-    }));
+    set((s) => {
+      const newNotifications = s.notifications.map((n) => {
+        if (n.id === id) {
+          if (n.source === "agent_scope_requests" || n.source === "auth_requests") {
+            return { ...n, read: true };
+          }
+          if (n.id.startsWith("srv-")) {
+            dismissedServerIds.add(n.id);
+            void archiveServerNotification(id);
+          }
+          return { ...n, archived: true };
+        }
+        return n;
+      });
+      return { notifications: newNotifications };
+    });
   },
 
   archiveRead(id) {
@@ -125,15 +148,20 @@ export const useNotificationStore = create<NotificationStore>((set, get) => ({
 
   clearAll() {
     set((s) => {
-      for (const n of s.notifications) {
+      const newNotifications = s.notifications.map((n) => {
         if (n.id.startsWith("srv-")) {
+          // Do not archive agent_scope_requests or auth_requests notifications
+          if (n.source === "agent_scope_requests" || n.source === "auth_requests") {
+            return n;
+          }
           dismissedServerIds.add(n.id);
           void archiveServerNotification(n.id);
+          return { ...n, archived: true };
         }
-      }
-      return {
-        notifications: s.notifications.map((n) => ({ ...n, archived: true })),
-      };
+        // Local (non-srv-) notifications: archive them as before
+        return { ...n, archived: true };
+      });
+      return { notifications: newNotifications };
     });
   },
 

@@ -11,15 +11,20 @@ on:
   pull_request:
     branches: [master, dev]
 
+# This gate only reads the checkout; nothing here writes to the repo, so do not
+# inherit whatever the repository or org default happens to grant GITHUB_TOKEN.
+permissions:
+  contents: read
+
 jobs:
   doc-gate:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
         with:
           fetch-depth: 0
 
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7
         with:
           python-version: "3.12"
 
@@ -37,12 +42,19 @@ jobs:
       - name: Retrofit-migration guard (#2188)
         run: python scripts/check_retrofit_migrations.py
 
+      - name: Schema-column guard (tsk-hrzgip)
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: python scripts/check_schema_column_migrations.py --base "origin/$BASE_REF"
+
       - name: Diff gate (Layer B)
         env:
           BASE_REF: ${{ github.base_ref }}
         run: python scripts/check_doc_gate.py diff-gate --base "origin/$BASE_REF"
 
       - name: Managed backend manifest lint
+        env:
+          PYTHONPATH: ${{ github.workspace }}
         run: |
-          python -m pip install --quiet pyyaml
+          python -m pip install --quiet pyyaml pydantic
           python scripts/check_manifests.py managed-lint

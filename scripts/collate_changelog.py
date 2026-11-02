@@ -39,13 +39,27 @@ SECTION_ORDER = ["### Added", "### Changed", "### Fixed", "### Removed", "### Se
 
 
 def parse_fragment(path: Path) -> dict[str, list[str]]:
-    """Return {section: [bullet lines]} for one fragment file."""
+    """Return {section: [bullet lines]} for one fragment file.
+
+    Refuses with ValueError if the fragment starts with a YAML frontmatter
+    delimiter (---) or a ``title:`` key. The fragment author must strip the
+    frontmatter block and keep only the markdown bullets.
+    """
     sections: dict[str, list[str]] = {}
     current = DEFAULT_SECTION
-    for raw in path.read_text(encoding="utf-8").splitlines():
+    text = path.read_text(encoding="utf-8")
+    first = True
+    for raw in text.splitlines():
         line = raw.rstrip()
         if not line.strip():
             continue
+        if first:
+            first = False
+            if line == "---" or line.startswith("title:"):
+                raise ValueError(
+                    f"{path.name}: fragment starts with YAML frontmatter ({line}); "
+                    "remove the frontmatter block and keep only markdown bullets"
+                )
         if line.startswith("### "):
             current = line.strip()
             continue
@@ -90,7 +104,11 @@ def main(argv: list[str]) -> int:
     if not FRAGMENT_DIR.is_dir():
         print("collate-changelog: no changelog.d/ directory, nothing to do")
         return 0
-    merged, consumed = collect(FRAGMENT_DIR)
+    try:
+        merged, consumed = collect(FRAGMENT_DIR)
+    except ValueError as e:
+        print(f"collate-changelog: {e}", file=sys.stderr)
+        return 1
     if not consumed:
         print("collate-changelog: no fragments, nothing to do")
         return 0
@@ -106,6 +124,35 @@ def main(argv: list[str]) -> int:
     if UNRELEASED not in text:
         print(f"collate-changelog: {CHANGELOG.name} has no '{UNRELEASED}' anchor", file=sys.stderr)
         return 1
+
+    version_header = f"## [{args.version}]"
+    if version_header in text:
+        # Rerun after a partial failure: only consume fragments whose content
+        # already made it into the changelog. A fragment that landed AFTER the
+        # failed run is folded nowhere -- unlinking it would silently lose its
+        # release note, so keep it and refuse loudly instead.
+        print(f"collate-changelog: {args.version} section already present in {CHANGELOG.name}, consuming folded leftover fragments", file=sys.stderr)
+        # Match against ONLY the target version's section. A bullet that happens
+        # to also appear under an OLDER release must not count as folded --
+        # unlinking on a whole-file match would silently lose the new note,
+        # which is the exact class this branch exists to prevent.
+        start = text.index(version_header)
+        next_header = text.find("\n## [", start + len(version_header))
+        section_text = text[start:] if next_header == -1 else text[start:next_header]
+        unfolded: list[Path] = []
+        for path in consumed:
+            lines = [ln for section_lines in parse_fragment(path).values() for ln in section_lines]
+            if all(ln in section_text for ln in lines):
+                path.unlink()
+            else:
+                unfolded.append(path)
+        print(f"collate-changelog: consumed {len(consumed) - len(unfolded)} leftover fragment(s) for {args.version}")
+        if unfolded:
+            for path in unfolded:
+                print(f"collate-changelog: {path.name} is not folded into {CHANGELOG.name} -- kept; rerun with the correct target version", file=sys.stderr)
+            return 1
+        return 0
+
     # Insert directly BELOW [Unreleased] so Unreleased stays empty and on top,
     # which is what the release train expects on the next cycle.
     anchor = UNRELEASED + "\n"

@@ -17,8 +17,10 @@ Semantics (fail closed):
   - Valid signature but the agent is not active in the registry, the sub is
     unknown, or the required scope grant is missing/expired -> 403.
 
-The registry JWT itself carries no exp claim; revocation is achieved by
-suspending the agent (status != 'active') or by setting expires_at on the grant.
+The registry JWT itself carries no exp claim; per-identity token rotation is
+achieved by bumping ``token_min_iat`` on the registry record — any token whose
+``iat`` is strictly less than the cutoff is rejected as superseded.  Per-agent
+revocation (suspending the agent or expiring the grant) remains available.
 """
 
 from datetime import datetime, timezone
@@ -64,6 +66,100 @@ def _grant_unexpired(expires_at, now: datetime) -> bool:
     return exp > now
 
 
+async def active_project_grants(
+    registry,
+    grants_store,
+    canonical_id: str,
+    scope: str,
+    now: datetime | None = None,
+) -> set[str]:
+    """Return the set of project_ids for which *canonical_id* holds an active
+    grant of *scope*.
+
+    This predicate is usable outside an HTTP request (no Request, no fastapi
+    exceptions). It returns an empty set for a missing or non-active registry
+    record. The same ``_grant_unexpired`` logic and fail-closed parsing are used
+    as the HTTP-layer checks.
+
+    Args:
+        registry: An object with an async ``get(canonical_id) -> dict | None``
+            method (e.g. AgentRegistryStore).
+        grants_store: An object with an async ``list_grants(canonical_id) ->
+            list[dict]`` method (e.g. AgentGrantsStore).
+        canonical_id: The agent's canonical registry id.
+        scope: The grant scope to filter on (e.g. "project_tasks").
+        now: Optional reference time for expiry checks. Defaults to
+            ``datetime.now(timezone.utc)``.
+
+    Returns:
+        Set of project_id strings for active, unexpired grants of the given
+        scope. Empty if the agent is not active, has no grants, or all matching
+        grants are expired/unparseable.
+    """
+    by_project = await _active_project_grants_by_project(
+        registry, grants_store, canonical_id, scope, now
+    )
+    return set(by_project.keys())
+
+
+async def _active_project_grants_by_project(
+    registry,
+    grants_store,
+    canonical_id: str,
+    scope: str,
+    now: datetime | None = None,
+) -> dict[str, dict]:
+    """Internal helper returning active grants keyed by project_id.
+
+    Same logic as ``active_project_grants`` but preserves the full grant dict
+    for each project. Used by ``check_agent_project_grants`` to avoid
+    re-fetching grants.
+    """
+    record = await registry.get(canonical_id)
+    if record is None or record.get("status") != "active":
+        return {}
+
+    if now is None:
+        now = datetime.now(timezone.utc)
+
+    grants = await grants_store.list_grants(canonical_id)
+    by_project: dict[str, dict] = {}
+    for g in grants:
+        if g.get("scope") != scope:
+            continue
+        pid = g.get("project_id")
+        if not pid:
+            continue
+        if not _grant_unexpired(g.get("expires_at"), now):
+            continue
+        by_project[pid] = g
+    return by_project
+
+
+def _enforce_rotation_cutoff(record: dict, payload: dict) -> None:
+    """Reject a token issued before the identity's ``token_min_iat`` cutoff.
+
+    Shared by ``_verify_agent_scope``, ``check_agent_identity``, and
+    ``check_agent_project_grants`` (previously copy-pasted into all three,
+    which let the cutoff semantics silently drift between call sites).
+
+    Both ``token_min_iat`` (absent until an identity has ever been rotated)
+    and ``iat`` default to 0 when missing -- NOT rejected outright. This is a
+    deliberate safe-by-default choice: an identity that was never rotated has
+    ``token_min_iat`` unset, and a token missing ``iat`` is treated as
+    infinitely old rather than exempt, so it is accepted only until the first
+    rotation and superseded by any cutoff set thereafter.  ``mint_registry_token``
+    always sets ``iat``; a missing claim only occurs on a hand-crafted token.
+
+    Raises:
+      401 -- ``iat`` is strictly before ``token_min_iat`` (superseded by rotation).
+    """
+    token_min_iat = record.get("token_min_iat") or 0
+    token_iat = payload.get("iat") or 0
+    if token_iat < token_min_iat:
+        raise HTTPException(status_code=401, detail="token superseded")
+
+
 def _get_keypair(request: Request) -> tuple[bytes, bytes]:
     kp = getattr(request.app.state, "agent_registry_keypair", None)
     if kp is None:
@@ -104,11 +200,18 @@ async def _verify_agent_scope(
     if not canonical_id:
         raise HTTPException(status_code=401, detail="token missing sub claim")
 
+    principal_type = payload.get("principal_type", "")
+    if principal_type == "human":
+        return None
+
     # Agent must be active in the registry.
     registry = _get_store(request)
     record = await registry.get(canonical_id)
     if record is None or record.get("status") != "active":
         raise HTTPException(status_code=403, detail="agent is not active in the registry")
+
+    # Reject tokens issued before the identity's token_min_iat cutoff (rotation).
+    _enforce_rotation_cutoff(record, payload)
 
     # Must hold an active grant for the required scope.
     grants_store = _get_grants_store(request)
@@ -137,13 +240,15 @@ async def check_agent_scope(request: Request, required_scope: str) -> Optional[s
     active *required_scope* grant, or raise an HTTPException.
 
     Returns None when no Authorization header is present (the caller falls
-    through to its own admin/session handling).
+    through to its own admin/session handling), or when a valid human-principal
+    token is presented (``principal_type == "human"`` short-circuits here so a
+    human token never reaches the agent-registry check).
 
     Raises:
       401 -- Authorization header present but the token is malformed, has a bad
-             signature, or is missing the sub claim.
+            signature, or is missing the sub claim.
       403 -- Token is valid but the agent is not active in the registry, the
-             sub is unknown, or the grant is missing/expired.
+            sub is unknown, or the grant is missing/expired.
     """
     result = await _verify_agent_scope(request, required_scope)
     if result is None:
@@ -152,22 +257,98 @@ async def check_agent_scope(request: Request, required_scope: str) -> Optional[s
     return canonical_id
 
 
-async def check_agent_identity(request: Request) -> Optional[str]:
-    """Return the canonical_id from a valid Bearer registry JWT for an ACTIVE
-    agent, without requiring any scope grant.
+async def registry_agent_caller(request: Request, required_scope: str) -> Optional[str]:
+    """Resolve a session-or-agent caller the way ``_authorize_task_actor``
+    (routes/projects.py) does, for routes that are NOT project-bound.
 
-    This proves only *who* the caller is, not *what* it may do — the caller is
-    responsible for the authorization decision (e.g. only allowing an agent to
-    act on its OWN canonical_id).  It is used by the scope-request create flow,
-    where an already-registered agent asks for MORE scopes: it must not need a
-    scope it does not yet hold in order to request one.
+    Resolution order:
+      1. An authenticated session (or local token) already set
+         ``request.state.user_id`` -> return None; the caller takes its
+         existing human path unchanged.
+      2. No Bearer, or a device bearer (``taosdev_`` prefix) -> return None;
+         the caller's own session/device handling decides.
+      3. Any other Bearer is treated as a registry JWT and verified exactly as
+         ``check_agent_scope`` (401 bad token, 403 inactive agent or missing
+         *required_scope* grant).  Returns the agent's canonical_id.
+
+    A human-principal registry token returns None (as ``check_agent_scope``
+    does) and so falls through to the caller's human path, which 401s it.
+    """
+    if getattr(request.state, "user_id", None):
+        return None
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.lower().startswith("bearer "):
+        return None
+    from tinyagentos.device_store import DEVICE_TOKEN_PREFIX
+
+    if auth_header[7:].strip().startswith(DEVICE_TOKEN_PREFIX):
+        return None
+    return await check_agent_scope(request, required_scope)
+
+
+async def check_human_identity(request: Request) -> Optional[str]:
+    """Return the user_id from a valid Bearer registry JWT for a HUMAN principal.
+
+    Uses the SAME Ed25519 verification chain as agent tokens (``verify_registry_token``)
+    but accepts only tokens with ``principal_type == "human"``.  The ``sub`` claim
+    is the user_id; a human cannot post as anyone else because ``from`` is derived
+    from the credential, never self-asserted.
 
     Returns None when no Authorization header is present (the caller falls
     through to its own admin/session handling).
 
     Raises:
       401 -- Authorization header present but the token is malformed, has a bad
-             signature, or is missing the sub claim.
+             signature, is missing the sub claim, or carries the wrong principal_type.
+      403 -- Token is well-formed but the user_id does not resolve to an existing
+             human account.
+    """
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.lower().startswith("bearer "):
+        return None
+
+    raw_token = auth_header[7:].strip()
+
+    _private_pem, public_pem = _get_keypair(request)
+    try:
+        payload = verify_registry_token(raw_token, public_pem)
+    except ValueError:
+        raise HTTPException(status_code=401, detail="invalid or malformed registry token")
+
+    principal_type = payload.get("principal_type", "")
+    if principal_type != "human":
+        raise HTTPException(status_code=401, detail="not a human-principal token")
+
+    user_id: str = payload.get("sub", "")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="token missing sub claim")
+
+    auth = getattr(request.app.state, "auth", None)
+    if auth is None:
+        raise RuntimeError("auth store not on app.state")
+    user = auth.get_user_by_id(user_id)
+    if user is None:
+        raise HTTPException(status_code=403, detail="human principal not found")
+
+    return user_id
+
+
+async def check_agent_identity_claims(request: Request) -> Optional[tuple[str, int]]:
+    """Return (canonical_id, iat) from a valid Bearer registry JWT for an ACTIVE
+    agent, without requiring any scope grant.
+
+    This proves only *who* the caller is and *when* the token was issued. The
+    caller is responsible for the authorization decision. Used by the auth-request
+    create flow to store the token's iat so a later token rotation can be detected
+    at approve time.
+
+    Returns None when no Authorization header is present (the caller falls
+    through to its own admin/session handling).
+
+    Raises:
+      401 -- Authorization header present but the token is malformed, has a bad
+             signature, is missing the sub claim, or was superseded by a token
+             rotation on the identity.
       403 -- Token is valid but the agent is not active in the registry.
     """
     auth_header = request.headers.get("Authorization", "")
@@ -191,6 +372,37 @@ async def check_agent_identity(request: Request) -> Optional[str]:
     if record is None or record.get("status") != "active":
         raise HTTPException(status_code=403, detail="agent is not active in the registry")
 
+    # Reject tokens issued before the identity's token_min_iat cutoff (rotation),
+    # exactly as check_agent_scope and check_agent_scope_for_project do.
+    _enforce_rotation_cutoff(record, payload)
+
+    iat = payload.get("iat") or 0
+    return canonical_id, iat
+
+
+async def check_agent_identity(request: Request) -> Optional[str]:
+    """Return the canonical_id from a valid Bearer registry JWT for an ACTIVE
+    agent, without requiring any scope grant.
+
+    This proves only *who* the caller is, not *what* it may do — the caller is
+    responsible for the authorization decision (e.g. only allowing an agent to
+    act on its OWN canonical_id).  It is used by the scope-request create flow,
+    where an already-registered agent asks for MORE scopes: it must not need a
+    scope it does not yet hold in order to request one.
+
+    Returns None when no Authorization header is present (the caller falls
+    through to its own admin/session handling).
+
+    Raises:
+      401 -- Authorization header present but the token is malformed, has a bad
+             signature, is missing the sub claim, or was superseded by a token
+             rotation on the identity.
+      403 -- Token is valid but the agent is not active in the registry.
+    """
+    result = await check_agent_identity_claims(request)
+    if result is None:
+        return None
+    canonical_id, _iat = result
     return canonical_id
 
 
@@ -211,7 +423,9 @@ async def check_agent_scope_for_project(
     been granted, and is rejected for any project it lacks a grant for.  See
     the grant-gated model in docs/agent-coordination.md.
 
-    Returns None when no Authorization header is present.
+    Returns None when no Authorization header is present, or when a valid
+    human-principal token is presented (``principal_type == "human"``
+    short-circuits via ``_verify_agent_scope``).
 
     Raises:
       401/403 -- exactly as ``check_agent_scope`` (bad token / inactive agent /
@@ -238,3 +452,60 @@ async def check_agent_scope_for_project(
     if not grant_ok:
         raise HTTPException(status_code=403, detail=PROJECT_SCOPE_MISMATCH_DETAIL)
     return canonical_id
+
+
+async def check_agent_project_grants(
+    request: Request, required_scope: str
+) -> tuple[Optional[str], dict[str, dict]]:
+    """Resolve an agent's project-bound grants with ONE grant-store read.
+
+    This is the cross-project sibling of ``check_agent_scope_for_project``: it
+    performs the SAME full identity chain (EdDSA signature, active registry
+    record, rotation cutoff) exactly once, then returns every ACTIVE grant of
+    ``required_scope`` keyed by ``project_id`` so a caller can authorize many
+    projects in O(1) per project instead of re-fetching ``list_grants`` and
+    re-verifying the token for each one (the N+1 that a multi-project aggregate
+    would otherwise pay).
+
+    Returns ``(canonical_id, {project_id: grant})``, or ``(None, {})`` when no
+    Authorization header is present (the caller falls through to its own
+    session/admin handling).
+
+    Raises:
+      401/403 -- exactly as ``check_agent_scope`` (bad/inactive/superseded token),
+                 or 403 when a valid human-principal token is presented.
+    """
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.lower().startswith("bearer "):
+        return None, {}
+
+    raw_token = auth_header[7:].strip()
+    _private_pem, public_pem = _get_keypair(request)
+    try:
+        payload = verify_registry_token(raw_token, public_pem)
+    except ValueError:
+        raise HTTPException(status_code=401, detail="invalid or malformed registry token")
+
+    canonical_id: str = payload.get("sub", "")
+    if not canonical_id:
+        raise HTTPException(status_code=401, detail="token missing sub claim")
+
+    principal_type = payload.get("principal_type", "")
+    if principal_type == "human":
+        raise HTTPException(
+            status_code=403,
+            detail="human-principal token cannot enumerate agent project grants",
+        )
+
+    registry = _get_store(request)
+    record = await registry.get(canonical_id)
+    if record is None or record.get("status") != "active":
+        raise HTTPException(status_code=403, detail="agent is not active in the registry")
+
+    _enforce_rotation_cutoff(record, payload)
+
+    grants_store = _get_grants_store(request)
+    by_project = await _active_project_grants_by_project(
+        registry, grants_store, canonical_id, required_scope, now=datetime.now(timezone.utc)
+    )
+    return canonical_id, by_project

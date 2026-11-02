@@ -19,15 +19,17 @@ import re
 import time
 
 import httpx
-from fastapi import APIRouter, Request, Response
+from fastapi import APIRouter, Depends, Request, Response
 from fastapi.responses import JSONResponse
 
 from tinyagentos.taosnet import mesh, mesh_credentials
+from tinyagentos.issued_cookies import TAOS_ISSUED_COOKIES
 from tinyagentos.peer import resolve_local_identity_id
+from tinyagentos.auth_context import require_admin
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(require_admin)])
 
 # Per-host service tokens the join ready payload carries. They are persisted
 # server-side and stripped from the browser-facing poll body so a bearer
@@ -134,21 +136,23 @@ def _rewrite_set_cookie(value: str, secure_ok: bool) -> str:
     return "; ".join(kept)
 
 
-# The local admin session cookie. The browser presents it on every same-origin
-# /api/account/* call, but it must never be relayed to the upstream taos.my: a
+# Cookies this origin issues. The browser presents them on every same-origin
+# /api/account/* call, but none may be relayed to the upstream taos.my: a
 # taos.my log leak or compromise would otherwise expose valid local admin
-# session tokens. Only the cookies that belong upstream are forwarded.
-_LOCAL_SESSION_COOKIE = "taos_session"
+# session tokens -- and, until this was fixed, the CSRF token that satisfies
+# verify_csrf() for this origin. Only the cookies that belong upstream are
+# forwarded. See tinyagentos/issued_cookies.py for why this is a deny-list.
+_LOCAL_COOKIES = TAOS_ISSUED_COOKIES
 
 
 def _strip_local_session_cookie(cookie_header: str) -> str | None:
-    """Return ``cookie_header`` with the local ``taos_session`` cookie removed.
+    """Return ``cookie_header`` with every taOS-issued cookie removed.
 
-    Parses the incoming Cookie header and drops only the local session cookie,
-    preserving every other cookie (the upstream taos.my session cookie, etc.).
-    Returns ``None`` when no cookies remain, so the relayed request sends no
-    Cookie header at all. A malformed Cookie header is returned untouched rather
-    than dropping unrelated cookies.
+    Parses the incoming Cookie header and drops every cookie this origin issues,
+    preserving the rest (the upstream taos.my session cookie, etc.). Returns
+    ``None`` when no cookies remain, so the relayed request sends no Cookie
+    header at all. A malformed Cookie header is returned untouched rather than
+    dropping unrelated cookies.
     """
     kept: list[str] = []
     for part in cookie_header.split(";"):
@@ -156,7 +160,7 @@ def _strip_local_session_cookie(cookie_header: str) -> str | None:
         if not p:
             continue
         name = p.split("=", 1)[0].strip().lower()
-        if name == _LOCAL_SESSION_COOKIE:
+        if name in _LOCAL_COOKIES:
             continue
         kept.append(p)
     if not kept:

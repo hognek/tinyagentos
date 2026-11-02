@@ -4,8 +4,8 @@ import json
 import time
 from typing import TYPE_CHECKING
 
-from tinyagentos.base_store import BaseStore
 from tinyagentos.projects.ids import new_id
+from tinyagentos.projects.tx import ProjectsDBStore
 
 if TYPE_CHECKING:
     from tinyagentos.projects.events import ProjectEventBroker
@@ -72,7 +72,33 @@ def _row_to_element(row, description) -> dict:
     return e
 
 
-class ProjectCanvasStore(BaseStore):
+# Append-only tldraw_shape guard (Excalidraw migration). A user_shape row's
+# "tldraw_shape" blob is the only lossless copy of a drawing made on the old
+# tldraw board. No payload update may drop or rewrite it: whatever the client
+# sends, the stored blob is carried forward verbatim. Other kinds (and
+# user_shape rows that never held a blob) keep the wholesale-replace contract.
+_GUARDED_PAYLOAD_KEY = "tldraw_shape"
+_GUARDED_KIND = "user_shape"
+
+
+def guard_payload_update(existing: dict | None, new_payload: dict) -> dict:
+    """Return the payload to store when *existing* is patched with *new_payload*.
+
+    *existing* is the current element row (as returned by get_element) or
+    None. When it is a user_shape whose payload holds a tldraw_shape, that
+    value wins over anything in *new_payload* (absent or different).
+    """
+    if not existing or existing.get("kind") != _GUARDED_KIND:
+        return new_payload
+    old_payload = existing.get("payload")
+    if not isinstance(old_payload, dict) or _GUARDED_PAYLOAD_KEY not in old_payload:
+        return new_payload
+    merged = dict(new_payload)
+    merged[_GUARDED_PAYLOAD_KEY] = old_payload[_GUARDED_PAYLOAD_KEY]
+    return merged
+
+
+class ProjectCanvasStore(ProjectsDBStore):
     SCHEMA = CANVAS_SCHEMA
 
     def __init__(self, db_path, *, broker: "ProjectEventBroker | None" = None) -> None:
@@ -85,22 +111,35 @@ class ProjectCanvasStore(BaseStore):
         # before the element tag existed on canvas items get the column added
         # here; fresh installs already have it from SCHEMA. Swallow the
         # duplicate-column error the same way the task/element stores do.
+        # DDL runs outside tx(): the connection is in autocommit mode, so each
+        # statement commits on its own and the expected duplicate-column error
+        # has no transaction left to leak.
         try:
             await self._db.execute(
                 "ALTER TABLE project_canvas_elements ADD COLUMN element_id TEXT"
             )
-            await self._db.commit()
         except Exception:
             pass
         # Created here (not in SCHEMA) so the column exists first on the
         # migration path. Idempotent (IF NOT EXISTS).
         await self._db.execute(_CANVAS_ELEMENT_INDEX)
-        await self._db.commit()
 
     async def _publish(self, project_id: str, kind: str, payload: dict) -> None:
-        if self._broker is not None:
-            from tinyagentos.projects.events import ProjectEvent
-            await self._broker.publish(project_id, ProjectEvent(kind=kind, payload=payload))
+        """Announce a canvas mutation once its write has actually committed.
+
+        Held back until the outermost transaction commits when this call is
+        made from inside one -- a joined scope returns without committing, so
+        emitting there would announce a change that can still roll back.
+        """
+        if self._broker is None:
+            return
+        from tinyagentos.projects.events import ProjectEvent
+        event = ProjectEvent(kind=kind, payload=payload)
+
+        async def _emit() -> None:
+            await self._broker.publish(project_id, event)
+
+        await self._after_commit(_emit)
 
     async def get_element(
         self, element_id: str, *, project_id: str | None = None
@@ -114,11 +153,60 @@ class ProjectCanvasStore(BaseStore):
                 "WHERE id = ? AND project_id = ?"
             )
             args = (element_id, project_id)
-        async with self._db.execute(sql, args) as cur:
+        async with self._read(sql, args) as cur:
             row = await cur.fetchone()
             if row is None:
                 return None
             return _row_to_element(row, cur.description)
+
+    async def get_element_any(
+        self, element_id: str, *, project_id: str
+    ) -> dict | None:
+        sql = (
+            "SELECT * FROM project_canvas_elements "
+            "WHERE id = ? AND project_id = ?"
+        )
+        args = (element_id, project_id)
+        async with self._read(sql, args) as cur:
+            row = await cur.fetchone()
+            if row is None:
+                return None
+            return _row_to_element(row, cur.description)
+
+    async def list_legacy(
+        self, project_id: str, include_deleted: bool = False
+    ) -> list[dict]:
+        sql = (
+            "SELECT id, project_id, kind, author_kind, author_id, "
+            "x, y, w, h, rotation, z_index, payload, created_at, updated_at, deleted_at, element_id "
+            "FROM project_canvas_elements "
+            "WHERE project_id = ? AND json_extract(payload, '$.tldraw_shape') IS NOT NULL"
+        )
+        args: list = [project_id]
+        if not include_deleted:
+            sql += " AND deleted_at IS NULL"
+        sql += " ORDER BY z_index ASC, created_at ASC"
+        async with self._read(sql, args) as cur:
+            rows = await cur.fetchall()
+            desc = cur.description
+        results = []
+        for row in rows:
+            el = _row_to_element(row, desc)
+            payload = el.get("payload") or {}
+            tldraw_shape = payload.get("tldraw_shape")
+            if not isinstance(tldraw_shape, dict):
+                continue
+            results.append({
+                "element_id": el["id"],
+                "kind": el["kind"],
+                "deleted_at": el.get("deleted_at"),
+                "type": tldraw_shape.get("type"),
+                "x": el["x"],
+                "y": el["y"],
+                "w": el["w"],
+                "h": el["h"],
+            })
+        return results
 
     async def add_element(
         self,
@@ -145,8 +233,9 @@ class ProjectCanvasStore(BaseStore):
         # Upsert: the client may re-send an element it already created (e.g. a
         # shape hydrated then nudged), which a plain INSERT rejected with a
         # UNIQUE constraint 500. On conflict, update in place (keep created_at).
-        await self._db.execute(
-            """INSERT INTO project_canvas_elements
+        async with self._tx():
+            await self._db.execute(
+                """INSERT INTO project_canvas_elements
                (id, project_id, kind, author_kind, author_id,
                 x, y, w, h, rotation, z_index, payload, element_id, created_at, updated_at)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -157,18 +246,17 @@ class ProjectCanvasStore(BaseStore):
                  z_index=excluded.z_index, payload=excluded.payload,
                  element_id=excluded.element_id,
                  updated_at=excluded.updated_at""",
-            (
-                eid, project_id, kind, author_kind, author_id,
-                float(element["x"]), float(element["y"]),
-                float(element["w"]), float(element["h"]),
-                float(element.get("rotation", 0)),
-                int(element.get("z_index", 0)),
-                json.dumps(element.get("payload") or {}),
-                element_id,
-                now, now,
-            ),
-        )
-        await self._db.commit()
+                (
+                    eid, project_id, kind, author_kind, author_id,
+                    float(element["x"]), float(element["y"]),
+                    float(element["w"]), float(element["h"]),
+                    float(element.get("rotation", 0)),
+                    int(element.get("z_index", 0)),
+                    json.dumps(element.get("payload") or {}),
+                    element_id,
+                    now, now,
+                ),
+            )
         new_el = await self.get_element(eid)
         await self._publish(
             project_id, "canvas.element_added",
@@ -180,6 +268,8 @@ class ProjectCanvasStore(BaseStore):
         self,
         project_id: str,
         element_id: "str | None" = None,
+        *,
+        include_deleted: bool = False,
     ) -> list[dict]:
         """Canvas items for a project, optionally scoped to one element.
 
@@ -187,11 +277,14 @@ class ProjectCanvasStore(BaseStore):
         ``None`` returns every (non-deleted) item, ``"none"`` returns only
         untagged items (``element_id IS NULL``), and any other string returns
         items tagged with that element id.
+
+        ``include_deleted`` is the manual-recovery path (the canvas raw JSON
+        backup): soft-deleted rows are returned too, and every row carries a
+        boolean ``deleted`` flag so a restore can tell them apart.
         """
-        sql = (
-            "SELECT * FROM project_canvas_elements "
-            "WHERE project_id = ? AND deleted_at IS NULL"
-        )
+        sql = "SELECT * FROM project_canvas_elements WHERE project_id = ?"
+        if not include_deleted:
+            sql += " AND deleted_at IS NULL"
         params: list = [project_id]
         if element_id == "none":
             sql += " AND element_id IS NULL"
@@ -199,10 +292,14 @@ class ProjectCanvasStore(BaseStore):
             sql += " AND element_id = ?"
             params.append(element_id)
         sql += " ORDER BY z_index ASC, created_at ASC"
-        async with self._db.execute(sql, params) as cur:
+        async with self._read(sql, params) as cur:
             rows = await cur.fetchall()
             desc = cur.description
-        return [_row_to_element(r, desc) for r in rows]
+        elements = [_row_to_element(r, desc) for r in rows]
+        if include_deleted:
+            for e in elements:
+                e["deleted"] = e.get("deleted_at") is not None
+        return elements
 
     async def _check_edit_permission(
         self, project_id: str, author_kind: str, author_id: str
@@ -211,7 +308,7 @@ class ProjectCanvasStore(BaseStore):
             return
         if author_kind != "agent":
             raise ValueError(f"invalid author_kind: {author_kind}")
-        async with self._db.execute(
+        async with self._read(
             "SELECT can_edit_canvas FROM project_members "
             "WHERE project_id = ? AND member_id = ?",
             (project_id, author_id),
@@ -235,7 +332,7 @@ class ProjectCanvasStore(BaseStore):
             return
         if author_kind != "agent":
             raise ValueError(f"invalid author_kind: {author_kind}")
-        async with self._db.execute(
+        async with self._read(
             "SELECT can_read_canvas FROM project_members "
             "WHERE project_id = ? AND member_id = ?",
             (project_id, author_id),
@@ -262,9 +359,10 @@ class ProjectCanvasStore(BaseStore):
             if col in patch:
                 sets.append(f"{col} = ?")
                 params.append(patch[col])
-        if "payload" in patch:
+        has_payload = "payload" in patch
+        if has_payload:
             sets.append("payload = ?")
-            params.append(json.dumps(patch["payload"]))
+            params.append(None)  # filled in under the transaction below
         if not sets:
             existing = await self.get_element(element_id, project_id=project_id)
             if existing is None:
@@ -273,12 +371,29 @@ class ProjectCanvasStore(BaseStore):
         sets.append("updated_at = ?"); params.append(time.time())
         params.append(element_id)
         params.append(project_id)
-        await self._db.execute(
-            f"UPDATE project_canvas_elements SET {', '.join(sets)} "
-            f"WHERE id = ? AND project_id = ? AND deleted_at IS NULL",
-            params,
-        )
-        await self._db.commit()
+        async with self._tx():
+            if has_payload:
+                # Read the stored row inside the same transaction as the write
+                # so a concurrent update cannot slip a different tldraw_shape
+                # between the read and the UPDATE.
+                async with self._db.execute(
+                    "SELECT * FROM project_canvas_elements "
+                    "WHERE id = ? AND project_id = ?",
+                    (element_id, project_id),
+                ) as cur:
+                    row = await cur.fetchone()
+                    existing = (
+                        _row_to_element(row, cur.description) if row is not None else None
+                    )
+                payload_idx = sets.index("payload = ?")
+                params[payload_idx] = json.dumps(
+                    guard_payload_update(existing, patch["payload"])
+                )
+            await self._db.execute(
+                f"UPDATE project_canvas_elements SET {', '.join(sets)} "
+                f"WHERE id = ? AND project_id = ? AND deleted_at IS NULL",
+                params,
+            )
         updated = await self.get_element(element_id, project_id=project_id)
         if updated is None:
             raise ValueError(f"element not found: {element_id}")
@@ -297,15 +412,20 @@ class ProjectCanvasStore(BaseStore):
         author_id: str,
     ) -> None:
         await self._check_edit_permission(project_id, author_kind, author_id)
+        # Deletes are SOFT and must stay soft: the row (and its payload) remains
+        # readable through get_element for the recovery path. Never add a hard
+        # DELETE / purge of rows whose payload holds "tldraw_shape" - that blob
+        # is the only lossless copy of a legacy tldraw drawing.
         now = time.time()
-        cur = await self._db.execute(
-            """UPDATE project_canvas_elements
-               SET deleted_at = ?, updated_at = ?
-               WHERE id = ? AND project_id = ? AND deleted_at IS NULL""",
-            (now, now, element_id, project_id),
-        )
-        await self._db.commit()
-        if cur.rowcount == 1:
+        async with self._tx():
+            cur = await self._db.execute(
+                """UPDATE project_canvas_elements
+                   SET deleted_at = ?, updated_at = ?
+                   WHERE id = ? AND project_id = ? AND deleted_at IS NULL""",
+                (now, now, element_id, project_id),
+            )
+            changed = cur.rowcount == 1
+        if changed:
             await self._publish(
                 project_id, "canvas.element_deleted",
                 {"element_id": element_id, "actor": {"kind": author_kind, "id": author_id}},

@@ -10,9 +10,18 @@ These endpoints proxy the bus: the Messages app can list bus channels and read
 messages (read paths), and a registry-authenticated agent (or an admin) can post
 a message (POST /api/a2a/bus/send). The raw bus is unauthenticated on the LAN and
 trusts its ``from`` field, so the send proxy is the authenticated write path --
-an agent posts as its OWN registry handle (scope ``a2a_send``), never able to
+an agent posts as its OWN registry identity (scope ``a2a_send``), never able to
 spoof another identity or borrow the owner's account. The URL is resolved from
 ``TAOS_A2A_BUS_URL``.
+
+An authenticated agent's post is attributed to its registry ``canonical_id`` and
+carries its registry JWT, forwarded to the bus as ``Authorization: Bearer ...``.
+Both halves are required: the bus authorises a sender by verifying the token
+signature against the registry and then requiring ``token sub == from``, so a
+message attributed to a display handle cannot be verified at all, and a
+credential the bus never receives is indistinguishable from no credential.
+Attribution is therefore the identity the bus can actually check, and the
+readable handle stays a display/alias concern (taOS #2156).
 
 Bus API (verified live):
   GET  {bus}/a2a/channels
@@ -24,17 +33,23 @@ Bus API (verified live):
 """
 from __future__ import annotations
 
+import ipaddress
 import logging
+import math
 import os
+from dataclasses import dataclass
+from urllib.parse import urlparse
 
 import httpx
 import asyncio
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
-from tinyagentos.agent_token_auth import check_agent_scope
+from tinyagentos.agent_registry_store import mint_registry_token
+from tinyagentos.agent_token_auth import check_agent_scope, check_human_identity
+from tinyagentos.auth_context import CurrentUser, current_user
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +65,99 @@ _STREAM_HEARTBEAT_SEC = 25
 def _bus_url() -> str:
     """Resolve the bus base URL from the environment, trailing slash stripped."""
     return os.environ.get("TAOS_A2A_BUS_URL", _DEFAULT_BUS_URL).rstrip("/")
+
+
+def _is_url_safe_for_credential(url: str, *, allow_private: bool = False) -> bool:
+    """Return True when *url* is safe to carry a credential.
+
+    Safe = https anywhere, or http on a loopback or (when *allow_private*
+    is True) private / tailnet address. Public http endpoints must never
+    carry a credential in cleartext.
+    """
+    parsed = urlparse(url)
+    if parsed.scheme == "https":
+        return True
+    if parsed.scheme != "http":
+        return False
+    hostname = (parsed.hostname or "").lower()
+    if not hostname:
+        return False
+    if hostname == "localhost":
+        return True
+    try:
+        addr = ipaddress.ip_address(hostname)
+    except ValueError:
+        # Not an IP address — could be a hostname. When allow_private=True,
+        # trust bare hostnames that look like LAN / tailnet names:
+        #   - ends with .local, .lan, .home.arpa, .ts.net
+        #   - single-label (no dot at all)
+        if allow_private:
+            if hostname.endswith((".local", ".lan", ".home.arpa", ".ts.net")):
+                return True
+            if "." not in hostname:
+                return True
+        return False
+    if addr.is_loopback:
+        return True
+    if allow_private:
+        if addr.is_private:
+            if addr.version == 6:
+                # Exclude documentation range 2001:db8::/32 (RFC 3849) from
+                # the generic is_private bucket: those addresses are not
+                # routable on any real network and must not be advertised in
+                # credential-bearing bundles.
+                doc_net = ipaddress.ip_network("2001:db8::/32")
+                if addr in doc_net:
+                    return False
+            return True
+        # Tailscale CGNAT range 100.64.0.0/10 is not flagged as private by
+        # Python's ipaddress, but is a tailnet address and should be trusted.
+        if addr.version == 4:
+            tailscale_net = ipaddress.ip_network("100.64.0.0/10")
+            if addr in tailscale_net:
+                return True
+        # Tailscale ULA fd7a:115c:a1e0::/48 is already is_private (ULA), but
+        # keep the explicit check for clarity / future-proofing.
+        if addr.version == 6:
+            tailscale_ula = ipaddress.ip_network("fd7a:115c:a1e0::/48")
+            if addr in tailscale_ula:
+                return True
+    return False
+
+
+def _credential_may_cross(bus_url: str) -> bool:
+    """Return True when the caller's registry credential may be forwarded to *bus_url*.
+
+    The credential is forwarded over:
+
+    - any ``https://`` destination (TLS protects it in transit), or
+    - an ``http://`` destination whose host is a loopback address
+      (``127.0.0.1``, ``::1``, or the literal hostname ``localhost``), because
+      the traffic never leaves the host.
+
+    Non-loopback ``http://`` destinations drop the credential: forwarding a
+    long-lived registry JWT in cleartext across the LAN would hand a replayable
+    credential to a passive observer.
+
+    The operator can opt back in for a specific non-loopback deployment by
+    setting ``TAOS_A2A_BUS_ALLOW_INSECURE_CREDENTIAL`` to any truthy value.
+
+    The host check uses parsed address resolution, not substring matching:
+    ``http://127.0.0.1.evil.test:7900`` does NOT count as loopback.
+    """
+    if _is_url_safe_for_credential(bus_url, allow_private=False):
+        return True
+    return bool(os.environ.get("TAOS_A2A_BUS_ALLOW_INSECURE_CREDENTIAL"))
+
+
+def _sanitise_handle(handle: str) -> str:
+    """Strip non-printable characters and cap at 64 characters.
+
+    Shared by the admin and human branches of ``_resolve_send_identity`` so
+    the two paths cannot drift apart: a handle carrying a newline or control
+    character cannot inject into bus records or log lines.
+    """
+    return "".join(c for c in handle if c.isprintable())[:64].strip()
 
 
 async def _authorize_bus_read(request: Request) -> None:
@@ -100,39 +208,107 @@ async def bus_channels(request: Request):
     return {"channels": channels, "available": True}
 
 
+# Query params this endpoint understands.  Anything else is a 400 rather than a
+# silent no-op: an ignored cursor param is indistinguishable from a cursor that
+# works, so a reader that passes `since_id=` believes it is reading incrementally
+# while it re-reads the whole window forever.  Measured on the live proxy before
+# this changed: `since_id=2430` returned 500 messages starting at id 1890.
+_MESSAGES_PARAMS = frozenset({"channel", "thread", "limit", "since"})
+
+# Selectors meaning "every thread", not one named channel.  `all` is the idiom
+# the raw bus and `taosmd a2a-watch` document, and it exists precisely so a
+# reader cannot miss a thread created after it started.  Forwarded here as "omit
+# the thread param", which is how the bus itself spells all-threads.
+_ALL_CHANNELS = frozenset({"all", "*"})
+
+_STREAM_PARAMS = frozenset({"channel", "since"})
+
+
 @router.get("/api/a2a/bus/messages")
-async def bus_messages(
-    request: Request,
-    channel: str = "",
-    limit: int = 100,
-    since: float | None = None,
-):
-    """Read messages from one bus channel, oldest-first as the bus returns them.
+async def bus_messages(request: Request):
+    """Read messages from the bus, oldest-first as the bus returns them.
 
     Authorized readers: an admin session, the host local token, or an active
     agent registry JWT holding the ``a2a_receive`` scope.
 
-    ``channel`` is required and maps to the bus ``thread`` query param; ``*`` is
-    rejected here (it is only meaningful as an all-threads selector on the
-    stream endpoint). ``limit`` is clamped to 1..500. ``since`` is forwarded
-    verbatim to the bus as the cursor (a message ``ts``); the bus replays
-    everything after it, so an agent can resume from the highest ``ts`` it has
-    processed. On a bus error this returns an empty list with ``available:
-    false`` and HTTP 200.
+    ``channel`` is required and maps to the bus ``thread`` query param;
+    ``thread`` is accepted as an alias because that is the raw bus's own name
+    for it.  ``channel=all`` (or ``*``) reads every thread.  ``limit`` is clamped
+    to 1..500.  ``since`` is the cursor and is a message ``ts`` (a float), NOT an
+    id -- it is forwarded verbatim and the bus replays everything after it.  Any
+    other query param is a 400.  On a bus error this returns an empty list with
+    ``available: false`` and HTTP 200.
+
+    A named channel that the bus does not know is reported as ``channel_known:
+    false`` alongside the empty list.  Channels on this bus exist only once
+    something has been posted to them, so an unknown name and a channel nobody
+    has written to yet are the same state -- but a reader that quietly gets a
+    200 and nothing else cannot tell a typo from a quiet channel, and stays
+    silent forever believing it is connected.
     """
     await _authorize_bus_read(request)
-    if not channel:
-        return JSONResponse({"error": "channel required"}, status_code=400)
-    if channel == "*":
+
+    unknown = sorted(set(request.query_params.keys()) - _MESSAGES_PARAMS)
+    if unknown:
         return JSONResponse(
-            {"error": "wildcard channel not supported here; use /api/a2a/bus/stream for all-threads"},
+            {
+                "error": f"unknown query parameter(s): {', '.join(unknown)}",
+                "accepted": sorted(_MESSAGES_PARAMS),
+                "hint": "the cursor is 'since' and takes a message ts (float), not an id",
+            },
             status_code=400,
         )
 
+    # `thread` is an alias for `channel`, so passing BOTH with different values
+    # has no correct interpretation -- and picking one silently drops the other,
+    # which is the same "ignored param reads as a working one" failure this
+    # endpoint is being fixed for.  Identical values are harmless and allowed.
+    chan_param = request.query_params.get("channel") or ""
+    thread_param = request.query_params.get("thread") or ""
+    if chan_param and thread_param and chan_param != thread_param:
+        return JSONResponse(
+            {
+                "error": (
+                    "channel and thread are the same parameter and disagree: "
+                    f"channel={chan_param!r} thread={thread_param!r}"
+                ),
+                "hint": "pass one of them, not both",
+            },
+            status_code=400,
+        )
+    channel = chan_param or thread_param
+    if not channel:
+        return JSONResponse({"error": "channel required"}, status_code=400)
+
+    try:
+        limit = int(request.query_params.get("limit", 100))
+    except ValueError:
+        return JSONResponse({"error": "limit must be an integer"}, status_code=400)
     limit = max(1, min(500, limit))
-    params: dict = {"thread": channel, "limit": limit}
-    if since is not None:
-        params["since"] = since
+
+    since_raw = request.query_params.get("since")
+    params: dict = {"limit": limit}
+    if channel not in _ALL_CHANNELS:
+        params["thread"] = channel
+    if since_raw is not None:
+        try:
+            since_val = float(since_raw)
+        except ValueError:
+            return JSONResponse(
+                {"error": "since must be a message ts (float), not an id"},
+                status_code=400,
+            )
+        # float() happily accepts "nan", "inf" and "-inf".  A NaN cursor makes
+        # every comparison on the bus side false, so the reader gets a silent
+        # empty window forever and a 200 confirming it -- the exact failure this
+        # endpoint is being fixed for, reintroduced through the validator.
+        if not math.isfinite(since_val):
+            return JSONResponse(
+                {"error": "since must be a finite message ts (float), not an id"},
+                status_code=400,
+            )
+        params["since"] = since_val
+
     bus = _bus_url()
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
@@ -147,14 +323,58 @@ async def bus_messages(
         return JSONResponse({"messages": [], "available": False}, status_code=200)
 
     messages = data.get("messages", []) if isinstance(data, dict) else []
-    return {"messages": messages, "available": True}
+    body: dict = {"messages": messages, "available": True}
+
+    # Only pay for the channel lookup when the answer is empty AND a specific
+    # channel was named -- that is the only case where "no messages" is
+    # ambiguous, and it keeps the normal read at one bus call.
+    if not messages and channel not in _ALL_CHANNELS:
+        body["channel_known"] = await _channel_exists(bus, channel)
+    return body
+
+
+async def _channel_exists(bus: str, channel: str) -> bool:
+    """True if *channel* appears in the bus channel list.
+
+    Fails OPEN (returns True) when the channel list cannot be fetched: an
+    unreachable bus must not be reported to the caller as "your channel name is
+    wrong", which would send them chasing a typo that does not exist.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(f"{bus}/a2a/channels")
+            resp.raise_for_status()
+            data = resp.json()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("A2A bus channel probe failed (%s): %s", bus, exc)
+        return True
+    # Fail open on a payload we cannot read, not just on a transport failure.
+    # A 200 carrying an error body (or anything that is not the channel list)
+    # would otherwise leave `channels` empty and report every channel as
+    # unknown -- an accusation of a typo, generated by a bus-side fault, which
+    # is precisely the false alarm this probe exists to avoid.
+    if not isinstance(data, dict) or "channels" not in data:
+        logger.warning(
+            "A2A bus channel probe got an unreadable payload from %s: %r", bus, data
+        )
+        return True
+    channels = data.get("channels") or []
+    # The bus spells it "channel" in this payload (verified against the live bus:
+    # {"channels":[{"channel":"build","members":[...],...}]}) while the SAME
+    # concept is "thread" on /a2a/messages. Accept both rather than trust one
+    # spelling; an empty name set here would silently report every channel as
+    # unknown, which is the exact false alarm this function exists to avoid.
+    names = {
+        (c.get("channel") or c.get("name") or c.get("thread")) if isinstance(c, dict) else c
+        for c in channels
+    }
+    return channel in names
 
 
 @router.get("/api/a2a/bus/stream")
 async def bus_stream(
     request: Request,
     channel: str = "",
-    since: float | None = None,
 ):
     """Authenticated SSE proxy to the raw bus stream.
 
@@ -167,10 +387,45 @@ async def bus_stream(
 
     ``channel`` maps to the bus ``thread`` query param. Omitting it (or passing
     ``channel=*``) subscribes to ALL threads: no ``thread`` param is forwarded
-    upstream, so the bus streams events from every thread. ``since`` maps to the
-    bus cursor.
+    upstream, so the bus streams events from every thread. ``since`` is the cursor
+    and is a message ``ts`` (a float), NOT an id -- any other query param is a 400.
     """
     await _authorize_bus_read(request)
+
+    unknown = sorted(set(request.query_params.keys()) - _STREAM_PARAMS)
+    if unknown:
+        return JSONResponse(
+            {
+                "error": f"unknown query parameter(s): {', '.join(unknown)}",
+                "accepted": sorted(_STREAM_PARAMS),
+                "hint": "the cursor is 'since' and takes a message ts (float), not an id",
+            },
+            status_code=400,
+        )
+
+    params: dict = {}
+    # Manual since parsing: FastAPI's `since: float | None = None` annotation
+    # causes non-numeric values like `?since=abc` to trigger a 422 instead of
+    # the project-consistent 400 seen on /messages. Parse from query params first.
+    since_raw = request.query_params.get("since")
+    if since_raw is not None:
+        try:
+            since_val = float(since_raw)
+        except ValueError:
+            return JSONResponse(
+                {"error": "since must be a message ts (float), not an id"},
+                status_code=400,
+            )
+        # float() happily accepts "nan", "inf" and "-inf".  A NaN cursor makes
+        # every comparison on the bus side false, so the reader gets a silent
+        # empty window forever and a 200 confirming it -- the exact failure this
+        # endpoint is being fixed for, reintroduced through the validator.
+        if not math.isfinite(since_val):
+            return JSONResponse(
+                {"error": "since must be a finite message ts (float), not an id"},
+                status_code=400,
+            )
+        params["since"] = since_val
 
     # An empty channel or "*" means "all threads": omit the thread param
     # upstream so the bus streams every thread. NOTE: when per-channel bus ACLs
@@ -178,12 +433,8 @@ async def bus_stream(
     # threads it is allowed to read, not everything -- filter here, not at the
     # bus. This is the line a future change will get wrong.
     all_threads = channel == "" or channel == "*"
-    params: dict = {}
     if not all_threads:
         params["thread"] = channel
-    if since is not None:
-        params["since"] = since
-
     bus = _bus_url()
 
     async def event_stream():
@@ -194,26 +445,35 @@ async def bus_stream(
                     f"{bus}/a2a/stream",
                     params=params,
                 ) as upstream:
+                    it = upstream.aiter_lines().__aiter__()
                     heartbeat = asyncio.create_task(
                         _stream_sleep(_STREAM_HEARTBEAT_SEC)
                     )
+                    next_line = asyncio.ensure_future(it.__anext__())
                     try:
-                        async for line in upstream.aiter_lines():
-                            if await request.is_disconnected():
-                                break
-                            # Drain any pending heartbeat that fired while we were
-                            # forwarding real data: emit it before the next event.
-                            if heartbeat.done():
-                                heartbeat.cancel()
+                        while True:
+                            done, pending = await asyncio.wait(
+                                {next_line, heartbeat},
+                                return_when=asyncio.FIRST_COMPLETED,
+                            )
+                            if heartbeat in done:
                                 yield ": ping\n\n"
                                 heartbeat = asyncio.create_task(
                                     _stream_sleep(_STREAM_HEARTBEAT_SEC)
                                 )
-                            if line == "":
-                                continue
-                            yield f"{line}\n\n"
+                            if next_line in done:
+                                try:
+                                    line = next_line.result()
+                                except StopAsyncIteration:
+                                    break
+                                if line != "":
+                                    yield f"{line}\n\n"
+                                next_line = asyncio.ensure_future(it.__anext__())
+                            if await request.is_disconnected():
+                                break
                     finally:
                         heartbeat.cancel()
+                        next_line.cancel()
         except Exception as exc:  # noqa: BLE001 (surface a final SSE comment)
             logger.warning("A2A bus stream proxy failed (%s): %s", bus, exc)
             yield f": stream error\n\n"
@@ -238,8 +498,8 @@ class BusSendBody(BaseModel):
 
     ``from_`` (JSON key ``from``) is honored ONLY for admin callers, so an
     operator can post as any handle. For an agent-token caller it is ignored and
-    the ``from`` is derived from the agent's own registry handle -- one agent can
-    never post as another.
+    the ``from`` is derived from the agent's own registry identity -- one agent
+    can never post as another.
     """
 
     thread: str
@@ -250,35 +510,98 @@ class BusSendBody(BaseModel):
     model_config = {"populate_by_name": True}
 
 
-async def _resolve_send_identity(request: Request, body_from: str | None) -> str:
-    """Return the bus ``from`` handle authorized for this send, or raise.
+@dataclass(frozen=True)
+class _BusIdentity:
+    """Who a bus send is attributed to, and the credential that proves it.
+
+    ``from_handle`` is the value the bus records as the message author.
+    ``credential`` is the caller's OWN registry JWT, forwarded to the bus so the
+    bus can verify the author against the registry instead of trusting the
+    request body. ``None`` means this caller presents no bus-verifiable
+    credential (an admin session, or a human assertion whose spelling the bus
+    does not resolve yet) -- the proxy still authorizes the caller, but the bus
+    has nothing to check, which is the pre-existing state for those callers.
+    """
+
+    from_handle: str
+    credential: str | None = None
+
+
+def _bearer_token(request: Request) -> str | None:
+    """Return the caller's raw Bearer credential, or None when absent.
+
+    Returned VERBATIM: it is forwarded to the bus, which verifies the signature
+    over the exact bytes it was signed with. Normalising it here (trimming
+    interior characters, re-encoding) would invalidate the signature and turn a
+    verifiable send into a rejected one.
+    """
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.lower().startswith("bearer "):
+        return None
+    return auth_header[7:].strip() or None
+
+
+async def _resolve_send_identity(
+    request: Request, body_from: str | None
+) -> _BusIdentity:
+    """Return the identity (and credential) authorized for this send, or raise.
 
     - Admin (session cookie or local token): may set an explicit ``from``
       (operator posts as any handle); defaults to ``@operator`` when omitted.
+      No credential is forwarded: an admin credential is a session cookie or the
+      host local token, neither of which the bus can verify, and the local token
+      is admin-equivalent ON THIS CONTROLLER -- handing it to another service
+      would widen its blast radius for no authentication gain.
     - Otherwise the caller must present a registry JWT holding an active
-      ``a2a_send`` grant. The ``from`` is DERIVED from that agent's registry
-      handle; a client-supplied ``from`` is ignored, so an agent cannot spoof
-      another agent's identity. ``check_agent_scope`` raises 401/403; a missing
-      Bearer header returns None and is rejected here as 403 (fail closed).
+      ``a2a_send`` grant (agent) or a valid human-principal token. The ``from``
+      is DERIVED from the credential for both principal types; a client-supplied
+      ``from`` is ignored, so neither an agent nor a human can spoof another
+      identity. ``check_agent_scope`` raises 401/403; ``check_human_identity``
+      raises 401/403; a missing Bearer header returns None from both and is
+      rejected here as 403 (fail closed).
     """
     if getattr(request.state, "is_admin", False):
-        # Admin may post as an explicit handle, but keep it a single clean token
-        # so it cannot inject newlines/control chars into the bus record or logs.
-        handle = (body_from or "").strip()
-        handle = "".join(c for c in handle if c.isprintable())[:64].strip()
-        return handle or "@operator"
+        handle = _sanitise_handle(body_from or "")
+        return _BusIdentity(handle or "@operator")
 
     caller = await check_agent_scope(request, "a2a_send")
-    if caller is None:
-        raise HTTPException(status_code=403, detail="forbidden")
+    if caller is not None:
+        registry = getattr(request.app.state, "agent_registry", None)
+        record = await registry.get(caller) if registry is not None else None
+        handle = ((record or {}).get("handle") or "").strip()
+        if not handle:
+            # Kept deliberately: a registry record with no handle is an
+            # incomplete bus identity (the handle is what every reader and the
+            # alias layer resolves, taOS #2156), and relaxing an access
+            # condition is not this change's business.
+            raise HTTPException(status_code=403, detail="agent has no bus handle")
+        # Attribute the message to the registry ``canonical_id`` (the token's
+        # ``sub``), not to the display handle. The bus derives identity from the
+        # credential: it verifies the signature and then requires
+        # ``token sub == from``. A handle-spelled ``from`` can never satisfy
+        # that, so an authenticated agent's post would still be recorded as
+        # unverifiable -- the exact gap this closes. The readable handle is
+        # resolved from the same identity for display (taOS #2156).
+        return _BusIdentity(caller, _bearer_token(request))
 
-    registry = getattr(request.app.state, "agent_registry", None)
-    record = await registry.get(caller) if registry is not None else None
-    handle = ((record or {}).get("handle") or "").strip()
-    if not handle:
-        # An active a2a_send grant with no bus handle cannot be safely attributed.
-        raise HTTPException(status_code=403, detail="agent has no bus handle")
-    return handle
+    human_id = await check_human_identity(request)
+    if human_id is not None:
+        auth = getattr(request.app.state, "auth", None)
+        user = auth.get_user_by_id(human_id) if auth else None
+        username = ((user or {}).get("username") or "").strip()
+        if not username:
+            raise HTTPException(status_code=403, detail="human has no username")
+        # The assertion is NOT forwarded: a human assertion's ``sub`` is the
+        # user_id while its bus ``from`` is ``@<username>``, and the bus's
+        # principal-spelling policy for humans is not settled yet (taosmd
+        # a2a-bus-auth-transition, open question 1). Forwarding it today would
+        # present a credential whose sub cannot match the from it accompanies.
+        # A username of only non-printable characters sanitises to a bare "@";
+        # fall back to "@operator" exactly as the admin branch does.
+        handle = _sanitise_handle(f"@{username}")
+        return _BusIdentity(handle if handle != "@" else "@operator")
+
+    raise HTTPException(status_code=403, detail="forbidden")
 
 
 @router.post("/api/a2a/bus/send")
@@ -287,13 +610,21 @@ async def bus_send(request: Request, body: BusSendBody):
 
     Authorized senders: an admin session / host local token (may set ``from``),
     or an active agent registry JWT holding the ``a2a_send`` scope (``from`` is
-    forced to the agent's own handle). This is the authenticated write path so
-    agents post as themselves instead of sharing the owner's account.
+    forced to the agent's own registry identity). This is the authenticated
+    write path so agents post as themselves instead of sharing the owner's
+    account.
+
+    An agent caller's registry JWT is forwarded to the bus, and the ``from`` it
+    accompanies is the SAME identity the token proves (the registry
+    ``canonical_id``). Those two travel together or not at all: the bus checks
+    the signature and then requires ``token sub == from``, so forwarding the
+    credential under a different spelling would be presenting a proof that
+    cannot match its own claim.
 
     Unlike the read endpoints, a bus failure surfaces as 502: a caller must know
     when its message did not land.
     """
-    from_handle = await _resolve_send_identity(request, body.from_)
+    identity = await _resolve_send_identity(request, body.from_)
 
     thread = body.thread.strip()
     text = body.body.strip()
@@ -307,18 +638,69 @@ async def bus_send(request: Request, body: BusSendBody):
             {"error": "reply_to must be a positive message id"}, status_code=400
         )
 
-    payload: dict = {"from": from_handle, "thread": thread, "body": text}
+    payload: dict = {
+        "from": identity.from_handle,
+        "thread": thread,
+        "body": text,
+    }
     if body.reply_to is not None:
         payload["reply_to"] = body.reply_to
+
+    headers: dict[str, str] = {}
+    credential_forwarded = False
+    if identity.credential:
+        bus = _bus_url()
+        if _credential_may_cross(bus):
+            headers["Authorization"] = f"Bearer {identity.credential}"
+            credential_forwarded = True
+        else:
+            logger.warning(
+                "A2A bus credential withheld for non-loopback http destination %s",
+                bus,
+            )
 
     bus = _bus_url()
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
-            resp = await client.post(f"{bus}/a2a/send", json=payload)
+            resp = await client.post(
+                f"{bus}/a2a/send", json=payload, headers=headers or None
+            )
             resp.raise_for_status()
             data = resp.json()
     except Exception as exc:  # noqa: BLE001
         logger.warning("A2A bus send failed (%s): %s", bus, exc)
         raise HTTPException(status_code=502, detail="a2a bus unavailable")
 
-    return {"ok": True, "from": from_handle, "message": data}
+    return {"ok": True, "from": identity.from_handle, "message": data, "credential_forwarded": credential_forwarded}
+
+
+@router.post("/api/a2a/bus/human-assertion")
+async def issue_human_assertion(
+    request: Request,
+    _user: CurrentUser = Depends(current_user),
+):
+    """Issue a signed assertion for the currently authenticated human user.
+
+    The assertion is a compact EdDSA JWT (the same format and signing key as
+    agent registry tokens) with ``principal_type="human"`` and ``sub`` set to
+    the caller's ``user_id``.  It can be presented as ``Authorization: Bearer
+    <assertion>`` to the bus read/write proxies, where it is verified through
+    the SAME chain as agent JWTs.  The bus derives ``from`` from the credential
+    (``@<username>``), so a human cannot post as anyone else.
+
+    Returns the assertion token once; the caller must store it securely.
+    """
+    auth = getattr(request.app.state, "auth", None)
+    if auth is None:
+        raise RuntimeError("auth store not on app.state")
+    user = auth.get_user_by_id(_user.user_id)
+    if user is None:
+        raise HTTPException(status_code=403, detail="forbidden")
+
+    priv, _pub = request.app.state.agent_registry_keypair
+    token = mint_registry_token(
+        _user.user_id,
+        priv,
+        principal_type="human",
+    )
+    return {"assertion": token}

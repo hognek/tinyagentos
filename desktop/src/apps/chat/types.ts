@@ -3,12 +3,12 @@
 export interface Channel {
   id: string;
   name: string;
-  type: "dm" | "topic" | "group";
+  type: "dm" | "dm-remote" | "topic" | "group";
   description?: string;
   topic?: string;
   members?: string[];
   created_at?: string;
-  last_message_at?: string;
+  last_message_at?: string | number | null;
   lastPreview?: string;
   project_id?: string;
   settings?: {
@@ -44,5 +44,14 @@ export interface ProjectGroup {
   name: string;
   channels: Channel[];
 }
+
+/**
+ * Sidebar presence state for an agent DM channel, derived from the agent's
+ * registry status plus real-time "thinking" events.
+ * - "working" -- agent is actively generating (thinking / running a tool).
+ * - "live"    -- agent is registered as running and available.
+ * - "idle"    -- agent is paused, stopped, failed, or otherwise unavailable.
+ */
+export type AgentPresence = "live" | "working" | "idle";
 
 export type WsStatus = "connecting" | "connected" | "disconnected";

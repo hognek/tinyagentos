@@ -12,10 +12,12 @@ CLI is running on). Three subcommands:
   taos worker dedup enable|disable
       Toggle bees deduplication daemon inside the worker LXC.
 
-  taos worker resize-storage --size NGB
+  taos worker resize-storage --size SIZE
       Expand the worker LXC's btrfs loopback file. Stops the LXC,
       truncates the file to the new size, restarts the LXC, and
-      grows the btrfs filesystem.
+      grows the btrfs filesystem. SIZE is read by
+      ``tinyagentos.size_units``: IEC (``1.5TiB``), SI (``2TB``), a bare
+      unit letter (``500G``) or a raw byte count.
 
 Invoked via the ``taos-worker-ctl`` console script or directly:
 
@@ -31,11 +33,16 @@ import subprocess
 import sys
 from pathlib import Path
 
+from tinyagentos.app import resolve_data_dir
+from tinyagentos.cli.taosctl.client import ApiError, TaosClient
 from tinyagentos.cluster.convert_to_lxc import (
     drain_and_delete_agents,
     list_flat_mode_agents,
     redeploy_agents,
 )
+from tinyagentos.config import load_config
+from tinyagentos.llm_proxy import LLMProxy
+from tinyagentos.size_units import parse_size_bytes
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +54,91 @@ def _load_agents_json(path: Path = Path("data/agents.json")) -> list[dict]:
     return json.loads(path.read_text())
 
 
+async def _get_verified_gateway_port() -> int:
+    """Query the LOCAL controller for the verified LLM gateway agent-listener port.
+
+    Uses the taosctl authenticated client (TAOS_TOKEN or ~/.config/taosctl/config.json).
+    Returns 0 and exits non-zero when the local controller is unreachable, returns
+    non-2xx, or reports the gateway as not running.
+    """
+    try:
+        resp = await asyncio.to_thread(TaosClient().get, "/api/settings/llm-proxy")
+    except ApiError as exc:
+        if exc.status in (401, 403):
+            print(
+                f"ERROR: local controller rejected the token (HTTP {exc.status}): "
+                "set TAOS_TOKEN or run taosctl login. "
+                f"Detail: {exc.message}",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"ERROR: local controller returned HTTP {exc.status} for "
+                f"/api/settings/llm-proxy: {exc.message}",
+                file=sys.stderr,
+            )
+        return 0
+    except Exception as exc:
+        print(
+            "ERROR: cannot reach local controller at http://127.0.0.1:6969 "
+            "(TAOS_TOKEN or ~/.config/taosctl/config.json required). "
+            f"Detail: {exc}",
+            file=sys.stderr,
+        )
+        return 0
+    if not isinstance(resp, dict) or not resp.get("running") or not resp.get("port"):
+        print(
+            "ERROR: local controller reports gateway not running or port missing. "
+            "Ensure TAOS_TOKEN or ~/.config/taosctl/config.json is set and the "
+            "controller is active.",
+            file=sys.stderr,
+        )
+        return 0
+    try:
+        return int(resp["port"])
+    except (TypeError, ValueError):
+        print(
+            "ERROR: local controller returned an invalid gateway port.",
+            file=sys.stderr,
+        )
+        return 0
+
+
+async def _get_agent_controller_port() -> int:
+    """The LOCAL controller's verified agent controller listener port, or 0."""
+    try:
+        resp = await asyncio.to_thread(TaosClient().get, "/api/settings/llm-proxy")
+        return int(resp.get("agent_controller_port") or 0)
+    except Exception:
+        return 0
+
+
 async def _convert_to_lxc(args) -> int:
+    # Preflight: verify gateway port against the LOCAL controller before
+    # touching anything. If this fails, exit non-zero having deleted nothing.
+    print("Verifying gateway port on local controller...")
+    gateway_port = await _get_verified_gateway_port()
+    if gateway_port == 0:
+        return 1
+    agent_controller_port = await _get_agent_controller_port()
+    if agent_controller_port == 0:
+        print("ERROR: local controller reports the agent controller listener not running.",
+              file=sys.stderr)
+        return 1
+
+    # Load config and build LLMProxy before touching anything. A bad
+    # config.yaml must abort having deleted nothing.
+    try:
+        data_dir = resolve_data_dir()
+        config = load_config(data_dir / "config.yaml")
+    except (ValueError, OSError) as exc:
+        print(f"ERROR: invalid config: {exc}", file=sys.stderr)
+        return 1
+    llm_proxy = LLMProxy(
+        port=config.server.get("litellm_port", 7834),
+        data_dir=data_dir,
+    )
+
     print("Enumerating flat-mode agents...")
     agents = list_flat_mode_agents()
     if not agents:
@@ -82,8 +173,12 @@ async def _convert_to_lxc(args) -> int:
         return r.returncode
 
     print("Redeploying agents into worker LXC...")
-    agent_cfgs = _load_agents_json()
-    await redeploy_agents(agent_cfgs)
+    agent_cfgs = _load_agents_json(data_dir / "agents.json")
+    failed = await redeploy_agents(agent_cfgs, llm_proxy=llm_proxy, gateway_port=gateway_port,
+                                    agent_controller_port=agent_controller_port)
+    if failed:
+        print(f"Redeploy failed for: {', '.join(failed)}", file=sys.stderr)
+        return 1
 
     print("Convert-to-LXC complete.")
     return 0
@@ -105,15 +200,16 @@ def _dedup(args) -> int:
 
 
 def _parse_iec_bytes(s: str) -> int:
-    """Parse '500G', '1T', '512M', or raw bytes into integer bytes.
-    Accepts the same forms as truncate(1)."""
-    s = s.strip()
-    units = {"K": 1024, "M": 1024**2, "G": 1024**3, "T": 1024**4}
-    if not s:
-        raise ValueError("empty size")
-    if s[-1].upper() in units:
-        return int(float(s[:-1]) * units[s[-1].upper()])
-    return int(s)
+    """Parse a size string into integer bytes.
+
+    Delegates to :mod:`tinyagentos.size_units`, so it accepts more than
+    the truncate(1) set this used to handle: IEC suffixes (``KiB``..``PiB``,
+    1024-based), SI suffixes (``kB``..``PB``, 1000-based), a bare unit
+    letter (``500G``, ``512M`` -- 1024-based) and a raw byte count.
+    Raises ``ValueError`` on anything else, including negative and
+    non-finite values.
+    """
+    return parse_size_bytes(s)
 
 
 def _resize_storage(args) -> int:
@@ -154,8 +250,12 @@ def _resize_storage(args) -> int:
     print("Stopping taos-worker...")
     subprocess.run(["sudo", "incus", "stop", "taos-worker"], check=True)
 
-    print(f"Resizing {pool_img} to {new_size_str}...")
-    subprocess.run(["sudo", "truncate", "-s", new_size_str, pool_img], check=True)
+    print(f"Resizing {pool_img} to {new_size_str} ({new_bytes} bytes)...")
+    # Hand truncate(1) the byte count, not the string the operator typed:
+    # truncate has no IEC suffixes, so `--size 1.5TiB` -- which this CLI
+    # now advertises and the pre-flight above already accepted -- would be
+    # rejected by truncate after the worker had been stopped.
+    subprocess.run(["sudo", "truncate", "-s", str(new_bytes), pool_img], check=True)
 
     print("Starting taos-worker...")
     subprocess.run(["sudo", "incus", "start", "taos-worker"], check=True)
@@ -212,7 +312,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_resize.add_argument(
         "--size", required=True,
-        help="New size, e.g. 500G or 1T (units accepted by truncate(1))",
+        help=(
+            "New size, e.g. 500G, 1.5TiB, 2TB or a raw byte count. "
+            "IEC suffixes (KiB..PiB) and bare unit letters are 1024-based; "
+            "SI suffixes (kB..PB) are 1000-based."
+        ),
     )
     p_resize.set_defaults(func=_resize_storage)
 

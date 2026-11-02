@@ -84,6 +84,6 @@ password:
 
 ## Open questions
 
-- Default scope set for a coding agent: `memory_read` + `memory_write` + `a2a_send` + `a2a_receive`; `files_*` / `tools_execute` gated tighter (probably off by default).
+- Default scope set for a coding agent: `a2a_send` + `a2a_receive`; `files_*` / `tools_execute` gated tighter (probably off by default). `memory_read`, `memory_write` and `tools_execute` were removed from the grantable vocabulary (no route enforces them; agent tokens are refused on `/api/memory/*` and `/api/user-memory/*` by auth_middleware).
 - Token lifetime for a stable identity: short-lived token, re-requested on expiry (re-auth of a known canonical_id), vs a longer-lived token with revocation-feed coverage. Lean short-lived + re-auth.
 - Per-channel A2A grants (v2): gate `taos-progress` vs `general` separately, or keep the v1 "any active grant" gate.

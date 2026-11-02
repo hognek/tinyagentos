@@ -1,13 +1,18 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Request
-from fastapi.responses import FileResponse, JSONResponse
+import os
 from pathlib import Path
+from fastapi import APIRouter, Depends, Request
+from fastapi.responses import FileResponse, JSONResponse
+
+from tinyagentos.auth_context import require_admin
 
 router = APIRouter()
 
-PROJECT_DIR = Path(__file__).resolve().parent.parent.parent
-SPA_DIR = PROJECT_DIR / "static" / "desktop"
+
+_PROJECT_DIR = Path(__file__).resolve().parent.parent.parent
+
+SPA_DIR = Path(os.environ.get("TAOS_SPA_DIR") or (_PROJECT_DIR / "static" / "desktop")).resolve()
 
 
 @router.get("/api/desktop/settings")
@@ -17,7 +22,7 @@ async def get_settings(request: Request):
     return JSONResponse(settings)
 
 
-@router.put("/api/desktop/settings")
+@router.put("/api/desktop/settings", dependencies=[Depends(require_admin)])
 async def update_settings(request: Request):
     store = request.app.state.desktop_settings
     body = await request.json()
@@ -32,7 +37,7 @@ async def get_dock(request: Request):
     return JSONResponse(dock)
 
 
-@router.put("/api/desktop/dock")
+@router.put("/api/desktop/dock", dependencies=[Depends(require_admin)])
 async def update_dock(request: Request):
     store = request.app.state.desktop_settings
     body = await request.json()
@@ -47,7 +52,7 @@ async def get_windows(request: Request):
     return JSONResponse(windows)
 
 
-@router.put("/api/desktop/windows")
+@router.put("/api/desktop/windows", dependencies=[Depends(require_admin)])
 async def save_windows(request: Request):
     store = request.app.state.desktop_settings
     body = await request.json()
@@ -62,7 +67,7 @@ async def get_widgets(request: Request):
     return JSONResponse(widgets)
 
 
-@router.put("/api/desktop/widgets")
+@router.put("/api/desktop/widgets", dependencies=[Depends(require_admin)])
 async def save_widgets(request: Request):
     store = request.app.state.desktop_settings
     body = await request.json()
@@ -86,7 +91,7 @@ async def get_preference(request: Request, namespace: str):
     return JSONResponse(data)
 
 
-@router.put("/api/preferences/{namespace}")
+@router.put("/api/preferences/{namespace}", dependencies=[Depends(require_admin)])
 async def save_preference(request: Request, namespace: str):
     store = request.app.state.desktop_settings
     body = await request.json()
@@ -130,7 +135,7 @@ async def serve_app_pwa():
     return JSONResponse({"error": "App PWA shell not built"}, status_code=404)
 
 
-@router.post("/api/desktop/browser/agent-command")
+@router.post("/api/desktop/browser/agent-command", dependencies=[Depends(require_admin)])
 async def browser_agent_command(request: Request):
     """Execute a natural language command on the current page using browser-use."""
     body = await request.json()
@@ -205,7 +210,9 @@ async def serve_spa_root():
     index = SPA_DIR / "index.html"
     if index.exists():
         return FileResponse(index, media_type="text/html", headers=_HTML_NO_CACHE)
-    return JSONResponse({"error": "Desktop shell not built. Run: cd desktop && npm run build"}, status_code=404)
+    if SPA_DIR.is_dir():
+        return JSONResponse({"error": "Desktop shell not built — run: cd desktop && npm run build, or set TAOS_SPA_DIR to the built static/desktop"}, status_code=404)
+    return JSONResponse({"error": "Desktop shell not installed (static/desktop missing; not built or staged on this install — set TAOS_SPA_DIR to point at the built static/desktop)"}, status_code=404)
 
 
 @router.get("/desktop/{rest:path}")
@@ -229,4 +236,6 @@ async def serve_spa(rest: str = ""):
     index = SPA_DIR / "index.html"
     if index.exists():
         return FileResponse(index, media_type="text/html", headers=_HTML_NO_CACHE)
-    return JSONResponse({"error": "Desktop shell not built. Run: cd desktop && npm run build"}, status_code=404)
+    if SPA_DIR.is_dir():
+        return JSONResponse({"error": "Desktop shell not built — run: cd desktop && npm run build, or set TAOS_SPA_DIR to the built static/desktop"}, status_code=404)
+    return JSONResponse({"error": "Desktop shell not installed (static/desktop missing; not built or staged on this install — set TAOS_SPA_DIR to point at the built static/desktop)"}, status_code=404)

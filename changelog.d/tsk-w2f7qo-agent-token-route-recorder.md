@@ -1,0 +1,2 @@
+### Added
+- Record every bound-agent local-token request (route template, agent, status) to `agent-token-routes.jsonl` with size-capped rotation (5 MB, 3 backups). Log-only: no request behavior changes.

@@ -99,7 +99,42 @@ async def test_chat_rejects_empty_messages(client):
 
 
 @pytest.mark.asyncio
-async def test_chat_contract_valid_returns_501_until_turn_implemented(client):
+@pytest.mark.parametrize("stream", ["true", 1, "false", 0])
+async def test_chat_rejects_non_bool_stream(client, stream):
+    """`stream` must be an explicit JSON boolean; a string/number is rejected
+    with 400 rather than silently coerced to a non-streaming turn."""
+    store = client._transport.app.state.agent_model_keys
+    token, _ = await store.mint("u1", ["agent-a"], [])
+    resp = await client.post(
+        "/v1/chat/completions",
+        json={**_chat_body(model="agent-a"), "stream": stream},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 400
+    assert resp.json()["error"]["message"] == "'stream' must be a boolean"
+
+
+@pytest.mark.asyncio
+async def test_chat_turn_returns_openai_envelope_with_mock(client, monkeypatch):
+    """Turn slice: a consented request drives one turn and returns the OpenAI
+    ChatCompletion shape. The opencode runtime is mocked so the test runs
+    headlessly in CI (no opencode binary required)."""
+    import tinyagentos.routes.agent_model_api as api
+
+    class _FakeServer:
+        base_url = "http://127.0.0.1:4188"
+
+    async def _fake_ensure(app_state, agent_id):
+        return _FakeServer()
+
+    async def _fake_drive_turn(text, trace_id, sink, *, base_url, model_id,
+                               model_provider_id="litellm", server_password=None,
+                               adapter_factory=None, turn_timeout=300.0):
+        sink({"kind": "final", "content": f"echo: {text}"})
+
+    monkeypatch.setattr(api, "ensure_taos_opencode_server", _fake_ensure)
+    monkeypatch.setattr(api, "drive_turn", _fake_drive_turn)
+
     store = client._transport.app.state.agent_model_keys
     token, _ = await store.mint("u1", ["agent-a"], [])
     resp = await client.post(
@@ -107,8 +142,73 @@ async def test_chat_contract_valid_returns_501_until_turn_implemented(client):
         json=_chat_body(model="agent-a"),
         headers={"Authorization": f"Bearer {token}"},
     )
-    assert resp.status_code == 501
-    assert resp.json()["error"]["code"] == "not_implemented"
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["object"] == "chat.completion"
+    assert data["model"] == "agent-a"
+    assert data["choices"][0]["message"]["role"] == "assistant"
+    assert data["choices"][0]["message"]["content"] == "echo: hi"
+    assert data["choices"][0]["finish_reason"] == "stop"
+
+
+@pytest.mark.asyncio
+async def test_chat_turn_transport_failure_returns_502(client, monkeypatch):
+    """A transport failure in the turn path degrades to 502, not 500/501."""
+    import tinyagentos.routes.agent_model_api as api
+
+    class _FakeServer:
+        base_url = "http://127.0.0.1:4188"
+
+    async def _fake_ensure(app_state, agent_id):
+        return _FakeServer()
+
+    async def _fake_drive_turn(text, trace_id, sink, *, base_url, model_id,
+                               model_provider_id="litellm", server_password=None,
+                               adapter_factory=None, turn_timeout=300.0):
+        sink({"kind": "error", "error": "opencode transport down"})
+
+    monkeypatch.setattr(api, "ensure_taos_opencode_server", _fake_ensure)
+    monkeypatch.setattr(api, "drive_turn", _fake_drive_turn)
+
+    store = client._transport.app.state.agent_model_keys
+    token, _ = await store.mint("u1", ["agent-a"], [])
+    resp = await client.post(
+        "/v1/chat/completions",
+        json=_chat_body(model="agent-a"),
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 502, resp.text
+    assert resp.json()["error"]["code"] == "agent_error"
+
+
+@pytest.mark.asyncio
+async def test_chat_missing_user_message_returns_400(client, monkeypatch):
+    """A request with no user role is a client error (400), not a 502."""
+    import tinyagentos.routes.agent_model_api as api
+
+    class _FakeServer:
+        base_url = "http://127.0.0.1:4188"
+
+    async def _fake_ensure(app_state, agent_id):
+        return _FakeServer()
+
+    async def _fake_drive_turn(text, trace_id, sink, *, base_url, model_id,
+                               model_provider_id="litellm", server_password=None,
+                               adapter_factory=None, turn_timeout=300.0):
+        sink({"kind": "final", "content": text})
+
+    monkeypatch.setattr(api, "ensure_taos_opencode_server", _fake_ensure)
+    monkeypatch.setattr(api, "drive_turn", _fake_drive_turn)
+
+    store = client._transport.app.state.agent_model_keys
+    token, _ = await store.mint("u1", ["agent-a"], [])
+    resp = await client.post(
+        "/v1/chat/completions",
+        json={"model": "agent-a", "messages": [{"role": "system", "content": "x"}]},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 400, resp.text
+    assert resp.json()["error"]["code"] == "invalid_request"
 
 
 @pytest.mark.asyncio
@@ -145,3 +245,209 @@ async def test_chat_missing_model_is_openai_shaped_400(client):
     assert resp.status_code == 400
     # OpenAI envelope, not FastAPI's default {"detail": [...]} 422.
     assert resp.json()["error"]["type"] == "invalid_request_error"
+
+
+@pytest.mark.asyncio
+async def test_chat_multi_turn_forwards_full_history(client, monkeypatch):
+    """Two-turn conversation where turn 2 references turn 1 content: the full
+    history must reach drive_turn so the agent-visible prompt contains turn 1
+    (regression for the bug that forwarded only the last user message)."""
+    import tinyagentos.routes.agent_model_api as api
+
+    class _FakeServer:
+        base_url = "http://127.0.0.1:4188"
+
+    async def _fake_ensure(app_state, agent_id):
+        return _FakeServer()
+
+    captured: list[str] = []
+
+    async def _fake_drive_turn(text, trace_id, sink, *, base_url, model_id,
+                               model_provider_id="litellm", server_password=None,
+                               adapter_factory=None, turn_timeout=300.0):
+        captured.append(text)
+        sink({"kind": "final", "content": f"reply about {text}"})
+
+    monkeypatch.setattr(api, "ensure_taos_opencode_server", _fake_ensure)
+    monkeypatch.setattr(api, "drive_turn", _fake_drive_turn)
+
+    store = client._transport.app.state.agent_model_keys
+    token, _ = await store.mint("u1", ["agent-a"], [])
+    resp = await client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "agent-a",
+            "messages": [
+                {"role": "user", "content": "turn 1: remember the word banana"},
+                {"role": "assistant", "content": "I will remember banana."},
+                {"role": "user", "content": "what fruit did I just tell you?"},
+            ],
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert len(captured) == 1
+    # Turn 1 content must be present in the agent-visible prompt.
+    assert "banana" in captured[0]
+    assert "what fruit did I just tell you?" in captured[0]
+
+
+@pytest.mark.asyncio
+async def test_chat_multi_turn_forwards_history_in_source_order(client, monkeypatch):
+    """The full conversation history must reach drive_turn in SOURCE order,
+    not scrambled. The lead review found that _run_agent_turn deferred user
+    turns, so an assistant reply was emitted before the user message that
+    produced it ([u1, a1, u2] -> a1, u1, u2). This test asserts on POSITIONS
+    (not containment) so it is RED on the broken behaviour."""
+    import tinyagentos.routes.agent_model_api as api
+
+    class _FakeServer:
+        base_url = "http://127.0.0.1:4188"
+
+    async def _fake_ensure(app_state, agent_id):
+        return _FakeServer()
+
+    captured: list[str] = []
+
+    async def _fake_drive_turn(text, trace_id, sink, *, base_url, model_id,
+                               model_provider_id="litellm", server_password=None,
+                               adapter_factory=None, turn_timeout=300.0):
+        captured.append(text)
+        sink({"kind": "final", "content": "ok"})
+
+    monkeypatch.setattr(api, "ensure_taos_opencode_server", _fake_ensure)
+    monkeypatch.setattr(api, "drive_turn", _fake_drive_turn)
+
+    store = client._transport.app.state.agent_model_keys
+    token, _ = await store.mint("u1", ["agent-a"], [])
+    resp = await client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "agent-a",
+            "messages": [
+                {"role": "user", "content": "turn 1: remember the word banana"},
+                {"role": "assistant", "content": "I will remember banana."},
+                {"role": "user", "content": "what fruit did I just tell you?"},
+            ],
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert len(captured) == 1
+    prompt = captured[0]
+    # u1 ("...banana") must come before a1 ("I will remember banana.") which
+    # must come before u2 ("what fruit did I just tell you?").
+    assert prompt.index("banana") < prompt.index("I will remember banana")
+    assert prompt.index("I will remember banana") < prompt.index("what fruit did I just tell you?")
+
+
+@pytest.mark.asyncio
+async def test_chat_single_message_forwards_only_content(client, monkeypatch):
+    """Fresh-session path (no prior history): a single user message forwards
+    just the message text to drive_turn -- no context prefix, no history
+    wrapping -- preserving the single-turn behaviour."""
+    import tinyagentos.routes.agent_model_api as api
+
+    class _FakeServer:
+        base_url = "http://127.0.0.1:4188"
+
+    async def _fake_ensure(app_state, agent_id):
+        return _FakeServer()
+
+    captured: list[str] = []
+
+    async def _fake_drive_turn(text, trace_id, sink, *, base_url, model_id,
+                               model_provider_id="litellm", server_password=None,
+                               adapter_factory=None, turn_timeout=300.0):
+        captured.append(text)
+        sink({"kind": "final", "content": text})
+
+    monkeypatch.setattr(api, "ensure_taos_opencode_server", _fake_ensure)
+    monkeypatch.setattr(api, "drive_turn", _fake_drive_turn)
+
+    store = client._transport.app.state.agent_model_keys
+    token, _ = await store.mint("u1", ["agent-a"], [])
+    resp = await client.post(
+        "/v1/chat/completions",
+        json={"model": "agent-a", "messages": [{"role": "user", "content": "hello"}]},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert captured == ["hello"]
+
+
+# ---------------------------------------------------------------------------
+# Middleware passthrough (tsk-hfs6zv): an EXTERNAL client (no session cookie)
+# must reach the /v1 handlers, whose consent-key check is the credential.
+# Before the exemption, the session gate 401d these requests before the
+# handler ran, so the surface was unreachable from outside by design-gap.
+# ---------------------------------------------------------------------------
+
+from httpx import ASGITransport, AsyncClient
+
+
+@pytest.fixture
+def bare_client(client):
+    """Session-less client against the same app: what an external
+    OpenAI-compatible caller looks like."""
+    app = client._transport.app
+    return AsyncClient(transport=ASGITransport(app=app), base_url="http://test")
+
+
+@pytest.mark.asyncio
+async def test_external_models_reaches_route_auth(bare_client):
+    """No session, no key: the 401 must be the ROUTE's OpenAI envelope,
+    not the middleware's generic 401."""
+    async with bare_client as c:
+        resp = await c.get("/v1/models")
+    assert resp.status_code == 401
+    assert resp.json()["error"]["code"] == "invalid_api_key"
+
+
+@pytest.mark.asyncio
+async def test_external_chat_completions_reaches_route_auth(bare_client):
+    async with bare_client as c:
+        resp = await c.post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer sk-taosagent-bogus"},
+            json={"model": "agent-a", "messages": [{"role": "user", "content": "hi"}]},
+        )
+    assert resp.status_code == 401
+    assert resp.json()["error"]["code"] == "invalid_api_key"
+
+
+@pytest.mark.asyncio
+async def test_external_valid_key_lists_models_end_to_end(client, bare_client):
+    """A minted consent key authenticates an external caller through the
+    middleware all the way to a 200 model list."""
+    store = client._transport.app.state.agent_model_keys
+    token, _ = await store.mint("u1", ["agent-a"], ["memory_read"])
+    async with bare_client as c:
+        resp = await c.get("/v1/models", headers={"Authorization": f"Bearer {token}"})
+    assert resp.status_code == 200, resp.text
+    assert [m["id"] for m in resp.json()["data"]] == ["agent-a"]
+
+
+@pytest.mark.asyncio
+async def test_unlisted_v1_path_stays_session_gated(bare_client):
+    """The exemption is exact-path: any other /v1 path must still hit the
+    session gate, not fall through as a public 404."""
+    async with bare_client as c:
+        resp = await c.get("/v1/other")
+    assert resp.status_code == 401
+    # The middleware's generic 401 ({"error": "Authentication required"}),
+    # never the route's OpenAI envelope ({"error": {"code": ...}}).
+    assert not isinstance(resp.json().get("error"), dict)
+
+
+@pytest.mark.asyncio
+async def test_wrong_method_on_exempt_path_stays_gated(bare_client):
+    """Method-sensitivity: POST /v1/models and GET /v1/chat/completions are
+    not exempt."""
+    async with bare_client as c:
+        r1 = await c.post("/v1/models")
+        r2 = await c.get("/v1/chat/completions")
+    assert r1.status_code == 401
+    assert r2.status_code == 401
+    for r in (r1, r2):
+        assert not isinstance(r.json().get("error"), dict)

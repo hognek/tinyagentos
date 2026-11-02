@@ -1,6 +1,7 @@
 """Tests for #642 — startup 503 guard and removal of duplicate eager init."""
 from __future__ import annotations
 
+
 import pytest
 from httpx import ASGITransport, AsyncClient
 
@@ -116,19 +117,15 @@ def test_bridge_sessions_is_none_before_lifespan(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# LiteLLM background bring-up: _startup_complete goes True without proxy
+# No LiteLLM: _startup_complete goes True with only the key service
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
 async def test_startup_complete_without_litellm(tmp_path, monkeypatch):
-    """_startup_complete must go True even if LiteLLM never starts.
-
-    The proxy bring-up now runs in a supervised background task. This
-    test stubs the proxy to never become ready and asserts that the
-    startup guard is lifted regardless.
-    """
+    """_startup_complete goes True with the key service stubbed out entirely
+    (LiteLLM removal 2b-2a: there is no proxy bring-up to wait for)."""
     import yaml
-    from unittest.mock import AsyncMock, MagicMock, patch
+    from unittest.mock import MagicMock, patch
 
     config = {
         "server": {"host": "0.0.0.0", "port": 6969},
@@ -141,12 +138,8 @@ async def test_startup_complete_without_litellm(tmp_path, monkeypatch):
     config_path.write_text(yaml.dump(config))
     (tmp_path / ".setup_complete").touch()
 
-    # Stub llm_proxy.start to never resolve (proxy never becomes ready).
-    proxy_stub = MagicMock()
-    proxy_stub.is_running.return_value = False
+    proxy_stub = MagicMock(spec=["port", "create_agent_key"])
     proxy_stub.port = 7834
-    proxy_stub.start = AsyncMock(return_value=False)
-    proxy_stub.stop = MagicMock()
 
     with patch("tinyagentos.app.LLMProxy", return_value=proxy_stub):
         from tinyagentos.app import create_app

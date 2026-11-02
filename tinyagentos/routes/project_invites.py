@@ -2,17 +2,21 @@ from __future__ import annotations
 
 import asyncio
 import html
+import ipaddress
 import json
 import logging
+import os
 import socket
+from urllib.parse import urlparse
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field, field_validator
 
-from tinyagentos.agent_registry_store import _slugify
+from tinyagentos.agent_registry_store import _slugify, agent_slug_or_fallback
 from tinyagentos.auth_context import CurrentUser, current_user, require_owner_or_admin
-from tinyagentos.auth_middleware import rate_limit_ok
+from tinyagentos.auth_middleware import rate_limit_ok, rate_limit_retry_after
+from tinyagentos.notification_labels import project_label
 from tinyagentos.projects.invite_store import (
     InviteAlreadyRedeemedError,
     InviteExpiredError,
@@ -20,7 +24,9 @@ from tinyagentos.projects.invite_store import (
     InvitePendingCapError,
     InviteRevokedError,
 )
+from tinyagentos.rate_limit import rate_limited_response
 from tinyagentos.routes.agent_auth_requests import VALID_SCOPES
+from tinyagentos.routes.a2a_bus import _is_url_safe_for_credential
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -29,7 +35,8 @@ router = APIRouter()
 class MintInviteIn(BaseModel):
     scopes: list[str] = Field(default_factory=list)
     approval_mode: str = Field(default="auto", pattern="^(auto|manual)$")
-    check_interval_secs: int = Field(default=1800, ge=60)
+    check_interval_secs: int | None = Field(default=None, ge=60)
+    kind: str = Field(default="agent")
     # How long the invite stays redeemable. Omitted means the store default
     # (1 hour). Capped at 24 hours: the PIN is the security gate, expiry is
     # hygiene, but an indefinitely live link is not a state we want.
@@ -46,6 +53,10 @@ class MintOsInviteIn(BaseModel):
     approval_mode: str = Field(default="auto", pattern="^(auto|manual)$")
     check_interval_secs: int = Field(default=1800, ge=60)
     display_name: str | None = Field(default=None, max_length=64)
+    # How long the invite stays redeemable. Omitted means the store default
+    # (1 hour). Capped at 24 hours: the PIN is the security gate, expiry is
+    # hygiene, but an indefinitely live link is not a state we want.
+    ttl_secs: int | None = Field(default=None, ge=60, le=86400)
 
     @field_validator("display_name")
     @classmethod
@@ -84,7 +95,7 @@ class RedeemInviteIn(BaseModel):
 # (project-less) invite has no project to bind them to, so they are stripped
 # before minting rather than granted verbatim: an OS invite must never hand out
 # project-scoped authority that resolves to no project.
-_PROJECT_SCOPED = {"project_tasks", "project_tasks_create", "project_tasks_update", "canvas_read", "canvas_write"}
+_PROJECT_SCOPED = {"project_tasks", "project_tasks_create", "project_tasks_update", "canvas_read", "canvas_write", "notifications_write"}
 
 
 def _derive_handle(project_slug: str, harness: str, label: str | None) -> str:
@@ -92,6 +103,11 @@ def _derive_handle(project_slug: str, harness: str, label: str | None) -> str:
 
     Each component is slugified independently so an awkward label cannot bleed
     separators into a neighbour; the parts are then joined with single dashes.
+
+    Dedup: if the slugified label starts with (or equals) a prefix already in
+    the handle, strip that overlap from the label before appending — so
+    ``taosmobile`` + ``claude`` + ``taosmobile-dev`` yields
+    ``taosmobile-claude-dev``, not ``taosmobile-claude-taosmobile-dev``.
     """
     slug = _slugify(project_slug)
     hw = _slugify(harness)
@@ -99,7 +115,16 @@ def _derive_handle(project_slug: str, harness: str, label: str | None) -> str:
     if label:
         lbl = _slugify(label)
         if lbl:
-            parts.append(lbl)
+            # Dedup: strip any prefix of the label that duplicates a part.
+            for dedup in (slug, hw):
+                if not lbl:
+                    break
+                if lbl == dedup:
+                    lbl = ""
+                elif lbl.startswith(dedup + "-"):
+                    lbl = lbl[len(dedup) + 1:]
+            if lbl:
+                parts.append(lbl)
     return "-".join(p for p in parts if p)
 
 
@@ -110,16 +135,26 @@ def _derive_os_handle(display_name: str | None, harness: str, label: str | None)
     primary name, falling back to the harness. An optional label disambiguates,
     as in the project path. Each component is slugified independently.
 
-    ``_slugify`` returns the sentinel ``"agent"`` for empty input, so only
-    slugify a non-empty alias; otherwise the harness fallback never fires."""
+    ``_slugify`` returns "" when nothing survives (an alias written only in
+    emoji or punctuation), so the harness fallback covers both an absent alias
+    and an unslugifiable one, and ``agent_slug_or_fallback`` guarantees the
+    result is never the empty handle."""
     alias = (display_name or "").strip()
     base = _slugify(alias) if alias else _slugify(harness)
+    # An alias that is present but unslugifiable (pure emoji/punctuation) must
+    # still fall back to the harness here, not just when parts joins to "":
+    # a slugifiable label would otherwise make the joined string non-empty on
+    # its own and skip the fallback below entirely, silently dropping the
+    # harness component and colliding two different harnesses on the same
+    # label-only handle.
+    if not base:
+        base = agent_slug_or_fallback(harness)
     parts = [base]
     if label:
         lbl = _slugify(label)
         if lbl:
             parts.append(lbl)
-    return "-".join(p for p in parts if p) or _slugify(harness)
+    return "-".join(p for p in parts if p)
 
 
 async def _dedupe_handle(request: Request, base_handle: str) -> str:
@@ -217,12 +252,29 @@ def _enumerate_lan_ips() -> list[str]:
 
 async def _build_controller_dict(request: Request) -> dict:
     """Enumerate the controller's reachable endpoints (operator override, LAN,
-    mesh; no relay in Phase 1) and wrap them in the controller descriptor shared
+    mesh, and optional relay) and wrap them in the controller descriptor shared
     by the project and OS-level bundles."""
     endpoints: list[dict] = []
     priority = 1
 
-    # Operator override (TAOS_CONTROLLER_CALLBACK_HOST) becomes priority 1.
+    # Relay endpoint (TAOS_CONTROLLER_RELAY_URL) becomes priority 1 when present.
+    # Relay MUST be HTTPS — http relays are not safe for credential-bearing bundles.
+    relay_url = os.environ.get("TAOS_CONTROLLER_RELAY_URL", "").strip()
+    if relay_url:
+        if _is_url_safe_for_credential(relay_url, allow_private=False):
+            endpoints.append(
+                {"kind": "relay", "url": relay_url, "priority": priority}
+            )
+            priority += 1
+        else:
+            logger.warning(
+                "TAOS_CONTROLLER_RELAY_URL omitted: %s is not safe for "
+                "credential-bearing bundles (must be https)",
+                relay_url,
+            )
+
+    # Operator override (TAOS_CONTROLLER_CALLBACK_HOST) becomes priority 1
+    # when present and safe.
     override = None
     try:
         from tinyagentos.routes.agent_deploy import controller_callback_host
@@ -231,14 +283,51 @@ async def _build_controller_dict(request: Request) -> dict:
     except Exception:  # noqa: BLE001
         override = None
     if override:
-        endpoints.append(
-            {"kind": "lan", "url": f"http://{override}:{_CONTROLLER_PORT}", "priority": priority}
-        )
-        priority += 1
+        # Detect bare IPv6 early: bracket it so urlparse sees the real address
+        # in the safety check and the advertised URL.
+        _override_for_check = override
+        try:
+            _addr = ipaddress.ip_address(override)
+            if _addr.version == 6:
+                _override_for_check = f"[{override}]"
+        except ValueError:
+            pass
+
+        if "://" in override:
+            # Full URL supplied by the operator: use scheme + host as-is.
+            if _is_url_safe_for_credential(override, allow_private=True):
+                endpoints.append(
+                    {"kind": "lan", "url": override, "priority": priority}
+                )
+                priority += 1
+            else:
+                logger.warning(
+                    "TAOS_CONTROLLER_CALLBACK_HOST omitted: %s is not safe for "
+                    "credential-bearing bundles (use https or a private address)",
+                    override,
+                )
+        elif _is_url_safe_for_credential(f"http://{_override_for_check}", allow_private=True):
+            endpoints.append(
+                {"kind": "lan", "url": f"http://{_override_for_check}:{_CONTROLLER_PORT}", "priority": priority}
+            )
+            priority += 1
+        else:
+            logger.warning(
+                "TAOS_CONTROLLER_CALLBACK_HOST omitted: %s is a public address "
+                "and cannot be advertised over http in a credential-bearing bundle",
+                override,
+            )
+
+    # For LAN deduplication, compare against the override's hostname when it's a full URL.
+    override_host = None
+    if override and "://" in override:
+        override_host = urlparse(override).hostname
 
     for ip in _enumerate_lan_ips():
-        if override and ip == override:
-            continue
+        if override:
+            # Skip if this LAN IP matches the override (either bare hostname/IP or parsed from full URL)
+            if ip == override or (override_host and ip == override_host):
+                continue
         endpoints.append(
             {"kind": "lan", "url": f"http://{ip}:{_CONTROLLER_PORT}", "priority": priority}
         )
@@ -275,6 +364,7 @@ async def build_os_connection_bundle(
     agent_handle: str,
     granted_scopes: list[str],
     check_interval_secs: int,
+    harness: str = "",
 ) -> dict:
     """Assemble the connection bundle for an OS-level (project-less) redeem.
 
@@ -319,6 +409,7 @@ async def build_os_connection_bundle(
         agent_handle=agent_handle,
         granted_scopes=granted_scopes,
         check_interval_secs=check_interval_secs,
+        harness=harness,
     )
 
     return {
@@ -346,12 +437,13 @@ async def build_connection_bundle(
     agent_handle: str,
     granted_scopes: list[str],
     check_interval_secs: int,
+    harness: str = "",
 ) -> dict:
     """Assemble the JSON connection bundle returned by a successful redeem.
 
     The bundle carries NO token or secret (the token arrives via the status
-    poll). It enumerates the controller's reachable endpoints (LAN, mesh; no
-    relay in Phase 1), the agent-JWT-reachable API surface scoped EXACTLY to
+    poll). It enumerates the controller's reachable endpoints (LAN, mesh, and
+    optional relay), the agent-JWT-reachable API surface scoped EXACTLY to
     the granted scopes (mirroring auth_middleware's canvas allowlist), the
     timed-check delivery contract, and an onboarding kit + guide_markdown.
 
@@ -361,6 +453,12 @@ async def build_connection_bundle(
     project_slug = project.get("slug") or pid
 
     controller = await _build_controller_dict(request)
+
+    # cloud_agent kind: bundle must contain ONLY relay endpoints.
+    if invite_record.get("kind") == "cloud_agent":
+        controller["endpoints"] = [
+            ep for ep in controller["endpoints"] if ep.get("kind") == "relay"
+        ]
 
     # --- agent_handle scoped api surface ----------------------------------
     apis: dict = {}
@@ -382,6 +480,8 @@ async def build_connection_bundle(
     if has_canvas_read:
         apis["canvas_elements"] = f"/api/projects/{pid}/canvas/elements"
         apis["canvas_snapshot"] = f"/api/projects/{pid}/canvas/snapshot.png"
+        apis["canvas_original"] = f"/api/projects/{pid}/canvas/elements/{{eid}}/original"
+        apis["canvas_legacy"] = f"/api/projects/{pid}/canvas/legacy"
     if has_canvas_write:
         apis["canvas_element"] = f"/api/projects/{pid}/canvas/elements/{{eid}}"
     # Files routes key on the project SLUG (not the id) in the path.
@@ -436,6 +536,7 @@ async def build_connection_bundle(
         has_files_read=has_files_read,
         has_files_write=has_files_write,
         check_interval_secs=check_interval_secs,
+        harness=harness,
     )
 
     return {
@@ -471,6 +572,7 @@ def _build_guide_markdown(
     has_files_read: bool = False,
     has_files_write: bool = False,
     check_interval_secs: int,
+    harness: str = "",
 ) -> str:
     """Generate the personalized capability guide from granted scopes + project
     + derived handle. Contains NO secret: the token still arrives via the status
@@ -536,7 +638,9 @@ def _build_guide_markdown(
         lines.append(
             f"- Files write: add and edit Files. Upload with "
             f"`POST /api/projects/{project_slug}/files/upload?path=<subdir>` as multipart "
-            f"`file=@...`, and make folders with `POST /api/projects/{project_slug}/mkdir` "
+            f"`file=@...` (`path` is the target DIRECTORY and may also be sent as a form "
+            f"field; add form field `filename=<name>` to choose the stored name; the "
+            f"response's `stored_as` is the real path), and make folders with `POST /api/projects/{project_slug}/mkdir` "
             f"`{{\"path\": \"<subdir>\"}}`."
         )
     else:
@@ -548,7 +652,8 @@ def _build_guide_markdown(
         lines.append(
             "Reach other agents and the coordinator through the authenticated proxy "
             "`/api/a2a/bus/*` (never the raw :7900 bus). The proxy forces `from` to your "
-            "own handle, so you always post as yourself. Send with "
+            "own registry canonical identity and presents your registry token to the "
+            "bus, so you always post as yourself and the bus can verify it. Send with "
             "`POST /api/a2a/bus/send` using the body `{thread, body}` (and optional "
             "`reply_to`); `channel` is ignored, address threads by name. Read via "
             "`GET /api/a2a/bus/messages?channel={channel}&since={cursor}`."
@@ -556,15 +661,40 @@ def _build_guide_markdown(
     else:
         lines.append("- A2A bus: NOT granted.")
     lines.append("")
+    if harness == "grok":
+        lines.append("## TOKEN STORAGE AND POLLING (Grok-specific)")
+        lines.append("")
+        lines.append(
+            "Store the taOS agent token ONLY via the Grok secure form. "
+            "Never write the token to a file or include it in a chat message."
+        )
+        lines.append(
+            f"Set a Grok routine to poll the taOS status endpoint every {check_interval_secs} seconds. "
+            "Polling is for onboarding only (to retrieve your token). "
+            "Ongoing messages and @mentions arrive on the A2A bus, and ready tasks are found by the timed check of `tasks/ready`."
+        )
+        lines.append(
+            "This token is readable by every bot on this Grok account. "
+            "Treat it as a shared secret."
+        )
+        lines.append("")
     lines.append("## WRITE THIS INTO YOUR OWN PERSISTENT MEMORY NOW")
     lines.append("")
-    lines.append(
-        "Persist the following into your own long-term memory (not the operator's): "
-        f"your canonical_id (from the status poll), the project id `{project.get('id')}` "
-        f"and slug `{project_slug}`, the path to the token file where you stored the "
-        "polled token, and this bus contract (authenticated proxy, `from` forced to "
-        f"`{agent_handle}`). A re-spawn must reuse this identity, not mint a new one."
-    )
+    if harness == "grok":
+        lines.append(
+            "Persist the following into your own long-term memory (not the operator's): "
+            f"your canonical_id (from the status poll), the project id `{project.get('id')}` "
+            f"and slug `{project_slug}`, and this bus contract (authenticated proxy, `from` forced to "
+            f"`{agent_handle}`). A re-spawn must reuse this identity, not mint a new one."
+        )
+    else:
+        lines.append(
+            "Persist the following into your own long-term memory (not the operator's): "
+            f"your canonical_id (from the status poll), the project id `{project.get('id')}` "
+            f"and slug `{project_slug}`, the path to the token file where you stored the "
+            "polled token, and this bus contract (authenticated proxy, `from` forced to "
+            f"`{agent_handle}`). A re-spawn must reuse this identity, not mint a new one."
+        )
     lines.append("")
     lines.append("## CHECK ON A TIMER (the loop that makes you a member)")
     lines.append("")
@@ -572,9 +702,7 @@ def _build_guide_markdown(
         f"Poll every {check_interval_secs} seconds (or hold the SSE stream at "
         "`/api/a2a/bus/stream`) for your ready tasks and any @mentions addressed to "
         f"`{agent_handle}`. On each check: read ready tasks, act on them, comment "
-        "progress, post on the bus, and report status. This timed check is the "
-        "reliable delivery floor; the stream is an optional optimization only if your "
-        "harness can hold a connection and wake on a message."
+        "progress, post on the bus, and report status. The timed check is the reliable delivery floor and the stream is an optional optimization."
     )
     lines.append("")
     return "\n".join(lines)
@@ -585,6 +713,7 @@ def _build_os_guide_markdown(
     agent_handle: str,
     granted_scopes: list[str],
     check_interval_secs: int,
+    harness: str = "",
 ) -> str:
     """Generate the capability guide for an OS-level (project-less) redeem.
 
@@ -615,7 +744,8 @@ def _build_os_guide_markdown(
         lines.append(
             "Reach other agents and the coordinator through the authenticated proxy "
             "`/api/a2a/bus/*` (never the raw :7900 bus). The proxy forces `from` to your "
-            "own handle, so you always post as yourself. Send with "
+            "own registry canonical identity and presents your registry token to the "
+            "bus, so you always post as yourself and the bus can verify it. Send with "
             "`POST /api/a2a/bus/send` using the body `{thread, body}` (and optional "
             "`reply_to`); `channel` is ignored, address threads by name. Read via "
             "`GET /api/a2a/bus/messages?channel={channel}&since={cursor}`."
@@ -623,15 +753,40 @@ def _build_os_guide_markdown(
     else:
         lines.append("- A2A bus: NOT granted.")
     lines.append("")
+    if harness == "grok":
+        lines.append("## TOKEN STORAGE AND POLLING (Grok-specific)")
+        lines.append("")
+        lines.append(
+            "Store the taOS agent token ONLY via the Grok secure form. "
+            "Never write the token to a file or include it in a chat message."
+        )
+        lines.append(
+            f"Set a Grok routine to poll the taOS status endpoint every {check_interval_secs} seconds. "
+            "Polling is for onboarding only (to retrieve your token). "
+            "Ongoing messages and @mentions arrive on the A2A bus, and ready tasks are found by the timed check of `tasks/ready`."
+        )
+        lines.append(
+            "This token is readable by every bot on this Grok account. "
+            "Treat it as a shared secret."
+        )
+        lines.append("")
     lines.append("## WRITE THIS INTO YOUR OWN PERSISTENT MEMORY NOW")
     lines.append("")
-    lines.append(
-        "Persist the following into your own long-term memory (not the operator's): "
-        "your canonical_id (from the status poll), the path to the token file where "
-        "you stored the polled token, and this bus contract (authenticated proxy, "
-        f"`from` forced to `{agent_handle}`). A re-spawn must reuse this identity, "
-        "not mint a new one."
-    )
+    if harness == "grok":
+        lines.append(
+            "Persist the following into your own long-term memory (not the operator's): "
+            "your canonical_id (from the status poll), and this bus contract (authenticated proxy, "
+            f"`from` forced to `{agent_handle}`). A re-spawn must reuse this identity, "
+            "not mint a new one."
+        )
+    else:
+        lines.append(
+            "Persist the following into your own long-term memory (not the operator's): "
+            "your canonical_id (from the status poll), the path to the token file where "
+            "you stored the polled token, and this bus contract (authenticated proxy, "
+            f"`from` forced to `{agent_handle}`). A re-spawn must reuse this identity, "
+            "not mint a new one."
+        )
     lines.append("")
     lines.append("## CHECK ON A TIMER")
     lines.append("")
@@ -639,9 +794,7 @@ def _build_os_guide_markdown(
         f"Poll every {check_interval_secs} seconds (or hold the SSE stream at "
         "`/api/a2a/bus/stream`) for any @mentions addressed to "
         f"`{agent_handle}`. On each check: read your mentions, act on them, and "
-        "report status. This timed check is the reliable delivery floor; the "
-        "stream is an optional optimization only if your harness can hold a "
-        "connection and wake on a message."
+        "report status. The timed check is the reliable delivery floor and the stream is an optional optimization."
     )
     lines.append("")
     return "\n".join(lines)
@@ -684,13 +837,42 @@ async def mint_invite(
             {"error": f"unknown scopes: {unknown}; valid: {sorted(VALID_SCOPES)}"},
             status_code=400,
         )
+
+    kind = payload.kind
+    if kind not in ("agent", "cloud_agent"):
+        return JSONResponse(
+            {"error": f"invalid invite kind: {kind}; valid: ['agent', 'cloud_agent']"},
+            status_code=400,
+        )
+
+    check_interval_secs = payload.check_interval_secs
+
+    # cloud_agent kind: require a safe HTTPS relay URL and default check_interval_secs to 900.
+    if kind == "cloud_agent":
+        relay_url = os.environ.get("TAOS_CONTROLLER_RELAY_URL", "").strip()
+        if not relay_url or not _is_url_safe_for_credential(relay_url, allow_private=False):
+            return JSONResponse(
+                {
+                    "error": (
+                        "this taOS is not reachable from the internet: "
+                        "set up taOSgo first"
+                    )
+                },
+                status_code=400,
+            )
+        if check_interval_secs is None:
+            check_interval_secs = 900
+    elif check_interval_secs is None:
+        check_interval_secs = 1800
+
     try:
         result = await store.mint(
             project_id=project_id,
             scopes=list(payload.scopes),
             approval_mode=payload.approval_mode,
-            check_interval_secs=payload.check_interval_secs,
+            check_interval_secs=check_interval_secs,
             created_by=user.user_id,
+            kind=kind,
             ttl_secs=payload.ttl_secs,
         )
     except InvitePendingCapError as exc:
@@ -726,6 +908,7 @@ async def list_invites(
             "status": i["status"],
             "expires_ts": i["expires_ts"],
             "redeemed_by": i.get("redeemed_by"),
+            "kind": i.get("kind", "agent"),
         }
         for i in items
     ]
@@ -806,6 +989,7 @@ async def mint_os_invite(
             check_interval_secs=payload.check_interval_secs,
             created_by=user.user_id,
             display_name=payload.display_name,
+            ttl_secs=payload.ttl_secs,
         )
     except InvitePendingCapError as exc:
         return JSONResponse({"error": str(exc)}, status_code=429)
@@ -921,6 +1105,16 @@ async def mint_collab_invite(
         return JSONResponse({"error": "project not found"}, status_code=404)
     require_owner_or_admin(user, project["user_id"])
 
+    # ---- collaboration kill switch: nothing goes out while off or paused ----
+    from tinyagentos.collab_settings import outbound_refusal
+
+    refusal = outbound_refusal(request.app.state.data_dir, payload.contact_id)
+    if refusal is not None:
+        return JSONResponse(
+            {"error": refusal},
+            status_code=503 if refusal == "collaboration disabled" else 403,
+        )
+
     # ---- validate contact exists and is active ----
     if contacts_store is None:
         return JSONResponse(
@@ -972,19 +1166,12 @@ async def mint_collab_invite(
     envelope: dict | None = None
     delivery_error: str | None = None
     try:
-        from tinyagentos.peer import build_envelope, resolve_local_identity_id
+        from tinyagentos.peer import build_envelope, deliver_to_peer, local_contact_id
 
-        # Resolve the local hub identity and the contact's hub username.
-        contact_username = (contact.get("hub_username") or "").strip()
-        if not contact_username:
-            delivery_error = "contact has no hub_username"
-        local_id = await asyncio.to_thread(
-            resolve_local_identity_id, request.app.state.data_dir
-        )
-        if local_id is None:
-            delivery_error = "hub identity not configured"
-        if delivery_error is None and contact_username and local_id:
-            local_username = local_id.removeprefix("hub:")
+        # Both ends are canonical hub:<fingerprint> ids: ours from the
+        # keystore, theirs is the contact row key.  hub_username is display only.
+        local_id = await asyncio.to_thread(local_contact_id)
+        if delivery_error is None:
             envelope_body = {
                 "invite_id": record["invite_id"],
                 "project_id": project_id,
@@ -995,46 +1182,26 @@ async def mint_collab_invite(
                 "display_name": payload.display_name,
             }
             envelope = build_envelope(
-                from_username=local_username,
-                to_username=contact_username,
+                to_contact_id=payload.contact_id,
                 kind="collab_invite",
                 body=envelope_body,
             )
 
             # POST the envelope to the remote contact's peer inbox.
-            # The peer link's endpoints are tried in priority order.
+            # The peer link's endpoints are tried in priority order, through
+            # the SSRF guard with the link's own endpoints as the allowance.
             peer_link = await contacts_store.get_peer_link(payload.contact_id)
             if peer_link is None or not peer_link.get("endpoints"):
                 delivery_error = "no peer endpoints for contact"
-            else:
-                import httpx
-
-                outbound_token = peer_link.get("outbound_token", "")
-                delivered = False
-                for ep in sorted(
-                    peer_link["endpoints"],
-                    key=lambda e: e.get("priority", 99),
-                ):
-                    inbox_url = f"{ep['url'].rstrip('/')}/api/peer/inbox"
-                    try:
-                        async with httpx.AsyncClient(timeout=10.0) as client:
-                            resp = await client.post(
-                                inbox_url,
-                                json={"envelope": envelope},
-                                headers={
-                                    "Authorization": f"Bearer {outbound_token}",
-                                    "Content-Type": "application/json",
-                                },
-                            )
-                            if 200 <= resp.status_code < 300:
-                                delivered = True
-                                break
-                    except Exception:
-                        continue
-                if not delivered:
-                    delivery_error = (
-                        "failed to deliver invite envelope to any peer endpoint"
-                    )
+            elif not peer_link.get("outbound_token"):
+                delivery_error = "peer handshake incomplete: no token for contact"
+            elif not await deliver_to_peer(
+                contacts_store, payload.contact_id, "/api/peer/inbox", envelope,
+                data_dir=request.app.state.data_dir,
+            ):
+                delivery_error = (
+                    "failed to deliver invite envelope to any peer endpoint"
+                )
     except Exception as exc:
         delivery_error = f"envelope delivery failed: {exc}"
 
@@ -1084,9 +1251,9 @@ async def redeem_invite(request: Request, body: RedeemInviteIn):
     """
     client_ip = request.client.host if request.client else "unknown"
     if not rate_limit_ok(client_ip):
-        return JSONResponse(
-            {"error": "too many redeem attempts; slow down and retry"},
-            status_code=429,
+        return rate_limited_response(
+            "too many redeem attempts; slow down and retry",
+            rate_limit_retry_after(client_ip),
         )
 
     store = request.app.state.project_invites
@@ -1120,6 +1287,15 @@ async def redeem_invite(request: Request, body: RedeemInviteIn):
     scopes = list(raw_scopes)
     if "project_tasks" not in scopes:
         scopes = ["project_tasks"] + scopes
+
+    # Extract sponsor_contact_id from delegation-sponsored invites (D1).
+    invite_metadata = invite.get("metadata") or {}
+    if isinstance(invite_metadata, str):
+        try:
+            invite_metadata = json.loads(invite_metadata)
+        except (ValueError, TypeError):
+            invite_metadata = {}
+    sponsor_contact_id = invite_metadata.get("sponsor_contact_id") if isinstance(invite_metadata, dict) else None
 
     handle = _derive_handle(project.get("slug") or invite["project_id"], body.harness, body.label)
     handle = await _dedupe_handle(request, handle)
@@ -1155,6 +1331,7 @@ async def redeem_invite(request: Request, body: RedeemInviteIn):
                 effective_project=invite["project_id"],
                 decided_by=invite["created_by"],
                 project_id=invite["project_id"],
+                sponsor_contact_id=sponsor_contact_id,
             )
         except Exception as exc:  # noqa: BLE001 - surface as JSON error
             await store.rollback_to_pending(body.invite_id)
@@ -1182,6 +1359,7 @@ async def redeem_invite(request: Request, body: RedeemInviteIn):
         agent_handle=handle,
         granted_scopes=scopes,
         check_interval_secs=invite.get("check_interval_secs") or 1800,
+        harness=body.harness,
     )
 
     return {
@@ -1211,6 +1389,15 @@ async def _redeem_os_level(request: Request, body: RedeemInviteIn, invite: dict,
             raw_scopes = []
     scopes = list(raw_scopes)
 
+    # Extract sponsor_contact_id from delegation-sponsored invites (D1).
+    invite_metadata = invite.get("metadata") or {}
+    if isinstance(invite_metadata, str):
+        try:
+            invite_metadata = json.loads(invite_metadata)
+        except (ValueError, TypeError):
+            invite_metadata = {}
+    sponsor_contact_id = invite_metadata.get("sponsor_contact_id") if isinstance(invite_metadata, dict) else None
+
     display_name = invite.get("display_name")
     handle = _derive_os_handle(display_name, body.harness, body.label)
     handle = await _dedupe_handle(request, handle)
@@ -1238,6 +1425,7 @@ async def _redeem_os_level(request: Request, body: RedeemInviteIn, invite: dict,
                 decided_by=invite["created_by"],
                 project_id=None,
                 display_name=display_name,
+                sponsor_contact_id=sponsor_contact_id,
             )
         except Exception as exc:  # noqa: BLE001 - surface as JSON error
             await store.rollback_to_pending(body.invite_id)
@@ -1260,6 +1448,7 @@ async def _redeem_os_level(request: Request, body: RedeemInviteIn, invite: dict,
         agent_handle=handle,
         granted_scopes=scopes,
         check_interval_secs=invite.get("check_interval_secs") or 1800,
+        harness=body.harness,
     )
 
     return {
@@ -1280,12 +1469,20 @@ def _notify_pending_invite(request: Request, record: dict) -> None:
         return
     try:
         scopes = record.get("requested_scopes") or []
+        project_id = record.get("project_id")
         import asyncio
 
-        asyncio.create_task(
-            notifs.add(
+        async def _add() -> None:
+            # Name the invite's project and carry its id so the consent
+            # surface can preselect it (tsk-i7ghpa).
+            on_project = (
+                f" on {await project_label(request.app.state, project_id)}"
+                if project_id
+                else ""
+            )
+            await notifs.add(
                 title="Access request",
-                message=f"{record['identity_claim']} is requesting {', '.join(scopes)}",
+                message=f"{record['identity_claim']} is requesting {', '.join(scopes)}{on_project}",
                 level="info",
                 source="auth_requests",
                 data={
@@ -1293,9 +1490,11 @@ def _notify_pending_invite(request: Request, record: dict) -> None:
                     "identity_claim": record["identity_claim"],
                     "framework": record["framework"],
                     "requested_scopes": list(scopes),
+                    "project_id": project_id,
                 },
             )
-        )
+
+        asyncio.create_task(_add())
     except Exception:  # noqa: BLE001
         pass
 

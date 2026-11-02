@@ -8,6 +8,7 @@ import logging
 import os
 import shutil
 import tarfile
+import tempfile
 import time
 from collections import OrderedDict
 from pathlib import Path
@@ -18,10 +19,14 @@ from fastapi import APIRouter, Depends, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 from tinyagentos.config import AppConfig, save_config_locked, validate_config
+from tinyagentos.hardware import _detect_device_class
 from tinyagentos.auto_update import resolve_tracked_branch, is_valid_branch_name, PREF_NAMESPACE
 from tinyagentos.data_snapshot import snapshot_data_dir
+from tinyagentos.middleware.upload_body_limit import register_upload_cap
+from tinyagentos.safe_archive import ArchiveError, extract_tar_safely, open_tar_gz
 from tinyagentos.update_runner import switch_to_branch
 from tinyagentos.restart_orchestrator import write_pending_restart
+from tinyagentos.launchd_migration import apply_launchd_migration
 
 logger = logging.getLogger(__name__)
 
@@ -151,28 +156,49 @@ def _format_size(size_bytes: int) -> str:
         return f"{size_bytes / (1024 ** 3):.2f} GB"
 
 
+def _fs_total_bytes(path: Path) -> int:
+    """Size of the filesystem holding *path* (its nearest existing ancestor)."""
+    probe = path
+    while not probe.exists() and probe != probe.parent:
+        probe = probe.parent
+    try:
+        return shutil.disk_usage(probe).total
+    except OSError:
+        return 0
+
+
 def _get_storage_stats(app) -> list[dict]:
-    """Compute storage usage for key directories."""
+    """Compute storage usage for key directories.
+
+    Each item carries ``total_bytes``, the size of the filesystem the folder
+    lives on, so the Settings panel can draw a usage bar against the disk.
+    """
     data_dir = app.state.config_path.parent
     items = []
 
-    # Models dir
-    models_dir = data_dir / "models"
+    # Models dir: where the installers put models (TAOS_MODELS_ROOT aware)
+    from tinyagentos.installers.model_paths import models_root
+
+    models_dir = models_root()
     models_bytes = _dir_size(models_dir)
     items.append({
         "label": "Models",
         "path": str(models_dir),
         "size": _format_size(models_bytes),
         "bytes": models_bytes,
+        "total_bytes": _fs_total_bytes(Path(models_dir)),
     })
 
-    # Data dir
+    # Data dir, without the models folder already counted above
     data_bytes = _dir_size(data_dir)
+    if models_dir.is_relative_to(data_dir):
+        data_bytes = max(0, data_bytes - models_bytes)
     items.append({
         "label": "Data",
         "path": str(data_dir),
         "size": _format_size(data_bytes),
         "bytes": data_bytes,
+        "total_bytes": _fs_total_bytes(Path(data_dir)),
     })
 
     # App catalog
@@ -187,6 +213,7 @@ def _get_storage_stats(app) -> list[dict]:
         "path": str(cat_path),
         "size": _format_size(cat_bytes),
         "bytes": cat_bytes,
+        "total_bytes": _fs_total_bytes(Path(cat_path)),
     })
 
     return items
@@ -215,7 +242,13 @@ async def save_config_endpoint(request: Request, body: ConfigUpdate, validate_on
         agents=data.get("agents", []),
         metrics=data.get("metrics", {}),
         webhooks=data.get("webhooks", []),
+        archived_agents=data.get("archived_agents", []),
+        archive=data.get("archive", {}),
         memory_url=data.get("memory_url", "http://localhost:7900"),
+        taosmd_dir=str(data.get("taosmd_dir", "") or ""),
+        taosmd_restart_cmd=str(data.get("taosmd_restart_cmd", "") or ""),
+        github_app_id=str(data.get("github_app_id", "") or ""),
+        lora_ingest_proxy_url=str(data.get("lora_ingest_proxy_url", "") or ""),
         config_path=request.app.state.config_path,
     )
     errors = validate_config(new_config)
@@ -250,12 +283,28 @@ async def save_platform_settings(request: Request, body: PlatformUpdate):
 
 @router.get("/api/settings/llm-proxy")
 async def llm_proxy_status(request: Request):
-    """Return LLM proxy status for the settings page."""
-    proxy = request.app.state.llm_proxy
+    """Return LLM proxy status for the settings page.
+
+    The proxy agents use IS the in-process gateway (the only LLM path since
+    LiteLLM removal 2b-2a): ``port`` is its agent listener (what each
+    container's ``127.0.0.1:4000`` forwards to) and ``running`` says this
+    start verified the listener as its own. There is no LiteLLM to report.
+    """
+    from tinyagentos import llm_gateway
+    from tinyagentos.agent_controller_listener import agent_controller_live_port
+    from tinyagentos.llm_gateway.cutover import llm_gateway_live_port
+
+    state = request.app.state
+    port = getattr(state, "llm_gateway_agent_port", None)
+    if port is None:
+        port = llm_gateway.agent_port(state.config)
     return {
-        "running": proxy.is_running() if hasattr(proxy, "is_running") else False,
-        "port": proxy.port if hasattr(proxy, "port") else 7834,
-        "backends": len(request.app.state.config.backends),
+        "mode": "gateway",
+        "running": bool(llm_gateway_live_port(state)),
+        "port": port,
+        "agent_controller_port": agent_controller_live_port(state),
+        "url": "/api/llm/v1",
+        "backends": len(state.config.backends),
     }
 
 
@@ -298,29 +347,47 @@ async def create_backup(request: Request):
     )
 
 
+# Cap the backup upload so a hostile body is never fully buffered; the archive's
+# own bomb limits then bound what the extraction can write into the data dir.
+_MAX_BACKUP_BYTES = 64 * 1024 * 1024
+
+# The read() below runs only after FastAPI has already spooled the multipart
+# body, so the cap also has to be enforced on the arriving request.
+register_upload_cap("/api/restore", lambda: _MAX_BACKUP_BYTES)
+
+
 @router.post("/api/restore")
 async def restore_backup(request: Request, file: UploadFile):
     """Restore configuration from a backup tarball."""
     data_dir = request.app.state.config_path.parent
-    content = await file.read()
+    # Read one byte past the cap so an oversized upload is detected without
+    # buffering the rest of it (same pattern as the package installers).
+    content = await file.read(_MAX_BACKUP_BYTES + 1)
+    if len(content) > _MAX_BACKUP_BYTES:
+        return JSONResponse({"error": "backup file too large (64 MB max)"}, status_code=413)
     buf = io.BytesIO(content)
     try:
-        with tarfile.open(fileobj=buf, mode="r:gz") as tar:
-            for member in tar.getmembers():
-                # Strip the leading "backup/" prefix when extracting
-                if not member.name.startswith("backup/"):
-                    continue
-                relative = member.name[len("backup/"):]
-                if not relative:
-                    continue
-                rel_path = Path(relative)
-                if rel_path.is_absolute() or ".." in rel_path.parts:
-                    continue
-                dest = data_dir / relative
-                dest.parent.mkdir(parents=True, exist_ok=True)
-                f = tar.extractfile(member)
-                if f is not None:
-                    dest.write_bytes(f.read())
+        with open_tar_gz(buf, kind="backup") as tar:
+            # Stage inside data_dir (same filesystem, so the moves are renames).
+            # extract_tar_safely applies the shared bomb caps before anything is
+            # written and PEP 706's "data" filter while it writes, so the
+            # "backup/" prefix can be stripped by relocating real files rather
+            # than by trusting a member name.
+            staging = Path(tempfile.mkdtemp(prefix=".taos-restore-", dir=str(data_dir)))
+            try:
+                extract_tar_safely(tar, staging, kind="backup")
+                root = staging / "backup"
+                if root.is_dir():
+                    for src in sorted(root.rglob("*")):
+                        if src.is_symlink() or not src.is_file():
+                            continue
+                        dest = data_dir / src.relative_to(root)
+                        dest.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.move(str(src), str(dest))
+            finally:
+                shutil.rmtree(staging, ignore_errors=True)
+    except ArchiveError as e:
+        return JSONResponse({"error": f"Invalid backup file: {e}"}, status_code=400)
     except tarfile.TarError as e:
         return JSONResponse({"error": f"Invalid backup file: {e}"}, status_code=400)
     # Reload config if config.yaml was restored
@@ -336,7 +403,13 @@ async def restore_backup(request: Request, file: UploadFile):
                 agents=data.get("agents", []),
                 metrics=data.get("metrics", {}),
                 webhooks=data.get("webhooks", []),
+                archived_agents=data.get("archived_agents", []),
+                archive=data.get("archive", {}),
                 memory_url=data.get("memory_url", "http://localhost:7900"),
+                taosmd_dir=str(data.get("taosmd_dir", "") or ""),
+                taosmd_restart_cmd=str(data.get("taosmd_restart_cmd", "") or ""),
+                github_app_id=str(data.get("github_app_id", "") or ""),
+                lora_ingest_proxy_url=str(data.get("lora_ingest_proxy_url", "") or ""),
                 config_path=config_path,
             )
             request.app.state.config = new_config
@@ -546,12 +619,28 @@ async def check_for_updates(request: Request):
     import re
     from tinyagentos import __version__
     from tinyagentos.auto_update import changes_are_docs_only, remote_is_strictly_ahead, branch_is_diverged
+    from tinyagentos.update_preflight import check_preflight
     project_dir = str(Path(__file__).parent.parent.parent)
 
-    # Track the user's selected branch (Updates → Advanced selector), or the
-    # checked-out branch when unset — never a hard-coded master, otherwise a
+    # Track the user's selected branch (Updates -> Advanced selector), or the
+    # checked-out branch when unset -- never a hard-coded master, otherwise a
     # dev box is told a stale master commit is "available" and Install fails.
     branch = await resolve_tracked_branch(request.app.state.desktop_settings, Path(project_dir))
+
+    # Pre-flight validation to prevent confusing errors or partial updates
+    preflight_issues = await asyncio.to_thread(check_preflight, project_dir, branch)
+    if preflight_issues:
+        return {
+            "has_updates": False,
+            "diverged": False,
+            "diverged_message": None,
+            "current_version": __version__,
+            "new_version": None,
+            "current_commit": None,
+            "new_commit": None,
+            "preflight_errors": preflight_issues,
+            "fetch_error": None,
+        }
 
     # Fetch remote refs so origin/<branch> is current, then compare SHAs.
     # Parsing dry-run output is unreliable on shallow clones / no tracking branch.
@@ -559,10 +648,23 @@ async def check_for_updates(request: Request):
         # `--` forces `branch` to be read as a refspec, never an option, even
         # though resolve_tracked_branch already validates it (defence in depth).
         "git", "fetch", "origin", "--", branch,
-        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
         cwd=project_dir,
     )
-    await fetch_proc.communicate()
+    fetch_out, _ = await fetch_proc.communicate()
+    if fetch_proc.returncode != 0:
+        # Surface fetch failure as an error field, never as 'unknown'
+        return {
+            "has_updates": False,
+            "diverged": False,
+            "diverged_message": None,
+            "current_version": __version__,
+            "new_version": None,
+            "current_commit": None,
+            "new_commit": None,
+            "preflight_errors": [],
+            "fetch_error": (fetch_out.decode(errors="replace") if fetch_out else "unknown error").strip()[:300],
+        }
 
     async def _rev_parse(ref: str) -> str:
         p = await asyncio.create_subprocess_exec(
@@ -728,12 +830,44 @@ def _find_uv(project_dir: Path) -> str | None:
     return None
 
 
+
+
 # Optional-dependency extras the updater must install so a `uv sync --frozen`
 # does not prune them out of the venv. Single source of truth for the Python
 # side; `scripts/install-server.sh` installs the same set via
-# `pip install -e ".[proxy]"`, and `test_updater_dep_install.py` asserts the two
-# stay in parity so they cannot silently drift (the bug that stripped litellm).
-UPDATE_EXTRAS: tuple[str, ...] = ("proxy",)
+# `$(taos_controller_extras)`, and `test_updater_dep_install.py` asserts the two
+# stay in parity so they cannot silently drift. There are none by default (the
+# LiteLLM `proxy` extra is gone); a handset (detected via
+# hardware._detect_device_class() or TAOS_EXTRAS_BLE=1) adds the "ble" extra so
+# Orb scan/pair routes work. TAOS_EXTRAS_BLE=0 excludes ble (rare).
+
+def _compute_update_extras() -> tuple[str, ...]:
+    """Compute UPDATE_EXTRAS based on device class and TAOS_EXTRAS_BLE env var.
+
+    Mirrors install-server.sh's logic: ble is added only on a taOSmobile handset
+    (hardware._detect_device_class() == "mobile") unless TAOS_EXTRAS_BLE=1 (force include)
+    or TAOS_EXTRAS_BLE=0 (force exclude). This ensures the scan/pair routes work on
+    a stock install while allowing operators with BLE dongles on non-handset hosts
+    to opt in.
+    """
+    import os
+
+    # Detect handset using the same signal as the controller
+    device_class = _detect_device_class()
+    is_handset = device_class == "mobile"
+
+    # Override via environment variable
+    taos_extras_ble = os.getenv("TAOS_EXTRAS_BLE")
+    if taos_extras_ble is not None:
+        if taos_extras_ble in ("1", "true"):
+            # Force include ble
+            return ("ble",)
+        elif taos_extras_ble in ("0", "false"):
+            # Force exclude ble
+            return ()
+
+    # Default: include ble on handsets only
+    return ("ble",) if is_handset else ()
 
 
 async def _install_dependencies(project_dir: Path) -> tuple[int, str]:
@@ -744,11 +878,12 @@ async def _install_dependencies(project_dir: Path) -> tuple[int, str]:
     deps onto a user's box. When uv is not present we fall back to the legacy
     ``pip install -e .`` so installs without uv still update.
 
-    Both paths carry the ``proxy`` extra (litellm + prisma) to match
-    ``install-server.sh``'s ``pip install -e ".[proxy]"``. The LLM proxy is a
-    core dependency, not optional: a bare ``uv sync --frozen`` prunes the venv
-    to the locked default set and silently uninstalls litellm, disabling the
-    proxy on every update and breaking basic agent functionality.
+    On a taOSmobile handset (detected via hardware._detect_device_class()) both
+    paths carry the ``ble`` extra so Orb scan/pair routes work; otherwise no
+    extra (the LiteLLM ``proxy`` extra is gone). Use TAOS_EXTRAS_BLE=1 to force
+    include ble on a non-handset, or TAOS_EXTRAS_BLE=0 to exclude it even on a
+    handset. A bare ``uv sync --frozen`` prunes the venv to the locked default
+    set plus the named extras, so an extra left out here is uninstalled.
 
     Capture output and surface failures -- silently swallowing a failed install
     lands users on a grey-screen the next time they restart, because the new
@@ -763,7 +898,7 @@ async def _install_dependencies(project_dir: Path) -> tuple[int, str]:
         # HOME=project_dir so uv resolves its data/cache dir correctly under the
         # service user whose HOME is the install dir (the Pi layout).
         env = {**os.environ, "HOME": str(project_dir)}
-        extra_args = [arg for extra in UPDATE_EXTRAS for arg in ("--extra", extra)]
+        extra_args = [arg for extra in _compute_update_extras() for arg in ("--extra", extra)]
         cmd = [uv_cmd, "sync", "--frozen", *extra_args]
         logger.info("Updater dependency install: %s", " ".join(cmd))
         return await _run_capture(cmd, cwd=str(project_dir), env=env)
@@ -773,7 +908,9 @@ async def _install_dependencies(project_dir: Path) -> tuple[int, str]:
         if candidate.exists():
             pip_cmd = str(candidate)
             break
-    pip_target = f".[{','.join(UPDATE_EXTRAS)}]"
+    extras = _compute_update_extras()
+    # ``.[]`` is not a valid pip target: brackets only when there is an extra.
+    pip_target = f".[{','.join(extras)}]" if extras else "."
     logger.info("Updater dependency install: uv not found, using %s install -e %s", pip_cmd, pip_target)
     return await _run_capture(
         [pip_cmd, "install", "-e", pip_target],
@@ -781,14 +918,15 @@ async def _install_dependencies(project_dir: Path) -> tuple[int, str]:
     )
 
 
-async def _pip_rebuild_restart(project_dir: Path, target_sha: str) -> tuple[int, str]:
+async def _pip_rebuild_restart(project_dir: Path, target_sha: str) -> tuple[int, str, str | None]:
     """Sync deps, rebuild the SPA, flag the pending restart, trigger restart.
 
-    Returns (returncode, output); non-zero means a step failed.
+    Returns (returncode, output, warning_message); non-zero means a step failed.
+    warning_message combines rebuild and launchd warnings, or None if none.
     """
     install_returncode, install_output = await _install_dependencies(project_dir)
     if install_returncode != 0:
-        return install_returncode, install_output
+        return install_returncode, install_output, None
 
     # Venv python for the import smoke test below (.venv/bin/python).
     venv_python: Path | None = None
@@ -832,7 +970,7 @@ async def _pip_rebuild_restart(project_dir: Path, target_sha: str) -> tuple[int,
             timeout=60.0,  # imports should be fast; 60s is generous
         )
         if smoke_returncode != 0:
-            return smoke_returncode, smoke_output
+            return smoke_returncode, smoke_output, None
 
     # Force a desktop bundle rebuild on every applied update. The mtime-based
     # staleness check in rebuild_desktop_bundle_if_stale is unreliable when
@@ -852,10 +990,37 @@ async def _pip_rebuild_restart(project_dir: Path, target_sha: str) -> tuple[int,
             "Update pulled but desktop rebuild failed: %s", rebuild_result.message
         )
 
+    # Combine rebuild and launchd warnings for user feedback
+    rebuild_warning = None
+    if not rebuild_result.success:
+        rebuild_warning = f"Frontend rebuild failed, so the old interface is still loaded: {rebuild_result.message}. Use Settings > Rebuild frontend after fixing it."
     if target_sha:
         write_pending_restart(target_sha)
 
-    return 0, ""
+    # macOS: migrate old bare-uvicorn launchd plist to `python -m tinyagentos`
+    # so the LLM gateway agent listener starts and local agent deploys work.
+    # This runs after deps are synced but before the restart is flagged.
+    # Failure is non-fatal: we log a warning and surface it in the update result.
+    launchd_warning = None
+    try:
+        _, launchd_warning = await apply_launchd_migration(str(project_dir))
+    except Exception as e:
+        launchd_warning = f"Launchd migration failed: {e}"
+
+    if launchd_warning:
+        logger.warning("Launchd migration: %s", launchd_warning)
+
+    # Combine rebuild and launchd warnings for user feedback
+    warning_message = None
+    if launchd_warning and rebuild_warning:
+        warning_message = f"{launchd_warning} {rebuild_warning}"
+    elif launchd_warning:
+        warning_message = launchd_warning
+    elif rebuild_warning:
+        warning_message = rebuild_warning
+    # else warning_message remains None
+
+    return 0, "", warning_message
 
 
 async def _stash_local_source_changes(project_dir) -> bool:
@@ -885,11 +1050,155 @@ async def _stash_local_source_changes(project_dir) -> bool:
     return True
 
 
+# Core capability identifiers every healthy taOSmd /health has served since the
+# capabilities field existed. Deliberately a SUBSET: newer servers add
+# capabilities, and the check must not fail on additions.
+REQUIRED_TAOSMD_CAPABILITIES = frozenset({"a2a.v1", "collections.v1", "search.v1"})
+
+# Post-restart verification pacing. Module constants so tests can collapse the
+# wait instead of patching sleep.
+_TAOSMD_VERIFY_RETRIES = 10
+_TAOSMD_VERIFY_DELAY = 2.0
+
+
+async def _verify_taosmd_running(request: Request) -> str | None:
+    """Verify the RUNNING taOSmd answers a real /health, or say why not.
+
+    Returns None on success, else a human-readable failure reason. Asserts in
+    order: (a) HTTP 200 whose Content-Type is application/json — a text/html
+    200 is the SPA catch-all answering the wrong port and MUST fail; (b) the
+    core capability identifiers are present in the body. Never status alone.
+    """
+    url = request.app.state.config.memory_url
+    try:
+        client = request.app.state.http_client
+        resp = await client.get(
+            f"{url}/health", timeout=httpx.Timeout(5.0, connect=3.0)
+        )
+    except (httpx.RequestError, httpx.InvalidURL) as exc:
+        return f"taOSmd /health unreachable at {url}: {exc}"
+    if resp.status_code != 200:
+        return f"taOSmd /health returned HTTP {resp.status_code} (expected 200)"
+    content_type = resp.headers.get("content-type", "")
+    if not content_type.startswith("application/json"):
+        return (
+            f"taOSmd /health Content-Type is {content_type or 'missing'!r}, not "
+            "application/json — a text/html 200 means the SPA catch-all "
+            "answered, not the memory service"
+        )
+    try:
+        body = resp.json()
+    except ValueError:
+        return "taOSmd /health claimed application/json but the body does not parse"
+    caps = body.get("capabilities") if isinstance(body, dict) else None
+    if not isinstance(caps, list):
+        return "taOSmd /health body has no capabilities list"
+    if not all(isinstance(c, str) for c in caps):
+        return "taOSmd /health capabilities list contains non-string entries"
+    missing = REQUIRED_TAOSMD_CAPABILITIES - set(caps)
+    if missing:
+        return f"taOSmd /health is missing capability identifiers: {sorted(missing)}"
+    return None
+
+
+async def _announce_taosmd_restart(text: str) -> bool:
+    """Post a system notice to the A2A bus BEFORE its process restarts.
+
+    A bus restart drops every SSE subscriber; without this notice the agent
+    leads diagnose a phantom outage. Best-effort: an already-down bus must not
+    block the update — there is nobody connected left to warn.
+    """
+    from tinyagentos.routes.a2a_bus import _bus_url
+
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.post(
+                f"{_bus_url()}/a2a/send",
+                json={"from": "system", "thread": "build", "body": text},
+            )
+            resp.raise_for_status()
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("taOSmd restart announcement failed: %s", exc)
+        return False
+
+
+async def _update_local_taosmd(request: Request) -> dict:
+    """Bring a locally-hosted taOSmd checkout to latest and restart its service.
+
+    Returns a report dict the update response carries verbatim:
+      {"skipped": <why>}    — legal no-op (remote taOSmd, or hooks unset)
+      {"updated": True, "output": ..., "announced": bool, "restarted": True}
+      {"error": <why>}      — hard failure; the caller must fail the update
+    """
+    import shlex
+
+    config = request.app.state.config
+    if not _is_local_url(config.memory_url):
+        return {"skipped": "memory_url is not local; update taOSmd on its own host"}
+    taosmd_dir = (config.taosmd_dir or "").strip()
+    if not taosmd_dir:
+        return {"skipped": "taosmd_dir not configured"}
+    if not (Path(taosmd_dir) / ".git").exists():
+        return {"error": f"taosmd_dir {taosmd_dir!r} is not a git checkout"}
+    restart_cmd = (config.taosmd_restart_cmd or "").strip()
+    if not restart_cmd:
+        # A configured checkout without a restart command would pull code the
+        # running service never loads — a silent half-update, worse than none.
+        return {
+            "error": "taosmd_dir is set but taosmd_restart_cmd is not; refusing "
+            "a pull the running service would never load"
+        }
+    try:
+        restart_argv = shlex.split(restart_cmd)
+    except ValueError as exc:
+        return {"error": f"taosmd_restart_cmd is not parseable shell syntax: {exc}"}
+    if not restart_argv:
+        return {"error": "taosmd_restart_cmd parses to an empty command"}
+    rc, out = await _run_capture(["git", "pull", "--ff-only"], cwd=taosmd_dir)
+    if rc != 0:
+        return {"error": f"taOSmd git pull failed: {out.strip()[-1500:]}"}
+    announced = await _announce_taosmd_restart(
+        "SYSTEM: taOSmd updating to latest via Settings-update; the A2A bus "
+        "restarts momentarily and SSE subscribers must reconnect."
+    )
+    rc, restart_out = await _run_capture(restart_argv, cwd=taosmd_dir, timeout=120.0)
+    if rc != 0:
+        return {"error": f"taOSmd restart command failed (rc {rc}): {restart_out.strip()[-1500:]}"}
+    return {
+        "updated": True,
+        "output": out.strip()[-1500:],
+        "announced": announced,
+        "restarted": True,
+    }
+
+
 @router.post("/api/settings/update")
 async def apply_update(request: Request):
     """Pull latest TinyAgentOS code from GitHub."""
     import asyncio
     project_dir = Path(__file__).parent.parent.parent
+
+    # Track the user's selected branch (Updates -> Advanced selector), or the
+    # checked-out branch when unset -- never a hard-coded master, otherwise a
+    # dev box is told a stale master commit is "available" and Install fails.
+    branch = await resolve_tracked_branch(request.app.state.desktop_settings, project_dir)
+
+    # Pre-flight validation to prevent confusing errors or partial updates
+    from tinyagentos.update_preflight import check_preflight
+
+    preflight_issues = await asyncio.to_thread(check_preflight, project_dir, branch)
+    if preflight_issues:
+        # REFUSE: check_for_updates returns 200 with preflight_errors: [...] and has_updates false;
+        # apply_update returns 409 with the messages and does NOT touch the tree
+        return JSONResponse(
+            {
+                "error": "Update blocked by preflight validation",
+                "preflight_errors": preflight_issues,
+                "message": "The update cannot proceed due to preflight validation errors. See preflight_errors for details.",
+            },
+            status_code=409,
+        )
 
     # The desktop rebuild leaves the tree dirty in three ways, and a dirty
     # tracked file makes the next git pull --ff-only refuse to overwrite the
@@ -919,11 +1228,6 @@ async def apply_update(request: Request):
     # the update applies; the change is recoverable via `git stash pop`.
     stashed_local = await _stash_local_source_changes(project_dir)
 
-    # Git pull — pull the branch this install tracks (master on stable, dev on
-    # a dev/test box). Pulling a hard-coded master onto a dev box fails ff-only
-    # (dev is ahead of master) and the update silently never applies.
-    branch = await resolve_tracked_branch(request.app.state.desktop_settings, project_dir)
-
     # Fetch first so we can verify GPG signature before merging.
     fetch_proc = await asyncio.create_subprocess_exec(
         "git", "fetch", "--quiet", "origin", "--", branch,
@@ -933,7 +1237,7 @@ async def apply_update(request: Request):
     fetch_out, _ = await fetch_proc.communicate()
     if fetch_proc.returncode != 0:
         return JSONResponse(
-            {"error": f"Fetch failed: {(fetch_out.decode() if fetch_out else 'unknown error').strip()[:300]}"},
+            {"error": f"Fetch failed: {(fetch_out.decode(errors='replace') if fetch_out else 'unknown error').strip()[:300]}"},
             status_code=500,
         )
 
@@ -1000,7 +1304,7 @@ async def apply_update(request: Request):
     sha_out, _ = await sha_proc.communicate()
     new_sha = sha_out.decode().strip() if sha_out else ""
 
-    rc, out = await _pip_rebuild_restart(project_dir, new_sha)
+    rc, out, launchd_warning = await _pip_rebuild_restart(project_dir, new_sha)
     if rc != 0:
         return JSONResponse(
             {
@@ -1011,6 +1315,39 @@ async def apply_update(request: Request):
             status_code=500,
         )
 
+    # Bring a locally-hosted taOSmd to latest in the SAME action (tsk-jjkukj):
+    # two components, one deploy route, one place to look when it fails. A
+    # skip (remote taOSmd, hooks unset) is reported, never silent; a failure
+    # fails the update loudly — a silent half-update is worse than no update.
+    taosmd_report = await _update_local_taosmd(request)
+    if "error" in taosmd_report:
+        return JSONResponse(
+            {
+                "error": f"taOSmd update FAILED — update aborted: {taosmd_report['error']}",
+                "git_output": output.strip(),
+            },
+            status_code=500,
+        )
+    if taosmd_report.get("updated"):
+        # Verify the RUNNING server came back serving real JSON with the core
+        # capability identifiers — never trust the restart exit status alone.
+        verify_reason = None
+        for attempt in range(_TAOSMD_VERIFY_RETRIES):
+            verify_reason = await _verify_taosmd_running(request)
+            if verify_reason is None:
+                break
+            if attempt < _TAOSMD_VERIFY_RETRIES - 1:
+                await asyncio.sleep(_TAOSMD_VERIFY_DELAY)
+        if verify_reason is not None:
+            return JSONResponse(
+                {
+                    "error": f"taOSmd update verification FAILED: {verify_reason}",
+                    "git_output": output.strip(),
+                    "taosmd": taosmd_report,
+                },
+                status_code=500,
+            )
+
     # Always restart after a successful update.
     import asyncio as _asyncio
     from tinyagentos.routes.system import _do_restart
@@ -1019,10 +1356,20 @@ async def apply_update(request: Request):
         "status": "restarting",
         "output": output.strip(),
         "stashed_local_changes": stashed_local,
+        "taosmd": taosmd_report,
         "message": (
-            "Update applied. Local source changes were stashed (recover with `git stash pop`). Restarting now…"
-            if stashed_local
-            else "Update applied. Restarting now…"
+            (
+                "Update applied. Local source changes were stashed (recover with `git stash pop`). "
+                if stashed_local
+                else "Update applied. "
+            )
+            + (
+                "taOSmd updated and verified against the running service. "
+                if taosmd_report.get("updated")
+                else ""
+            )
+            + (f"{launchd_warning} " if launchd_warning else "")
+            + "Restarting now…"
         ),
     }
 
@@ -1123,7 +1470,7 @@ async def set_update_channel(request: Request, body: UpdateChannel):
     prefs["tracked_branch"] = branch
     await store.save_preference("user", PREF_NAMESPACE, prefs)
 
-    rc, out = await _pip_rebuild_restart(project_dir, result.new_sha)
+    rc, out, launchd_warning = await _pip_rebuild_restart(project_dir, result.new_sha)
     if rc != 0:
         return JSONResponse(
             {"error": f"Switched to {branch} but rebuild failed: {out[:300]}",
@@ -1143,7 +1490,7 @@ async def set_update_channel(request: Request, body: UpdateChannel):
         "branch": branch,
         "snapshot": str(snapshot_path) if snapshot_path else None,
         "recovery_tag": result.recovery_tag,
-        "message": result.message,
+        "message": result.message + (f" {launchd_warning}" if launchd_warning else ""),
     }
 
 
@@ -1198,6 +1545,85 @@ async def _probe_taosmd(request: Request, url: str) -> tuple[bool, str | None]:
 
 class MemoryUrlUpdate(BaseModel):
     url: str
+
+
+@router.get("/api/settings/demo-mode")
+async def get_demo_mode(request: Request):
+    """Whether the lock screen's scripted demo content is SHOWN.
+
+    ``available`` says whether any ``TAOS_LOCK_DEMO_*`` flag defines demo
+    content on this device at all; with none, the switch has nothing to show.
+    """
+    from tinyagentos.demo_mode import demo_flags_configured, read_demo_mode
+
+    return {
+        "enabled": read_demo_mode(request.app.state.data_dir),
+        "available": demo_flags_configured(),
+    }
+
+
+@router.put("/api/settings/demo-mode")
+async def put_demo_mode(request: Request):
+    """Flip the demo switch. Admin-only via this router's dependency."""
+    from tinyagentos.demo_mode import demo_flags_configured, write_demo_mode
+
+    try:
+        body = await request.json()
+    except ValueError:
+        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+    if not isinstance(body, dict) or not isinstance(body.get("enabled"), bool):
+        return JSONResponse({"error": "'enabled' must be true or false"}, status_code=400)
+    write_demo_mode(request.app.state.data_dir, body["enabled"])
+    return {"ok": True, "enabled": body["enabled"], "available": demo_flags_configured()}
+
+
+@router.get("/api/settings/collaboration")
+async def get_collaboration(request: Request):
+    """The collaboration kill switch: instance-wide flag plus paused contacts."""
+    from tinyagentos.collab_settings import read_collab_settings
+
+    return read_collab_settings(request.app.state.data_dir).to_dict()
+
+
+@router.put("/api/settings/collaboration")
+async def put_collaboration(request: Request):
+    """Flip the kill switch or replace the paused list. Admin-only via this router's dependency.
+
+    Either field may be omitted to keep its current value.  Pausing deletes
+    nothing: the contact row and peer link stay, and un-pausing restores service.
+    """
+    from tinyagentos import collab_settings as cs
+
+    try:
+        body = await request.json()
+    except ValueError:
+        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+    if not isinstance(body, dict):
+        return JSONResponse({"error": "body must be an object"}, status_code=400)
+    data_dir = request.app.state.data_dir
+    async with cs.collab_write_lock:
+        current = cs.read_collab_settings(data_dir)
+        enabled = body.get("enabled", current.enabled)
+        if not isinstance(enabled, bool):
+            return JSONResponse({"error": "'enabled' must be true or false"}, status_code=400)
+        paused_in = body.get("paused_contacts", current.paused_contacts)
+        if not isinstance(paused_in, list) or not all(isinstance(p, str) for p in paused_in):
+            return JSONResponse(
+                {"error": "'paused_contacts' must be a list of contact ids"}, status_code=400,
+            )
+        paused: list[str] = []
+        seen: set[str] = set()
+        for raw in paused_in:
+            try:
+                cid = cs.normalise_contact_id(raw)
+            except ValueError as exc:
+                return JSONResponse({"error": str(exc)}, status_code=400)
+            if cid not in seen:
+                seen.add(cid)
+                paused.append(cid)
+        settings = cs.CollabSettings(enabled=enabled, paused_contacts=paused)
+        await asyncio.to_thread(cs.write_collab_settings, data_dir, settings)
+    return settings.to_dict()
 
 
 @router.get("/api/settings/memory-url")

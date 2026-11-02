@@ -5,10 +5,11 @@ import json
 import logging
 from pathlib import Path
 
-from fastapi import APIRouter, Request, UploadFile, File
+from fastapi import APIRouter, Depends, HTTPException, Request, UploadFile, File, Form, Query
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
+from tinyagentos.auth_context import CurrentUser, current_user, require_agent_owner_or_admin
 from tinyagentos.routes.user_workspace import (
     _dir_signature,
     _list_dir,
@@ -27,7 +28,24 @@ from tinyagentos.workspace_trash import (
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter()
+
+async def _require_agent_access(
+    request: Request, agent_name: str, user: CurrentUser = Depends(current_user)
+) -> None:
+    """Only the agent's owner, an admin, or the agent itself may touch its workspace.
+
+    A per-agent local token maps to the admin user, so the owner check alone
+    would let agent A read or rewrite agent B's files; a bound token is fenced
+    to its own agent first. Every route in this module carries ``{agent_name}``,
+    so the check runs once, router-wide, before any handler.
+    """
+    bound = getattr(request.state, "agent_name", None)
+    if bound and bound != agent_name:
+        raise HTTPException(status_code=403, detail="forbidden")
+    await require_agent_owner_or_admin(request, user, agent_name)
+
+
+router = APIRouter(dependencies=[Depends(_require_agent_access)])
 
 
 class MkdirRequest(BaseModel):
@@ -134,11 +152,15 @@ async def api_watch_files(request: Request, agent_name: str, path: str = "", int
 
 
 @router.post("/api/agents/{agent_name}/workspace/files/upload")
-async def api_upload_file(request: Request, agent_name: str, path: str = "", file: UploadFile = File(...)):
+async def api_upload_file(request: Request, agent_name: str, path: str | None = Query(None), form_path: str | None = Form(None, alias="path"), file: UploadFile = File(...)):
     """Upload a file into an agent's workspace, optionally into a subdirectory."""
     workspace, err = _resolve_workspace(request, agent_name)
     if err is not None:
         return err
+
+    if path is not None and form_path is not None and path != form_path:
+        return JSONResponse({"error": "path given in both query and form with different values"}, status_code=400)
+    path = path if path is not None else (form_path or "")
 
     if path:
         target_dir = _resolve_safe(workspace, path)

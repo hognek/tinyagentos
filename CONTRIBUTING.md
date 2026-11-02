@@ -6,11 +6,9 @@ Welcome - and thanks for your interest in contributing. taOS is a self-hosted AI
 
 ---
 
-## License & Contributor License Agreement
+## License
 
-taOS is open source under the **GNU Affero General Public License v3.0 or later** (AGPL-3.0-or-later; see [`LICENSE`](LICENSE)). A separate commercial license is available from jaylfc for uses the AGPL does not grant, for example embedding taOS in a proprietary product or offering it as a hosted service without releasing your modifications under the AGPL (see [`COMMERCIAL-LICENSE.md`](COMMERCIAL-LICENSE.md)).
-
-To keep this sustainable, **all contributors must agree to the Contributor License Agreement ([`CLA.md`](CLA.md))** before their contributions are merged. The CLA grants jaylfc the right to include and **relicense** your contributions under the project's licenses; **you keep ownership of your work**. You sign once - on your first pull request, comment **"I have read the CLA Document and I hereby sign the CLA"** and the CLA check turns green; it then covers all your future contributions.
+taOS is open source under the **GNU Affero General Public License v3.0 or later** (AGPL-3.0-or-later; see [`LICENSE`](LICENSE)). There is no separate commercial license and no Contributor License Agreement: your contributions are accepted under the same AGPL-3.0-or-later terms as the rest of the project, and you keep the copyright in your work.
 
 ---
 
@@ -58,6 +56,14 @@ Open a GitHub issue with:
 Open a GitHub issue describing:
 - The use case you are trying to solve
 - Why it belongs in the core project rather than a plugin or external tool
+
+### Fork PRs
+
+Fork PRs receive no automated review. **Lead review is the gate for fork PRs:** a maintainer review (an APPROVED review from a collaborator with admin or write permission on the current head sha, or the `lead-reviewed` label) is required before a fork PR can merge.
+
+For a fork PR the CodeRabbit classification is irrelevant: the verdict is EXIT_OK only when a maintainer has approved (APPROVED review by a collaborator with admin or write permission) or the `lead-reviewed` label is present. Otherwise the verdict is EXIT_FORK_UNREVIEWED (3). The `bot-review-allow` label does NOT waive the fork verdict: it waives stub-shaped bot output, and a fork PR has no bot output to be stubbed.
+
+The `lead-reviewed` label is the always-working path. An approval-based pass requires a successful read of `collaborators/{login}/permission`; we have not yet measured whether the read-only `GITHUB_TOKEN` of a fork `pull_request` run can read that endpoint, so a failed permission read fails closed (EXIT_ERROR) rather than guessing. The `bot-review-gate` check stays red until a maintainer approves the PR with a review on the current head sha (or applies the `lead-reviewed` label). Expected turnaround is within 24-48 hours for routine code changes; complex changes requiring multiple reviews may take longer.
 
 ### Adding Apps to the Catalog
 
@@ -168,6 +174,16 @@ Submit a pull request. The CI will run the catalog tests automatically. Include 
 - Follow the patterns already in the codebase - there is no strict linter, but keep it readable
 - One concern per module; avoid cross-importing between route files
 - Use `async def` for route handlers; use `await` for all I/O
+- Persist state with `tinyagentos.atomic_io` (`atomic_write_text` /
+  `atomic_write_bytes`), never a hand-rolled write-temp-then-rename: the
+  hand-rolled form fsyncs nothing, so a power cut can bring the file back the
+  right size and full of NULs. `tests/test_config_atomic.py` enforces this;
+  see pitfall 24 in [`docs/contributor-pitfalls.md`](docs/contributor-pitfalls.md)
+- Create one-time key material with `atomic_create_bytes`, not
+  `atomic_write_bytes`: a write is a *replace*, so two processes that both find
+  the file absent both write and the loser keeps using a key that is not on disk
+- Await a durable write from async code (`await asyncio.to_thread(...)`): the
+  two fsyncs are blocking syscalls and stall the whole event loop
 
 ### Frontend
 
@@ -180,7 +196,7 @@ The UI is a React SPA (`desktop/`) built with Vite. Static assets are served fro
 ### Tests
 
 - Use pytest; fixtures live in `tests/conftest.py` - use them
-- Mirror the module structure: `tinyagentos/routes/agents.py` -> `tests/test_agents.py`
+- Mirror the module structure: `tinyagentos/routes/agents.py` -> `tests/test_routes_agents.py`
 - All PRs must pass CI before merge
 
 ### Commits
@@ -220,7 +236,7 @@ Run a specific test file:
 pytest tests/test_catalog_sync.py -v
 ```
 
-The project has ~10,250 tests. CI runs against Python 3.12 and 3.13 on every pull request. Python 3.11 is added on the nightly scheduled run. A PR cannot be merged until all required checks pass.
+The project has ~10,250 tests. CI runs against Python 3.12 and 3.13 on every pull request. A dedicated Python 3.11 import-smoke job also runs on every PR targeting dev or master to catch floor-version import regressions; Python 3.11 remains in the nightly shard matrix as well. An advisory Python 3.14 import-smoke job (`py314-import-smoke`, not a required check) confirms the app imports on the newest version `requires-python` admits. A PR cannot be merged until all required checks pass.
 
 When adding a feature, add tests that cover the new behaviour. When fixing a bug, add a regression test.
 
@@ -240,6 +256,7 @@ Cases that have actually happened here:
 Applied to your own changes:
 
 - **If you add a gate, prove it fails.** A check only ever observed passing is unproven where it counts. Make it go red deliberately once.
+- **A guard test must fail on the defect it names.** A test that monkeypatches the function it guards, asserts only the case that cannot differ, or uses a fixture that never reaches the guarded branch passes whether the product is right or wrong. Declare what it guards with `@pytest.mark.guards("module:function", replace=[(correct_snippet, defective_snippet)])` and `scripts/check_non_discriminating.py` re-runs it against that broken variant; it must fail there. The gate proves only the DECLARED edit, not the defect you meant: a `replace` that raises on entry, or default mode's `return-none` (no `replace`/`must_kill`), is killed by any test that merely calls the function. So a reviewer must check that the `replace` pair reproduces the real defect, and a default-mode OK proves only that the test reaches the function.
 - **Verify a review comment against the code before acting on it**, including automated ones. Bot findings are often wrong, and confidently phrased.
 - **Report honestly.** If tests fail, say so and include the output. If you skipped a step, name it. "Done" should mean verified, not attempted.
 
@@ -253,24 +270,84 @@ Applied to your own changes:
 
 ## Documentation gate
 
-A gate blocks PRs that add or remove certain feature code without a matching doc update. It only fires on structural changes (a file added or deleted), never on a plain edit, and only for a small set of conservative rules configured in `docs/doc-gate.toml`:
+A gate blocks PRs that change feature code without a matching doc update, unless
+the commit that makes the change carries a non-empty `Docs-Reviewed: <why>`
+trailer (the trailer is scoped to its own commit, see below). The gate
+is configured in `docs/doc-gate.toml`; rules are data, no code changes needed to
+add new ones.
+
+### What triggers the gate
+
+The gate fires on **additions, deletions, and modifications** (plain edits count)
+for the following trees:
 
 | Change | Requires editing one of |
 |--------|--------------------------|
-| A desktop app under `desktop/src/apps/` is added or removed | `README.md` |
-| A route module under `tinyagentos/routes/` is added or removed | `docs/agent-coordination.md` |
-| An installer under `tinyagentos/installers/` or `scripts/install*` is added or removed | `README.md` |
-| A manifest under `app-catalog/` is added or removed | `README.md` |
+| A route module under `tinyagentos/routes/` is added, removed, or modified | `docs/agent-coordination.md` |
+| An installer under `tinyagentos/installers/` or `scripts/install*` is added, removed, or modified | `README.md` |
+| A manifest under `app-catalog/` is added, removed, or modified | `README.md` |
+| `tinyagentos/auth_middleware.py` is added, removed, or modified | `docs/agent-coordination.md` |
 
-If your PR trips a rule and there is genuinely nothing to document (or you already covered it elsewhere), add a trailer line to a commit message instead of editing a doc:
+In addition, **any non-test change under `tinyagentos/` or `desktop/src/`**
+(docs and assets under those trees included, not only code) requires a
+changelog entry: either a line in `CHANGELOG.md`
+or a new file under `changelog.d/` (preferred, avoids merge conflicts on the
+shared `[Unreleased]` anchor).
 
-```
+Agent-facing changes (agent registry, token auth, the scope-requests store,
+`tinyagentos/routes/agent_*.py`, and the MCP surface) also require a doc:
+either a page under `docs/agent-manual/` or `docs/agent-coordination.md`
+satisfies the rule.
+
+### Test-file exemption
+
+Test files are never structural changes and do not trip the gate. This covers
+Python `test_*.py` modules, co-located `__tests__/` directories, and frontend
+`*.test.*` / `*.spec.*` files.
+
+### Docs-Reviewed trailer
+
+If your PR trips a rule and there is genuinely nothing to document (or you
+already covered it elsewhere), add a trailer line to a commit message instead of
+editing a doc:
+
+```text
 Docs-Reviewed: no user-facing change, internal refactor only
 ```
 
-The trailer must have non-empty text after the colon; a bare `Docs-Reviewed:` does not count.
+The trailer must have non-empty text after the colon; a bare `Docs-Reviewed:`
+does not count. When CI detects the trailer it logs which commit used it, who
+authored it, and which files that commit touched.
 
-Run `scripts/install-git-hooks.sh` once to enable local hooks (`.githooks/pre-commit` and `.githooks/commit-msg`) so the gate runs before you push instead of after you open the PR. Local hooks are a convenience only: `.github/workflows/doc-gate.yml` is the authoritative check and runs on every PR regardless of local setup or `--no-verify`.
+**A trailer covers only the commit that carries it.** The gate attributes every
+non-merge commit in the PR the files it touched (a rename counts under both
+names; a merge commit's own diff is skipped and its parents are gated as
+ordinary commits). A rule tripped by a file is waived only when every commit in
+the PR that touched that file carries a covering trailer. So:
+
+- a trailer on an unrelated or empty ("retrigger CI") commit waives nothing;
+- code pushed after the trailer commit is still gated, even to the same file;
+- a doc edit or changelog fragment still satisfies a rule from any commit in
+  the PR (satisfaction is PR-wide, only the waiver is per-commit).
+
+By default a trailer waives every rule its commit trips. To waive only some,
+name them in a leading bracket:
+
+```text
+Docs-Reviewed: [routes] no API surface change, handler body only
+```
+
+Rule names are the `name` fields in `docs/doc-gate.toml`; a name that matches no
+rule waives nothing, and the reason after the bracket is still required. This
+is the shape to use on a squash-merged or single-commit PR that legitimately
+needs one rule waived but must still carry its changelog fragment: an unscoped
+trailer on a single commit waives everything that commit trips, as before.
+
+Run `scripts/install-git-hooks.sh` once to enable local hooks (`.githooks/pre-commit`
+and `.githooks/commit-msg`) so the gate runs before you push instead of after you
+open the PR. Local hooks are a convenience only: `.github/workflows/doc-gate.yml`
+is the authoritative check and runs on every PR regardless of local setup or
+`--no-verify`.
 
 To add a new rule, edit `docs/doc-gate.toml` -- rules are data, no code changes needed.
 

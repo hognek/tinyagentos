@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import logging
 import os as _os
 import re
@@ -9,7 +10,9 @@ from pathlib import Path
 from typing import Literal
 
 import yaml
+from slugify import slugify
 
+from tinyagentos.atomic_io import atomic_write_text
 from tinyagentos.providers import ALL_TYPES as VALID_BACKEND_TYPES
 
 log = logging.getLogger(__name__)
@@ -35,6 +38,14 @@ DEFAULT_CONFIG = {
     "metrics": {"poll_interval": 30, "retention_days": 30},
     "memory_url": "http://localhost:7900",
     "webhooks": [],
+    "wake_budget": {"global_default": 2, "per_agent": {}, "per_project": {}},
+    "container_provisioning": {
+        "quota": 2,
+        "threshold": 5,
+        "per_agent_quota": {},
+        "per_agent_threshold": {},
+        "default_image": "images:debian/bookworm",
+    },
 }
 
 _config_lock = asyncio.Lock()
@@ -60,8 +71,39 @@ class AppConfig:
     archived_agents: list[dict] = field(default_factory=list)
     archive: dict = field(default_factory=lambda: DEFAULT_ARCHIVE_CONFIG.copy())
     memory_url: str = "http://localhost:7900"
+    wake_budget: dict = field(default_factory=lambda: copy.deepcopy(DEFAULT_CONFIG["wake_budget"]))
+    container_provisioning: dict = field(default_factory=lambda: copy.deepcopy(DEFAULT_CONFIG["container_provisioning"]))
+    # Locally-hosted taOSmd deployment hooks for /api/settings/update: the git
+    # checkout the running service imports from, and the command that restarts
+    # it (e.g. "sudo systemctl restart taosmd"). Both empty on installs where
+    # taOSmd is remote or unmanaged; settings-update then reports the skip.
+    taosmd_dir: str = ""
+    taosmd_restart_cmd: str = ""
     wallhaven_api_key: str | None = None
     github_app_id: str = ""
+    # Explicit, opt-in proxy for LoRA Studio's Civitai ingest fetcher only
+    # (httpx.AsyncClient(proxy=...) per-request). Empty = direct connection.
+    # Nothing else in taOS reads this field or changes its egress behaviour.
+    lora_ingest_proxy_url: str = ""
+    # The device this controller runs on. ``class`` is "auto" (read from
+    # hardware._detect_device_class: the taos-kiosk unit marks a taOSmobile
+    # handset), or an operator override: "mobile" / "desktop".
+    device: dict = field(default_factory=lambda: {"class": "auto"})
+    # The system taOS Agent. ``framework`` is "auto" (picoclaw on a mobile
+    # device, opencode elsewhere), or an operator override: "opencode" /
+    # "picoclaw". See taos_agent_runtime.decide_framework.
+    taos_agent: dict = field(default_factory=lambda: {"framework": "auto"})
+    # Bundled mDNS reflector for cast discovery across a container bridge
+    # (services/mdns_reflector.py). Opt-in: off unless ``enabled`` is true.
+    # Optional ``interfaces`` (names to bridge) and ``silence_window_s``.
+    mdns_reflector: dict = field(default_factory=lambda: {"enabled": False})
+    # mDNS publisher for advertising the controller as taos.local on the LAN.
+    # Enabled by default; set ``enabled: false`` to disable. Can also be
+    # overridden by the TAOS_MDNS=0 environment variable.
+    mdns: dict = field(default_factory=lambda: {"enabled": True})
+    # Orb catalog settings. ``catalog_url`` is the base URL of the signed Orb
+    # catalog (https only; empty = cache only, no remote fetch).
+    orb: dict = field(default_factory=lambda: {"catalog_url": ""})
     config_path: Path | None = None
 
     def to_dict(self) -> dict:
@@ -71,6 +113,7 @@ class AppConfig:
             "qmd": self.qmd,
             "agents": self.agents,
             "metrics": self.metrics,
+            "wake_budget": self.wake_budget,
         }
         if self.webhooks:
             d["webhooks"] = self.webhooks
@@ -81,8 +124,24 @@ class AppConfig:
             d["archive"] = self.archive
         if self.memory_url != "http://localhost:7900":
             d["memory_url"] = self.memory_url
+        if self.taosmd_dir:
+            d["taosmd_dir"] = self.taosmd_dir
+        if self.taosmd_restart_cmd:
+            d["taosmd_restart_cmd"] = self.taosmd_restart_cmd
         if self.github_app_id:
             d["github_app_id"] = self.github_app_id
+        if self.lora_ingest_proxy_url:
+            d["lora_ingest_proxy_url"] = self.lora_ingest_proxy_url
+        if (self.device or {}).get("class", "auto") != "auto":
+            d["device"] = self.device
+        if (self.taos_agent or {}).get("framework", "auto") != "auto":
+            d["taos_agent"] = self.taos_agent
+        if (self.mdns_reflector or {}) != {"enabled": False}:
+            d["mdns_reflector"] = self.mdns_reflector
+        if self.mdns != {"enabled": True}:
+            d["mdns"] = self.mdns
+        if self.orb != {"catalog_url": ""}:
+            d["orb"] = self.orb
         return d
 
 # rkllama's taOS default port moved from the upstream 8080 to 7833. Installs
@@ -187,11 +246,36 @@ def load_config(path: Path) -> AppConfig:
         qmd=data.get("qmd", DEFAULT_CONFIG["qmd"].copy()),
         agents=agents,
         metrics=data.get("metrics", DEFAULT_CONFIG["metrics"].copy()),
+        wake_budget=copy.deepcopy(
+            data["wake_budget"]
+            if isinstance(data.get("wake_budget"), dict)
+            else DEFAULT_CONFIG["wake_budget"]
+        ),
         webhooks=data.get("webhooks", []),
         archived_agents=data.get("archived_agents", []),
         archive=archive_cfg,
         memory_url=data.get("memory_url", "http://localhost:7900"),
+        taosmd_dir=str(data.get("taosmd_dir", "") or ""),
+        taosmd_restart_cmd=str(data.get("taosmd_restart_cmd", "") or ""),
         github_app_id=str(data.get("github_app_id", "") or ""),
+        lora_ingest_proxy_url=str(data.get("lora_ingest_proxy_url", "") or ""),
+        device=dict(data["device"]) if isinstance(data.get("device"), dict) else {"class": "auto"},
+        taos_agent=(
+            dict(data["taos_agent"]) if isinstance(data.get("taos_agent"), dict)
+            else {"framework": "auto"}
+        ),
+        mdns_reflector=(
+            dict(data["mdns_reflector"]) if isinstance(data.get("mdns_reflector"), dict)
+            else {"enabled": False}
+        ),
+        mdns=(
+            dict(data["mdns"]) if isinstance(data.get("mdns"), dict)
+            else {"enabled": True}
+        ),
+        orb=(
+            dict(data["orb"]) if isinstance(data.get("orb"), dict)
+            else {"catalog_url": ""}
+        ),
         config_path=path,
         wallhaven_api_key=wallhaven_api_key,
     )
@@ -210,6 +294,10 @@ def load_config(path: Path) -> AppConfig:
     return cfg
 
 AGENT_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
+
+# Container names are ``taos-agent-<slug>``; 63 chars is the slug budget that
+# keeps the whole name inside the hostname limit.
+MAX_AGENT_SLUG_LEN = 63
 
 def validate_agent_name(name: str) -> str | None:
     """Validate agent display name. Accepts any non-empty string up to 64
@@ -231,18 +319,34 @@ def validate_agent_name(name: str) -> str | None:
 def slugify_agent_name(name: str) -> str:
     """Derive a container-safe slug from a free-form agent display name.
 
-    Lowercases, replaces any run of non-alphanumeric characters with a
-    single hyphen, trims leading/trailing hyphens, and truncates to 63
-    chars. Returns an empty string if nothing survives — callers should
-    handle that case.
+    This is the single slug implementation on the Python side; everything
+    that needs an agent slug (including
+    ``agent_registry_store._slugify``) routes through it.
+
+    Transliterates to ASCII first, then lowercases, replaces any run of
+    non-alphanumeric characters with a single hyphen, trims hyphens, and
+    truncates to :data:`MAX_AGENT_SLUG_LEN`. Returns an empty string if
+    nothing survives — callers should handle that case.
+
+    Transliteration is what lets a name written in a non-Latin script be
+    used at all: the previous ASCII-only character class deleted every
+    such code point *before* the emptiness check, so "我的代理" slugged to
+    "" and ``validate_agent_name`` rejected it as containing no letter or
+    number. It also stops accents being dropped rather than folded
+    ("résumé" was "r-sum", now "resume").
+
+    Only ever call this at creation time. Re-deriving the slug of an
+    existing row would change that agent's identity, since rows created
+    before this transliterates were slugged by the ASCII-only rule.
 
     Examples:
         "Mary's Coding Buddy" -> "mary-s-coding-buddy"
         "🚀 Alpha v2" -> "alpha-v2"
         "Agent_42!" -> "agent-42"
+        "我的代理" -> "wo-de-dai-li"
+        "Агент Иванов" -> "agent-ivanov"
     """
-    slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
-    return slug[:63]
+    return slugify(name, max_length=MAX_AGENT_SLUG_LEN)
 
 
 def unique_agent_slug(config: "AppConfig", display_name: str) -> str:
@@ -251,13 +355,18 @@ def unique_agent_slug(config: "AppConfig", display_name: str) -> str:
     Checks for collisions against config.agents by matching the ``name``
     field, mirroring the semantics of agent_db.find_agent.
 
+    The base is re-trimmed for every suffix so ``<base>-<n>`` still fits
+    :data:`MAX_AGENT_SLUG_LEN`; appending to an already-63-char slug would
+    overrun the very container-name limit the truncation exists to respect.
+
     Raises ValueError if no unique slug can be found within 100 attempts.
     """
     slug = slugify_agent_name(display_name)
     unique_slug = slug
     suffix = 2
     while any(a.get("name") == unique_slug for a in config.agents):
-        unique_slug = f"{slug}-{suffix}"
+        tail = f"-{suffix}"
+        unique_slug = slug[: MAX_AGENT_SLUG_LEN - len(tail)].rstrip("-") + tail
         suffix += 1
         if suffix > 100:
             raise ValueError("Could not generate a unique agent slug")
@@ -325,7 +434,8 @@ def normalize_agent(agent: dict) -> dict:
     agent.setdefault("soul_md", "")
     agent.setdefault("agent_md", "")
     agent.setdefault("memory_plugin", "taosmd")
-    agent.setdefault("memory_config", None)  # device_id + tier_id; None → use global taosmd_default.json
+    agent.setdefault("memory_config", None)  # device_id + tier_id; None -> use global taosmd_default.json
+    agent.setdefault("memory_mode", "both")  # "both" | "framework" | "taosmd"
     agent.setdefault("source_persona_id", None)
     # False for pre-existing rows; new deploys flip to True explicitly.
     agent.setdefault("migrated_to_v2_personas", False)
@@ -339,10 +449,16 @@ def normalize_agent(agent: dict) -> dict:
     return agent
 
 def save_config(config: AppConfig, path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_suffix(".yaml.tmp")
-    tmp_path.write_text(yaml.dump(config.to_dict(), default_flow_style=False, sort_keys=False))
-    tmp_path.replace(path)
+    # config.yaml holds the entire install, and this runs on the _pin_applied
+    # path at boot -- the window a first-boot power cut is most likely to hit.
+    # atomic_io fsyncs the temp file and the parent directory, so a crash
+    # leaves the complete old config or the complete new one, never a
+    # NUL-filled one; its randomised temp name also keeps a second writer
+    # (save_config is reachable outside save_config_locked's per-process
+    # asyncio.Lock) from sharing one temp inode.
+    atomic_write_text(
+        path, yaml.dump(config.to_dict(), default_flow_style=False, sort_keys=False)
+    )
 
 async def save_config_locked(config: AppConfig, path: Path) -> None:
     async with _config_lock:
@@ -487,4 +603,31 @@ def validate_config(config: AppConfig) -> list[str]:
         fb = a.get("fallback_models")
         if fb is not None and not isinstance(fb, list):
             errors.append(f"agents[{i}]: fallback_models must be a list")
+    wb = config.wake_budget
+    if wb is None:
+        return errors
+    if not isinstance(wb, dict):
+        errors.append("wake_budget must be a mapping")
+        return errors
+    raw_gd = wb.get("global_default", 2)
+    if isinstance(raw_gd, bool) or not isinstance(raw_gd, int):
+        errors.append("wake_budget.global_default must be an integer")
+    elif raw_gd < 0:
+        errors.append("wake_budget.global_default must be >= 0")
+    for section in ("per_agent", "per_project"):
+        bucket = wb.get(section)
+        if bucket is None:
+            continue
+        if not isinstance(bucket, dict):
+            errors.append(f"wake_budget.{section} must be a mapping")
+            continue
+        for key, val in bucket.items():
+            if isinstance(val, bool):
+                errors.append(f"wake_budget.{section}[{key!r}] must be an integer")
+                continue
+            if not isinstance(val, int):
+                errors.append(f"wake_budget.{section}[{key!r}] must be an integer")
+                continue
+            if val < 0:
+                errors.append(f"wake_budget.{section}[{key!r}] must be >= 0")
     return errors

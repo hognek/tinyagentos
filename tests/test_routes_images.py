@@ -1,5 +1,6 @@
 import base64
 import json
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -7,6 +8,7 @@ import pytest_asyncio
 from httpx import ASGITransport, AsyncClient, Request as HttpxRequest, Response
 
 from tinyagentos.app import create_app
+from taos_test_csrf import csrf_event_hooks
 
 
 @pytest.fixture
@@ -20,6 +22,24 @@ def images_app(tmp_data_dir, tmp_path):
     return app
 
 
+def _get_admin_user_id(app):
+    """Get the admin user ID from the auth store."""
+    rec = app.state.auth.find_user("admin")
+    return rec["id"] if rec else ""
+
+
+def _get_user_images_dir(app, user_id: str):
+    """Get the user-specific images directory."""
+    data_dir = Path(app.state.config_path).parent
+    return data_dir / "workspace" / "users" / user_id / "images" / "generated"
+
+
+def _get_legacy_images_dir(app):
+    """Get the legacy shared images directory."""
+    data_dir = Path(app.state.config_path).parent
+    return data_dir / "workspace" / "images" / "generated"
+
+
 @pytest_asyncio.fixture
 async def images_client(images_app):
     store = images_app.state.metrics
@@ -31,7 +51,7 @@ async def images_client(images_app):
     _rec = images_app.state.auth.find_user("admin")
     _token = images_app.state.auth.create_session(user_id=_rec["id"] if _rec else "", long_lived=True)
     transport = ASGITransport(app=images_app)
-    async with AsyncClient(transport=transport, base_url="http://test", cookies={"taos_session": _token}) as c:
+    async with AsyncClient(transport=transport, base_url="http://test", cookies={"taos_session": _token}, event_hooks=csrf_event_hooks()) as c:
         yield c
     await store.close()
     await images_app.state.qmd_client.close()
@@ -68,8 +88,9 @@ class TestImagesGenerate:
         assert data["seed"] == 42
         assert data["filename"].endswith("_42.png")
 
-        # Verify file was saved
-        images_dir = images_app.state.config_path.parent / "workspace" / "images" / "generated"
+        # Verify file was saved in user-specific directory
+        admin_id = _get_admin_user_id(images_app)
+        images_dir = _get_user_images_dir(images_app, admin_id)
         saved_files = list(images_dir.glob("*.png"))
         assert len(saved_files) == 1
         assert saved_files[0].read_bytes() == b"fake-png-data"
@@ -99,7 +120,7 @@ class TestImagesGenerate:
         _rec = app.state.auth.find_user("admin")
         _token = app.state.auth.create_session(user_id=_rec["id"] if _rec else "", long_lived=True)
         transport = ASGITransport(app=app)
-        async with AsyncClient(transport=transport, base_url="http://test", cookies={"taos_session": _token}) as c:
+        async with AsyncClient(transport=transport, base_url="http://test", cookies={"taos_session": _token}, event_hooks=csrf_event_hooks()) as c:
             resp = await c.post("/api/images/generate", json={"prompt": "test"})
         assert resp.status_code == 503
         assert "error" in resp.json()
@@ -200,7 +221,8 @@ class TestImagesList:
         assert data["images"] == []
 
     async def test_list_with_images(self, images_app, images_client):
-        images_dir = images_app.state.config_path.parent / "workspace" / "images" / "generated"
+        admin_id = _get_admin_user_id(images_app)
+        images_dir = _get_user_images_dir(images_app, admin_id)
         images_dir.mkdir(parents=True, exist_ok=True)
         # Create a fake image + metadata
         (images_dir / "1234_42.png").write_bytes(b"fake-png")
@@ -224,7 +246,8 @@ class TestImagesDelete:
         assert resp.status_code == 404
 
     async def test_delete_image(self, images_app, images_client):
-        images_dir = images_app.state.config_path.parent / "workspace" / "images" / "generated"
+        admin_id = _get_admin_user_id(images_app)
+        images_dir = _get_user_images_dir(images_app, admin_id)
         images_dir.mkdir(parents=True, exist_ok=True)
         (images_dir / "1234_42.png").write_bytes(b"fake-png")
         (images_dir / "1234_42.json").write_text('{"prompt": "test"}')

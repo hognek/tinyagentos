@@ -3,9 +3,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import subprocess
+import time
+import uuid
 from dataclasses import asdict
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
@@ -16,10 +18,26 @@ import re
 from tinyagentos.cluster.capabilities import hardware_to_targets, potential_capabilities as _potential_capabilities
 from tinyagentos.cluster.optimiser import ClusterOptimiser
 from tinyagentos.cluster.worker_auth import _HMACError, require_worker_hmac
-from tinyagentos.cluster.worker_protocol import WorkerInfo
+from tinyagentos.cluster.worker_protocol import (
+    WorkerInfo,
+    invalid_resource_classes,
+)
+from tinyagentos.auth_context import require_admin
+from tinyagentos.rate_limit import MovingWindowLimiter, rate_limited_response
 from tinyagentos.routes.auth import _require_admin
+from tinyagentos.task_utils import _create_supervised_task
 
 router = APIRouter()
+
+_update_jobs: dict[str, dict] = {}
+
+# Admin-only fleet mutations / worker execution (tsk-exyzu4). Uses
+# `require_admin`, which accepts an admin session or the host local token
+# (taosctl, the taOS agent). This is broader than the `_require_admin` gate
+# used by revoke/block/unblock, which accepts only an admin session cookie. Worker-facing
+# paths (heartbeat, pairing, leases, capabilities) keep their HMAC /
+# possession gates and are deliberately not covered by this.
+_ADMIN = [Depends(require_admin)]
 
 
 # ---------------------------------------------------------------------------
@@ -34,25 +52,14 @@ router = APIRouter()
 # under the limit); an attacker trying to brute-force the code is held to a few
 # attempts per window, which on top of the high-entropy PIN makes guessing the
 # code within its 15-minute TTL infeasible.
-import time as _time
-
 _MANUAL_CLAIM_WINDOW_SECS = 10.0
 _MANUAL_CLAIM_MAX_PER_WINDOW = 20
-# ip -> (window_start_ts, count). In-memory is sufficient: the controller is a
-# single process and the cap only needs to bound a brute-force burst.
-_manual_claim_hits: dict[str, tuple[float, int]] = {}
-
-
-def _manual_claim_rate_ok(ip: str) -> bool:
-    """Fixed-window per-IP limiter. Returns False when the IP has exceeded
-    _MANUAL_CLAIM_MAX_PER_WINDOW requests in the current window."""
-    now = _time.time()
-    window_start, count = _manual_claim_hits.get(ip, (now, 0))
-    if now - window_start >= _MANUAL_CLAIM_WINDOW_SECS:
-        window_start, count = now, 0
-    count += 1
-    _manual_claim_hits[ip] = (window_start, count)
-    return count <= _MANUAL_CLAIM_MAX_PER_WINDOW
+_manual_claim_limiter = MovingWindowLimiter(
+    _MANUAL_CLAIM_MAX_PER_WINDOW, _MANUAL_CLAIM_WINDOW_SECS
+)
+# ip -> the claim timestamps still inside its window. Aliased here so tests and
+# an operator can reset a window; the limiter mutates it in place.
+_manual_claim_hits = _manual_claim_limiter.hits
 
 
 # ---------------------------------------------------------------------------
@@ -199,10 +206,10 @@ async def pairing_manual_claim(request: Request, body: ManualPairClaim):
     it displayed. Returns the signing key + the admin-supplied url once the admin
     has authorised the matching code; 202 awaiting otherwise."""
     client_ip = request.client.host if request.client else "unknown"
-    if not _manual_claim_rate_ok(client_ip):
-        return JSONResponse(
-            {"error": "too many pairing attempts; slow down and retry"},
-            status_code=429,
+    if not _manual_claim_limiter.check(client_ip):
+        return rate_limited_response(
+            "too many pairing attempts; slow down and retry",
+            _manual_claim_limiter.retry_after(client_ip),
         )
     store = request.app.state.cluster_pairing
     result = await store.manual_claim(body.name, body.code)
@@ -220,6 +227,7 @@ class WorkerRegister(BaseModel):
     models: list[str] = []
     capabilities: list[str] = []
     platform: str = ""
+    resources: list[str] = []
     # KV quant support, asymmetric K/V plus boundary-layer flag. Defaults
     # to fp16-only so legacy workers that don't send these still validate.
     kv_cache_quant_support: list[str] = ["fp16"]
@@ -238,12 +246,16 @@ class WorkerRegister(BaseModel):
     # preserved under the renamed pool. Worker deletes its local marker
     # after a successful registration so this never repeats.
     pending_storage_backup: dict | None = None
+    # taOS #640: split-brain protection — worker echoes the controller's
+    # generation. Legacy workers that don't send it get a pass.
+    generation: int | None = None
 
 
 class HeartbeatBody(BaseModel):
     name: str
     load: float = 0.0
     models: list[str] | None = None
+    resources: list[str] | None = None
     # Backend-driven fields (worker agent v2+). Both optional so legacy
     # worker agents that only report load + models still validate.
     backends: list[dict] | None = None
@@ -266,6 +278,12 @@ class HeartbeatBody(BaseModel):
     # rank candidates by actual free memory, not total capacity.
     free_vram_mb: int | None = None
     used_vram_mb: int | None = None
+    # Worker-sampled age of the VRAM report in milliseconds. When present,
+    # the controller uses the sample time (not the receipt time) to avoid
+    # over-admitting during heartbeat transit. If absent, keep the current
+    # receipt-time behavior (old workers, backward compatibility). Must be
+    # non-negative; negative values are rejected with a 422.
+    vram_sampled_age_ms: int | None = Field(default=None, ge=0)
     # Registration-drift refresh (taOS #1538): workers report their live
     # host_lan_ip, url, and hardware on every heartbeat so the cluster
     # manager stays in sync with container reality. Optional so legacy
@@ -279,6 +297,9 @@ class HeartbeatBody(BaseModel):
     # ready but the worker is still accepting tasks.
     status: str | None = None
     drain_reason: str | None = None
+    # taOS #640: split-brain protection — worker echoes the controller's
+    # generation. Legacy workers that don't send it get a pass.
+    generation: int | None = None
 
 
 class RouteRequest(BaseModel):
@@ -287,6 +308,7 @@ class RouteRequest(BaseModel):
     path: str
     body: dict | None = None
     timeout: float = 60
+    affinity_key: str | None = None
 
 
 class MoveRequest(BaseModel):
@@ -297,7 +319,14 @@ class MoveRequest(BaseModel):
 
 @router.get("/api/cluster/workers")
 async def list_workers(request: Request):
+    is_admin = getattr(request.state, "is_admin", False)
+    # taOS #3227: headless callers presenting a valid local token, device
+    # token, or registry JWT on this exempt GET get the full worker view
+    # (the middleware sets headless_full_view). signing_key stays stripped
+    # for everyone -- see below.
+    full_view = is_admin or getattr(request.state, "headless_full_view", False)
     cluster = request.app.state.cluster_manager
+    pairing = getattr(request.app.state, "cluster_pairing", None)
     registry = getattr(request.app.state, "registry", None)
     workers = cluster.get_workers()
     result = []
@@ -306,10 +335,37 @@ async def list_workers(request: Request):
         # signing_key is the worker's raw HMAC secret (bytes). Two reasons
         # to strip it from API responses: (1) FastAPI's default encoder
         # tries to utf-8 decode bytes fields, which crashes on random key
-        # material — the entire workers list 500s when any worker has a
+        # material -- the entire workers list 500s when any worker has a
         # non-utf8 signing key, and (2) even when serialization didn't
         # crash, the secret has no business being on the wire.
         d.pop("signing_key", None)
+        if not full_view:
+            result.append({
+                "name": d["name"],
+                "status": d["status"],
+                "tier_id": d.get("tier_id", ""),
+                "kind": d.get("kind", "worker"),
+            })
+            continue
+        # Surface the persistent auth state from the pairing store so the
+        # Cluster UI can show whether a node's signing key is live (not
+        # revoked/blocked) and offer revoke/block/unblock actions. A worker
+        # with no pairing row (e.g. the local controller) is treated as
+        # having a live token.
+        if pairing is not None:
+            state = await pairing.pairing_state(w.name)
+            if state is not None:
+                d["revoked"] = state["revoked"]
+                d["blocked"] = state["blocked"]
+                d["live_token"] = not state["revoked"] and not state["blocked"]
+            else:
+                d["revoked"] = False
+                d["blocked"] = False
+                d["live_token"] = True
+        else:
+            d["revoked"] = False
+            d["blocked"] = False
+            d["live_token"] = True
         if registry is not None:
             tier_id, pot_caps = _potential_capabilities(w.hardware, registry)
             d["tier_id"] = tier_id
@@ -323,6 +379,11 @@ async def list_workers(request: Request):
 
 @router.post("/api/cluster/workers")
 async def register_worker(request: Request, body: WorkerRegister):
+    """HMAC-signed -- a paired worker registers (or re-registers) itself.
+
+    The signing identity must match ``body.name``. The reported hardware is
+    normalised before it reaches :class:`WorkerInfo` and the capability map.
+    """
     # HMAC gate — workers must be paired before registering.
     # The 'local' worker registers in-process (manager.register_worker),
     # never over HTTP, so it is unaffected by this check.
@@ -349,18 +410,42 @@ async def register_worker(request: Request, body: WorkerRegister):
     # Populate signing_key from pairing store so ticket-signing consumers work.
     pairing_store = getattr(request.app.state, "cluster_pairing", None)
     signing_key = b""
+    # The kind is never the caller's to choose. A node whose key was issued
+    # to a device (a taOSusb board paired over BLE), or that the registry
+    # already lists as a device, stays kind="device" however it registers:
+    # the board holds its own node_key, and a self-promotion to "worker"
+    # would put it past every placement guard (chat, embed, browser).
+    kind = "worker"
+    existing = cluster.get_worker(body.name)
+    if existing is not None and getattr(existing, "kind", "worker") == "device":
+        kind = "device"
     if pairing_store is not None:
         key = await pairing_store.get_signing_key(body.name)
         if key is not None:
             signing_key = key
+        if await pairing_store.get_kind(body.name) == "device":
+            kind = "device"
+    hw = body.hardware or {}
+    # Treat null ram_mb as missing so downstream arithmetic never sees None.
+    # Preserve explicit 0 (e.g. ram_mb=0 is valid).
+    if hw.get("ram_mb") is None:
+        hw = dict(hw)
+        hw.pop("ram_mb", None)
+    bad = _bad_hardware(hw)
+    if bad:
+        return JSONResponse({"error": bad}, status_code=400)
+    bad_res = _bad_resources(body.resources)
+    if bad_res:
+        return JSONResponse({"error": bad_res}, status_code=400)
     info = WorkerInfo(
         name=body.name,
         url=body.url,
-        hardware=body.hardware,
+        hardware=hw,
         backends=body.backends,
         models=body.models,
         capabilities=body.capabilities,
         platform=body.platform,
+        resources=body.resources,
         kv_cache_quant_support=body.kv_cache_quant_support,
         kv_cache_quant_k_support=body.kv_cache_quant_k_support,
         kv_cache_quant_v_support=body.kv_cache_quant_v_support,
@@ -371,12 +456,20 @@ async def register_worker(request: Request, body: WorkerRegister):
         bytes_deduped_total=body.bytes_deduped_total,
         worker_lxc_image_version=body.worker_lxc_image_version,
         signing_key=signing_key,
+        kind=kind,
     )
-    await cluster.register_worker(info)
+    ok, reason = await cluster.register_worker(info, generation=body.generation)
+    if not ok:
+        if reason == "stale_generation":
+            return JSONResponse(
+                {"error": reason, "generation": cluster.generation}, status_code=409
+            )
+        return JSONResponse({"error": reason}, status_code=409)
     await _record_worker_capability(request.app, body.name, body.host_lan_ip, body.hardware)
     if body.pending_storage_backup:
         await _surface_storage_backup(request.app, body.name, body.pending_storage_backup)
-    return {"status": "registered", "name": body.name}
+    cluster = request.app.state.cluster_manager
+    return {"status": "registered", "name": body.name, "generation": cluster.generation}
 
 
 async def _record_worker_capability(app, name: str, host_lan_ip: str, hardware: dict) -> None:
@@ -400,8 +493,9 @@ async def _record_worker_capability(app, name: str, host_lan_ip: str, hardware: 
         prev = current or {}
 
         def _keep(key, default):
-            val = hw.get(key)
-            return val if val else prev.get(key, default)
+            if key in hw and hw[key] is not None:
+                return hw[key]
+            return prev.get(key, default)
 
         await store.upsert(
             {
@@ -437,7 +531,7 @@ async def _surface_storage_backup(app, worker_name: str, marker: dict) -> None:
         f"renamed it to '{backed_up}' before creating a fresh pool. "
         f"No data was deleted — see your workspace inbox for the full note."
     )
-    notif = getattr(app.state, "notif_store", None)
+    notif = getattr(app.state, "notifications", None)
     if notif is not None:
         try:
             await notif.add(title, short_msg, level="warning", source=f"worker:{worker_name}")
@@ -493,6 +587,41 @@ async def _surface_storage_backup(app, worker_name: str, marker: dict) -> None:
         logger.warning("storage-backup notify: failed to write workspace inbox file")
 
 
+def _bad_hardware(hw: dict | None) -> str | None:
+    """Return an error string if hardware carries non-int ram_mb/vram_mb, else None."""
+    if not hw:
+        return None
+    ram = hw.get("ram_mb")
+    if ram is not None and not isinstance(ram, int):
+        return "hardware.ram_mb must be an integer"
+    gpu = hw.get("gpu")
+    if isinstance(gpu, dict):
+        vram = gpu.get("vram_mb")
+        if vram is not None and not isinstance(vram, int):
+            return "hardware.gpu.vram_mb must be an integer"
+    return None
+
+
+def _bad_resources(resources: list[str] | None) -> str | None:
+    """Return an error string if the resource inventory breaks the class grammar.
+
+    The advertised inventory is what the controller authorises lease claims
+    against and shows in the cluster UI. install-worker.sh exports
+    TAOS_WORKER_RESOURCES, so this list is partly operator-supplied; storing an
+    unchecked string here would let a typo (or a bad override) reach the
+    scheduler. The class grammar is the one in
+    docs/design/resource-scheduler.md, shared with ClusterManager via
+    worker_protocol.RESOURCE_CLASS_RE.
+    """
+    invalid = invalid_resource_classes(resources)
+    if invalid:
+        return (
+            "resources must be scheduler resource classes "
+            f"(docs/design/resource-scheduler.md); got: {', '.join(invalid)}"
+        )
+    return None
+
+
 @router.post("/api/cluster/heartbeat")
 async def worker_heartbeat(request: Request, body: HeartbeatBody):
     # HMAC gate — only paired, registered workers may heartbeat.
@@ -506,11 +635,18 @@ async def worker_heartbeat(request: Request, body: HeartbeatBody):
             {"error": "Worker name in header does not match body"},
             status_code=403,
         )
+    bad_hw = _bad_hardware(body.hardware)
+    if bad_hw:
+        return JSONResponse({"error": bad_hw}, status_code=400)
+    bad_res = _bad_resources(body.resources)
+    if bad_res:
+        return JSONResponse({"error": bad_res}, status_code=400)
     cluster = request.app.state.cluster_manager
     ok = cluster.heartbeat(
         body.name,
         load=body.load,
         models=body.models,
+        resources=body.resources,
         backends=body.backends,
         capabilities=body.capabilities,
         kv_cache_quant_support=body.kv_cache_quant_support,
@@ -519,6 +655,7 @@ async def worker_heartbeat(request: Request, body: HeartbeatBody):
         kv_cache_quant_boundary_layer_protect=body.kv_cache_quant_boundary_layer_protect,
         free_vram_mb=body.free_vram_mb,
         used_vram_mb=body.used_vram_mb,
+        vram_sampled_age_ms=body.vram_sampled_age_ms,
         # LXC storage counters (forwarded from worker heartbeat)
         storage_cap_bytes=body.storage_cap_bytes,
         storage_used_bytes=body.storage_used_bytes,
@@ -529,19 +666,151 @@ async def worker_heartbeat(request: Request, body: HeartbeatBody):
         hardware=body.hardware,
         status=body.status,
         drain_reason=body.drain_reason,
+        generation=body.generation,
     )
     if not ok:
         return JSONResponse({"error": "Worker not registered"}, status_code=404)
-    return {"status": "ok"}
+    cluster = request.app.state.cluster_manager
+    return {"status": "ok", "generation": cluster.generation}
 
 
-@router.delete("/api/cluster/workers/{name}")
+@router.delete("/api/cluster/workers/{name}", dependencies=_ADMIN)
 async def unregister_worker(request: Request, name: str):
+    # Revoke the pairing key BEFORE deleting the worker row. If the store is
+    # unavailable or revoke raises, refuse with 503 so the row is never deleted
+    # while its key survives. Never skip revoke even if the worker row is absent.
+    pairing = getattr(request.app.state, "cluster_pairing", None)
+    if pairing is None:
+        return JSONResponse({
+            "error": "pairing store unavailable",
+            "code": "STORE_UNAVAILABLE",
+        }, status_code=503)
+
+    try:
+        await pairing.revoke(name)
+    except Exception:
+        return JSONResponse({
+            "error": "pairing store unavailable",
+            "code": "STORE_UNAVAILABLE",
+        }, status_code=503)
+
     cluster = request.app.state.cluster_manager
     removed = await cluster.unregister_worker(name)
     if not removed:
         return JSONResponse({"error": "Worker not found"}, status_code=404)
-    return {"status": "removed", "name": name}
+
+    # Unpin every agent that was deployed against this worker. Clearing only
+    # `remote` would leave a phantom local agent (restart_orchestrator treats
+    # `host and not remote` as local), so clear all placement fields together.
+    config = request.app.state.config
+    unpinned_agents: list[str] = []
+    for agent in config.agents:
+        if agent.get("remote") == name:
+            unpinned_agents.append(agent["name"])
+            agent.pop("remote", None)
+            agent.pop("placement_source", None)
+            agent["host"] = ""
+            agent["status"] = "failed"
+            agent["placement_error"] = f"worker '{name}' was unregistered"
+    if unpinned_agents:
+        from tinyagentos.config import save_config_locked
+
+        await save_config_locked(config, config.config_path)
+
+    _revoke_node_model_keys(request, name)
+    return {"status": "removed", "name": name, "unpinned_agents": unpinned_agents}
+
+
+def _revoke_node_model_keys(request: Request, name: str) -> None:
+    """Cut the node's LLM gateway keys in the same step as the node itself.
+
+    Raises on failure: a node revoke that answered 200 while its model keys
+    stayed live would be a silent half-revocation.
+    """
+    from tinyagentos.llm_gateway.auth import revoke_for_node
+
+    revoke_for_node(name, data_dir=request.app.state.data_dir)
+
+
+@router.post("/api/cluster/workers/{name}/revoke")
+async def revoke_node(request: Request, name: str):
+    """Admin -- revoke a node's signing key.
+
+    Invalidates the node's HMAC signing key so subsequent register/heartbeat
+    requests are rejected. The node can re-pair (announce/confirm/claim) to
+    obtain a fresh key; this is the node analogue of device revoke.
+    """
+    ok, err = _require_admin(request)
+    if not ok:
+        return err
+    pairing = getattr(request.app.state, "cluster_pairing", None)
+    if pairing is None:
+        return JSONResponse({"error": "pairing store unavailable"}, status_code=503)
+    # The node must exist in the pairing store (have been paired at least once).
+    state = await pairing.pairing_state(name)
+    if state is None:
+        return JSONResponse({"error": f"Worker '{name}' not found"}, status_code=404)
+    changed = await pairing.revoke(name)
+    _revoke_node_model_keys(request, name)
+    # Flag the in-memory worker as offline so the scheduler stops routing tasks
+    # to it immediately (rather than waiting for the heartbeat timeout). The
+    # worker itself stays in the registry so it remains visible in /api/cluster
+    # /workers and can be unblocked/re-paired from the UI.
+    cluster = request.app.state.cluster_manager
+    worker = cluster.get_worker(name)
+    if worker is not None and worker.status == "online":
+        worker.status = "offline"
+    return {"revoked": True, "changed": changed}
+
+
+@router.post("/api/cluster/workers/{name}/block")
+async def block_node(request: Request, name: str):
+    """Admin -- block a node.
+
+    Revokes the signing key (so the node can no longer authenticate) AND
+    prevents re-pairing until an admin unblocks it. The node analogue of
+    device block: a blocked node is refused at the pairing gate, not just
+    at the auth gate.
+    """
+    ok, err = _require_admin(request)
+    if not ok:
+        return err
+    pairing = getattr(request.app.state, "cluster_pairing", None)
+    if pairing is None:
+        return JSONResponse({"error": "pairing store unavailable"}, status_code=503)
+    state = await pairing.pairing_state(name)
+    if state is None:
+        return JSONResponse({"error": f"Worker '{name}' not found"}, status_code=404)
+    changed = await pairing.block(name)
+    _revoke_node_model_keys(request, name)
+    # Same as revoke: mark in-memory worker offline so no new tasks are routed,
+    # but keep it registered so it shows in the UI and can be unblocked.
+    cluster = request.app.state.cluster_manager
+    worker = cluster.get_worker(name)
+    if worker is not None and worker.status == "online":
+        worker.status = "offline"
+    return {"blocked": True, "changed": changed}
+
+
+@router.post("/api/cluster/workers/{name}/unblock")
+async def unblock_node(request: Request, name: str):
+    """Admin -- unblock a node so it may re-pair.
+
+    Clears the blocked flag. The old signing key stays dead (revoked), so
+    the node must re-pair via the normal announce/confirm/claim flow to
+    obtain a fresh key. The node analogue of device unblock.
+    """
+    ok, err = _require_admin(request)
+    if not ok:
+        return err
+    pairing = getattr(request.app.state, "cluster_pairing", None)
+    if pairing is None:
+        return JSONResponse({"error": "pairing store unavailable"}, status_code=503)
+    state = await pairing.pairing_state(name)
+    if state is None:
+        return JSONResponse({"error": f"Worker '{name}' not found"}, status_code=404)
+    changed = await pairing.unblock(name)
+    return {"unblocked": True, "changed": changed}
 
 
 @router.get("/api/cluster/capabilities")
@@ -605,7 +874,7 @@ async def cluster_backends(request: Request):
     return cluster.aggregate_catalog()
 
 
-@router.post("/api/cluster/route")
+@router.post("/api/cluster/route", dependencies=_ADMIN)
 async def route_task(request: Request, body: RouteRequest):
     task_router = request.app.state.task_router
     data, worker_name = await task_router.route_request(
@@ -614,6 +883,7 @@ async def route_task(request: Request, body: RouteRequest):
         path=body.path,
         body=body.body,
         timeout=body.timeout,
+        affinity_key=body.affinity_key,
     )
     if data is None:
         return JSONResponse(
@@ -741,7 +1011,7 @@ async def list_install_targets(request: Request):
     return targets
 
 
-@router.post("/api/cluster/move")
+@router.post("/api/cluster/move", dependencies=_ADMIN)
 async def move_model(request: Request, body: MoveRequest):
     cluster = request.app.state.cluster_manager
     to_worker = cluster.get_worker(body.to_worker)
@@ -903,7 +1173,7 @@ REMOTE_EXEC_ALLOWLIST = [
 ]
 
 
-@router.post("/api/cluster/workers/{name}/deploy")
+@router.post("/api/cluster/workers/{name}/deploy", dependencies=_ADMIN)
 async def deploy_backend(request: Request, name: str, body: DeployRequest):
     """Trigger a backend install on a remote worker.
 
@@ -935,7 +1205,7 @@ async def deploy_backend(request: Request, name: str, body: DeployRequest):
         return JSONResponse({"error": str(exc)}, status_code=502)
 
 
-@router.post("/api/cluster/workers/{name}/remote")
+@router.post("/api/cluster/workers/{name}/remote", dependencies=_ADMIN)
 async def worker_remote_command(request: Request, name: str, body: WorkerRemoteRequest):
     """Run an allowlisted command on a remote worker for debugging.
 
@@ -970,7 +1240,7 @@ async def worker_remote_command(request: Request, name: str, body: WorkerRemoteR
         return JSONResponse({"error": str(exc)}, status_code=502)
 
 
-@router.post("/api/cluster/promote-archived")
+@router.post("/api/cluster/promote-archived", dependencies=_ADMIN)
 async def promote_archived_models(request: Request):
     """Manual trigger: scan all online workers and promote any archived
     models that are now compatible with cluster hardware.
@@ -1042,11 +1312,13 @@ class LeaseClaimRequest(BaseModel):
 
 class LeaseReleaseRequest(BaseModel):
     lease_id: str
+    epoch: str | None = None
 
 
 class LeaseRenewRequest(BaseModel):
     lease_id: str
     ttl_seconds: float = Field(default=30, gt=0, le=_LEASE_TTL_MAX)
+    epoch: str | None = None
 
 
 async def _require_lease_access(request: Request) -> JSONResponse | None:
@@ -1113,6 +1385,7 @@ async def claim_lease(request: Request, body: LeaseClaimRequest):
         "status": "claimed",
         "lease_id": lease.lease_id,
         "resource_id": lease.resource_id,
+        "epoch": lease.epoch,
         "expires_at": lease.expires_at,
         "ttl_seconds": int(body.ttl_seconds),
         "required_vram_mb": lease.required_vram_mb,
@@ -1126,8 +1399,17 @@ async def release_lease(request: Request, body: LeaseReleaseRequest):
     if denied is not None:
         return denied
     cluster = request.app.state.cluster_manager
-    await cluster.release_lease(body.lease_id)
-    return {"status": "released", "lease_id": body.lease_id}
+    released, epoch = await cluster.release_lease_result(body.lease_id, epoch=body.epoch)
+    if not released:
+        return JSONResponse({
+            "error": "lease epoch mismatch",
+            "lease_id": body.lease_id,
+        }, status_code=409)
+    return {
+        "status": "released",
+        "lease_id": body.lease_id,
+        "epoch": epoch,
+    }
 
 
 @router.post("/api/cluster/leases/renew")
@@ -1137,7 +1419,7 @@ async def renew_lease(request: Request, body: LeaseRenewRequest):
     if denied is not None:
         return denied
     cluster = request.app.state.cluster_manager
-    lease = await cluster.renew_lease(body.lease_id, ttl_seconds=body.ttl_seconds)
+    lease = await cluster.renew_lease(body.lease_id, ttl_seconds=body.ttl_seconds, epoch=body.epoch)
     if lease is None:
         return JSONResponse({
             "error": "lease not found or expired",
@@ -1146,6 +1428,7 @@ async def renew_lease(request: Request, body: LeaseRenewRequest):
     return {
         "status": "renewed",
         "lease_id": lease.lease_id,
+        "epoch": lease.epoch,
         "expires_at": lease.expires_at,
     }
 
@@ -1373,8 +1656,9 @@ async def update_all_workers(request: Request):
     After a successful update, the route waits (with a timeout) for the worker
     to re-register as ``online`` before proceeding to the next target.
 
-    Returns an aggregate ``{updated: [...], failed: [{name, error}], skipped: [...]}``
-    so the admin can see exactly which workers were touched and which failed.
+    Returns 202 with a ``job_id`` immediately; the actual roll runs as a
+    tracked background task. Poll ``GET /api/cluster/workers/update-all/<job_id>``
+    for progress and final results.
     """
     ok, err = _require_admin(request)
     if not ok:
@@ -1388,19 +1672,50 @@ async def update_all_workers(request: Request):
         if w.name == "local" or w.status not in ("online", "draining")
     ]
     if not targets:
-        return {
+        return JSONResponse({
             "updated": [],
             "failed": [],
             "skipped": skipped,
             "total_targets": 0,
             "message": "No online remote workers to update",
-        }
+        }, status_code=202)
 
+    job_id = uuid.uuid4().hex
+    _update_jobs[job_id] = {
+        "job_id": job_id,
+        "status": "running",
+        "updated": [],
+        "failed": [],
+        "skipped": skipped,
+        "total_targets": len(targets),
+        "created_at": time.time(),
+        "completed_at": None,
+    }
+
+    async def _run() -> None:
+        try:
+            await _run_update_all_job(cluster, targets, job_id)
+        except Exception:
+            logger.exception("update-all job %s crashed", job_id)
+            job = _update_jobs.get(job_id)
+            if job is not None:
+                job["status"] = "failed"
+                job["completed_at"] = time.time()
+
+    bg = getattr(request.app.state, "_background_tasks", None)
+    _create_supervised_task(_run(), bg)
+
+    return JSONResponse({"job_id": job_id, "status": "running"}, status_code=202)
+
+
+async def _run_update_all_job(cluster, targets, job_id: str) -> None:
+    """Execute the rolling update and record results in ``_update_jobs``."""
+    job = _update_jobs[job_id]
     updated: list[str] = []
     failed: list[dict] = []
 
-    RE_REGISTER_TIMEOUT = 300  # seconds to wait for worker to come back online
-    RE_REGISTER_POLL = 5       # seconds between status checks
+    RE_REGISTER_TIMEOUT = 300
+    RE_REGISTER_POLL = 5
 
     for worker in targets:
         try:
@@ -1415,9 +1730,6 @@ async def update_all_workers(request: Request):
 
         if result["success"]:
             updated.append(worker.name)
-            # Wait for the worker to re-register as "online" before proceeding
-            # to the next target. This guarantees at most one worker is actively
-            # updating at any moment (never more than one draining concurrently).
             waited = 0
             while waited < RE_REGISTER_TIMEOUT:
                 await asyncio.sleep(RE_REGISTER_POLL)
@@ -1430,8 +1742,6 @@ async def update_all_workers(request: Request):
                     )
                     break
             else:
-                # Timeout: worker didn't come back online in time. Log it but
-                # continue the roll -- the worker's status will resolve on its own.
                 logger.warning(
                     "update-all: worker '%s' did not re-register within %ds timeout; "
                     "continuing roll",
@@ -1444,9 +1754,16 @@ async def update_all_workers(request: Request):
                 worker.name, result.get("error", "unknown"),
             )
 
-    return {
-        "updated": updated,
-        "failed": failed,
-        "skipped": skipped,
-        "total_targets": len(targets),
-    }
+    job["updated"] = updated
+    job["failed"] = failed
+    job["status"] = "completed"
+    job["completed_at"] = time.time()
+
+
+@router.get("/api/cluster/workers/update-all/{job_id}")
+async def get_update_all_job_status(request: Request, job_id: str):
+    """Poll the status of a fleet update started by POST /api/cluster/workers/update-all."""
+    job = _update_jobs.get(job_id)
+    if job is None:
+        return JSONResponse({"error": f"Job '{job_id}' not found"}, status_code=404)
+    return job

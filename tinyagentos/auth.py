@@ -1,19 +1,24 @@
 from __future__ import annotations
+import functools
 import hashlib
+import ipaddress
 import json
 import logging
 import os
 import secrets
 import threading
 import time
-from collections.abc import Iterator
+from collections import OrderedDict
+from collections.abc import Iterator, Mapping
 from pathlib import Path
 from typing import Any
 
 from argon2 import PasswordHasher
 from argon2.exceptions import VerifyMismatchError, VerificationError, InvalidHashError
 from fastapi import HTTPException, Request
+from filelock import FileLock
 
+from tinyagentos.atomic_io import atomic_write_text
 from tinyagentos.shortcuts.capabilities import default_caps_for_admin, default_caps_for_new_user
 
 _ph = PasswordHasher()
@@ -22,6 +27,34 @@ _ph = PasswordHasher()
 _hash_upgrade_lock = threading.Lock()
 
 logger = logging.getLogger(__name__)
+
+
+def _serialized(method):
+    """Hold the instance's account-store lock for the whole method.
+
+    Every mutator reads the store, edits the parsed dict and writes it back.
+    Atomic writes make each *write* all-or-nothing, but two concurrent
+    read-modify-write cycles still lose one of the two edits -- invite a user
+    while another request renames one and the rename can vanish. Serialising
+    the cycle is the missing half. Re-entrant so a mutator may call another.
+    """
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self._users_lock:
+            return method(self, *args, **kwargs)
+    return wrapper
+
+
+class AuthStoreCorruptError(RuntimeError):
+    """Raised when the account store exists but cannot be parsed.
+
+    A *missing* store means a fresh install; a *corrupt* one means the
+    accounts are still there and we simply cannot read them.  Conflating the
+    two is what turned a truncated ``.auth_user.json`` into a first-run
+    onboarding screen on 2026-08-21 — an unauthenticated caller was one form
+    submission away from claiming the box and overwriting the real users.
+    Callers must fail closed on this rather than treat it as "no users".
+    """
 
 
 class _PersistentSessions:
@@ -43,13 +76,28 @@ class _PersistentSessions:
         if not self._path.exists():
             return {}
         try:
-            return json.loads(self._path.read_text())
+            data = json.loads(self._path.read_text())
         except (json.JSONDecodeError, OSError):
             return {}
+        self._prune_expired(data)
+        return data
 
     def _save(self, data: dict) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        self._path.write_text(json.dumps(data))
+        self._save_pruned(data)
+
+    def _save_pruned(self, data: dict) -> None:
+        self._prune_expired(data)
+        atomic_write_text(self._path, json.dumps(data), mode=0o600)
+
+    def _prune_expired(self, data: dict) -> None:
+        now = time.time()
+        expired_keys = [
+            token for token, entry in data.items()
+            if isinstance(entry, dict) and entry.get("expires_at") is not None and now >= entry.get("expires_at")
+        ]
+        for token in expired_keys:
+            del data[token]
 
     def __getitem__(self, key: str):
         return self._load()[key]
@@ -84,6 +132,28 @@ class _PersistentSessions:
 
     def items(self):
         return list(self._load().items())
+
+    def set_capped(self, key: str, value: dict, limit: int) -> None:
+        """Store *value* under *key*, then evict the same user's oldest
+        sessions so that user keeps at most *limit* live ones.
+
+        One load/modify/save under the lock, so concurrent mints cannot race
+        each other past the cap. "Oldest" is dict insertion order, which is
+        mint order: tokens are never re-inserted and JSON round-trips keep
+        the order. Legacy float entries carry no user_id and are not counted.
+        """
+        user_id = value.get("user_id", "")
+        with self._lock:
+            data = self._load()
+            data[key] = value
+            if limit > 0:
+                owned = [
+                    token for token, entry in data.items()
+                    if isinstance(entry, dict) and entry.get("user_id", "") == user_id
+                ]
+                for token in owned[: max(0, len(owned) - limit)]:
+                    del data[token]
+            self._save(data)
 
 
 def hash_password(password: str, salt: str = "") -> str:
@@ -145,6 +215,216 @@ def verify_and_maybe_rehash(password: str, stored: str) -> tuple[bool, str | Non
     return True, _ph.hash(password)
 
 
+#: Minimum / maximum PIN length. A PIN is a low-entropy credential by design —
+#: it is safe only because it is refused anywhere but the device's own screen
+#: (see :func:`is_console_origin`). Four digits matches what users expect from
+#: a phone or a Windows device; the upper bound just keeps the on-screen keypad
+#: usable and the stored value sane.
+PIN_MIN_LEN = 4
+PIN_MAX_LEN = 12
+
+#: Headers that mean "this request was relayed by something else". Their mere
+#: PRESENCE disqualifies a request from counting as console-local, regardless of
+#: value — see :func:`is_console_origin` for why we do not try to interpret them.
+_FORWARDING_HEADERS = (
+    "x-forwarded-for",
+    "x-forwarded-host",
+    "x-forwarded-proto",
+    "x-real-ip",
+    "forwarded",
+    "via",
+)
+
+
+def validate_pin(pin: str) -> str:
+    """Return *pin* if it is well-formed, else raise ``ValueError``.
+
+    Digits only: the whole point of a PIN here is that it can be entered on a
+    taOS-rendered numeric keypad by a device with no keyboard attached, so a
+    PIN containing anything else would be unenterable on the hardware it exists
+    to serve.
+    """
+    if not isinstance(pin, str) or not pin.isdigit():
+        raise ValueError("PIN must contain digits only")
+    if not (PIN_MIN_LEN <= len(pin) <= PIN_MAX_LEN):
+        raise ValueError(f"PIN must be {PIN_MIN_LEN}-{PIN_MAX_LEN} digits")
+    return pin
+
+
+#: How the console lock screen opens. Stored per user as ``unlock_method``.
+#:
+#: ``swipe`` is NO credential at all: whoever holds the device opens taOS. It is
+#: honoured only on the console of a single-user install (see
+#: ``routes.auth.swipe_unlock``), and choosing it costs the account password.
+UNLOCK_METHODS: tuple[str, ...] = ("swipe", "pin", "password")
+
+#: Shown in Settings but not implemented. Refused by the API until they are, so
+#: a stored value can never name a method no route knows how to honour.
+UNLOCK_METHODS_PLANNED: tuple[str, ...] = ("pattern",)
+
+
+def effective_unlock_method(record: Mapping[str, Any] | None) -> str:
+    """The unlock method that actually applies to *record*, never a wish.
+
+    An unset or unknown stored value falls back to the pre-existing behaviour:
+    ``pin`` when the user has a PIN, otherwise ``password``. A stored ``pin``
+    with no PIN behind it (the PIN was turned off afterwards) also degrades to
+    ``password`` rather than rendering a keypad nothing can satisfy.
+
+    Only ever degrades toward a STRONGER method: nothing here can turn a
+    missing or malformed value into ``swipe``.
+    """
+    if not record:
+        return "password"
+    has_pin = bool(record.get("pin_hash"))
+    method = record.get("unlock_method")
+    if method not in UNLOCK_METHODS:
+        method = "pin" if has_pin else "password"
+    if method == "pin" and not has_pin:
+        method = "password"
+    return method
+
+
+def _is_loopback(host: str) -> bool:
+    """True when *host* is a loopback literal (127.0.0.0/8, ::1, mapped v4)."""
+    if not host:
+        return False
+    candidate = host.strip()
+    # Strip an IPv6 zone id ("fe80::1%eth0") and brackets ("[::1]").
+    if candidate.startswith("[") and candidate.endswith("]"):
+        candidate = candidate[1:-1]
+    candidate = candidate.split("%", 1)[0]
+    if candidate == "localhost":
+        return True
+    try:
+        addr = ipaddress.ip_address(candidate)
+    except ValueError:
+        return False
+    # ::ffff:127.0.0.1 is a v4-mapped loopback and is_loopback is False for it,
+    # so unwrap the mapping before asking.
+    mapped = getattr(addr, "ipv4_mapped", None)
+    if mapped is not None:
+        addr = mapped
+    return addr.is_loopback
+
+
+def is_console_origin(client_host: str | None, headers: Mapping[str, str] | None = None) -> bool:
+    """True only when this request came from the device's OWN screen.
+
+    This is the single control that makes PIN sign-in safe, so it is written to
+    fail closed and is deliberately dumber than it could be.
+
+    A PIN is 4-12 digits. That is fine against someone standing at the pi-top
+    and hopeless against anything that can send requests over a network, which
+    is why a PIN is accepted from the local console and nowhere else. The kiosk
+    is a browser running ON the device talking to ``localhost:6969``, so
+    "console" and "loopback" coincide today.
+
+    **They stop coinciding the moment taOS sits behind a reverse proxy.** Every
+    LAN request then arrives at the app from 127.0.0.1 with the real client
+    buried in ``X-Forwarded-For``, and a loopback-only test would silently start
+    accepting PINs from the entire network — turning a device-bound credential
+    into a 4-digit password for every machine in the house, with no code change
+    and nothing in the UI to show it happened.
+
+    So the PRESENCE of any forwarding header disqualifies the request outright.
+    We do not parse them and we do not consult a trusted-proxy list: a header we
+    cannot authenticate is not evidence, and treating an unverified header as
+    proof of locality is the whole failure mode. A proxied deployment simply
+    does not offer PIN sign-in, which is the correct answer for it.
+
+    Note this refuses in the safe direction only. Being wrong here costs a user
+    the keypad and sends them to the password; the opposite error would hand a
+    remote attacker a 10,000-guess credential.
+    """
+    if not _is_loopback(client_host or ""):
+        return False
+    if headers:
+        for name in _FORWARDING_HEADERS:
+            if headers.get(name):
+                return False
+    return True
+
+
+class _PinAttemptLimiter:
+    """Escalating, self-healing throttle for PIN attempts.
+
+    The delay grows with consecutive failures and then simply expires. There is
+    deliberately NO terminal "PIN disabled, go use your password" state: the
+    device this protects is a keyboard-less touchscreen, so a lockout that can
+    only be cleared from another machine would re-create the exact hard lockout
+    PIN sign-in was added to fix. Brute force is defeated on the clock instead —
+    at the top tier an attacker gets four guesses an hour against a space of at
+    least ten thousand — while the legitimate user always gets back in from the
+    screen in front of them by waiting.
+
+    Keyed by user id rather than by client address on purpose: every console
+    request shares the single loopback address, so an address key would be the
+    same bucket for everyone and would also let PIN failures interfere with the
+    password limiter.
+    """
+
+    #: ``(failures_at_or_above, delay_seconds)``, highest tier last.
+    _TIERS = ((15, 900), (10, 300), (5, 30))
+
+    #: Upper bound on tracked keys. ``routes.auth`` falls back to the key
+    #: ``f"unknown:{username}"`` when no user resolves, so a caller cycling
+    #: usernames would otherwise grow this map for the life of the process.
+    #: A kiosk runs for weeks, so "small and bounded" beats "usually small".
+    _MAX_KEYS = 1024
+
+    def __init__(self) -> None:
+        # Ordered so the bound can evict the least-recently-failed key.
+        self._state: OrderedDict[str, tuple[int, float]] = OrderedDict()
+        self._lock = threading.Lock()
+
+    @classmethod
+    def _delay_for(cls, failures: int) -> int:
+        for threshold, delay in cls._TIERS:
+            if failures >= threshold:
+                return delay
+        return 0
+
+    def retry_after(self, key: str, now: float | None = None) -> int:
+        """Seconds the caller must wait before another attempt is accepted."""
+        now = time.time() if now is None else now
+        with self._lock:
+            failures, last_failure = self._state.get(key, (0, 0.0))
+        remaining = self._delay_for(failures) - (now - last_failure)
+        return int(remaining) + 1 if remaining > 0 else 0
+
+    def record_failure(self, key: str, now: float | None = None) -> None:
+        now = time.time() if now is None else now
+        with self._lock:
+            failures, _ = self._state.get(key, (0, 0.0))
+            self._state[key] = (failures + 1, now)
+            self._state.move_to_end(key)
+            # Bound memory, but evict the LEAST-PENALISED key -- fewest
+            # failures, oldest first to break ties -- never simply the oldest.
+            # Plain LRU looked right and was wrong: an attacker who floods
+            # _MAX_KEYS distinct usernames pushes the genuinely-throttled key
+            # out and RESETS it, which is exactly the escalation this class
+            # exists to enforce. Keeping the most-penalised entries means a
+            # flood evicts the attacker's own one-failure keys instead. A test
+            # in tests/test_auth_pin.py holds this direction.
+            #
+            # We also do NOT drop entries whose delay has merely elapsed: the
+            # failure COUNT is what escalates, so expiring it would hand out a
+            # free reset (wait out the top tier, get five fast guesses again).
+            # The delay expiring is the intended self-healing; the count is
+            # deliberately sticky.
+            while len(self._state) > self._MAX_KEYS:
+                victim = min(
+                    self._state,
+                    key=lambda k: (self._state[k][0], self._state[k][1]),
+                )
+                del self._state[victim]
+
+    def reset(self, key: str) -> None:
+        with self._lock:
+            self._state.pop(key, None)
+
+
 class AuthManager:
     """Multi-user auth manager.
 
@@ -175,38 +455,128 @@ class AuthManager:
         self._user_file = data_dir / ".auth_user.json"
         self._sessions_file = data_dir / ".auth_sessions"
         self._sessions = _PersistentSessions(self._sessions_file)
+        # Serialises read-modify-write cycles on the account store; see
+        # _serialized. Re-entrant so nested mutators do not self-deadlock.
+        self._users_lock = threading.RLock()
         self.session_ttl = 86400 * 7  # 7 days, default
         self.long_session_ttl = 86400 * 30  # 30 days for "stay signed in"
+        # Live sessions kept per user; minting past it evicts that user's
+        # oldest. Bounds the store when a client logs in per invocation
+        # instead of reusing its session (tsk-wmclfd: 37,521 for one user).
+        self.max_sessions_per_user = 50
+        self._prune_sessions_on_startup()
+
+    def _prune_sessions_on_startup(self) -> None:
+        """Prune expired sessions at startup AND persist the shrunk file.
+
+        _load() prunes in memory on every read and _save() prunes on every
+        write, so correctness never depends on this -- but without a write-back
+        here, a grown sessions file only shrinks on the next session mint.
+        Load (which prunes) then save once, so startup leaves the file small."""
+        if not self._sessions_file.exists():
+            return
+        try:
+            before = len(json.loads(self._sessions_file.read_text()))
+        except (json.JSONDecodeError, OSError):
+            return
+        data = self._sessions._load()
+        self._sessions._save(data)
+        removed = before - len(data)
+        if removed:
+            logger.info(
+                "Pruned %s expired auth sessions at startup (%s -> %s live)",
+                removed, before, len(data),
+            )
+        if len(data) > 50000:
+            logger.warning(
+                "Auth sessions count %s after pruning is still excessive; "
+                "sessions are being minted faster than they expire", len(data),
+            )
 
     # ------------------------------------------------------------------ #
     #  Profile storage helpers                                             #
     # ------------------------------------------------------------------ #
 
     def _read_users(self) -> dict:
+        """Return the account store, or raise if it is present but unreadable.
+
+        Only a *missing* file yields the empty store — see
+        :class:`AuthStoreCorruptError` for why an unparseable one must not.
+        """
         if self._user_file.exists():
             try:
-                return json.loads(self._user_file.read_text())
-            except (json.JSONDecodeError, OSError):
-                return {"users": [], "current_user_id": None}
+                raw = self._user_file.read_text()
+            except OSError as exc:
+                raise AuthStoreCorruptError(
+                    f"cannot read account store {self._user_file}: {exc}"
+                ) from exc
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                raise AuthStoreCorruptError(
+                    f"account store {self._user_file} is not valid JSON "
+                    f"({len(raw)} bytes): {exc}"
+                ) from exc
+            if not isinstance(data, dict):
+                raise AuthStoreCorruptError(
+                    f"account store {self._user_file} is a "
+                    f"{type(data).__name__}, expected an object"
+                )
+            # Every store this code has ever written carries a list-valued
+            # "users". Anything else -- {}, {"users": null} -- parses as JSON
+            # but would read as "no accounts", which is the exact conclusion
+            # this class exists to prevent.
+            if not isinstance(data.get("users"), list):
+                raise AuthStoreCorruptError(
+                    f"account store {self._user_file} has no 'users' list "
+                    f"(found {type(data.get('users')).__name__})"
+                )
+            return data
         return {"users": [], "current_user_id": None}
 
     def _write_users(self, data: dict) -> None:
-        self._user_file.parent.mkdir(parents=True, exist_ok=True)
-        self._user_file.write_text(json.dumps(data, indent=2))
+        atomic_write_text(
+            self._user_file, json.dumps(data, indent=2), mode=0o600,
+        )
 
     # ------------------------------------------------------------------ #
     #  Predicates                                                          #
     # ------------------------------------------------------------------ #
 
     def is_configured(self) -> bool:
-        return bool(self._read_users().get("users")) or self._password_file.exists()
+        """True when this install already has an account.
+
+        This is the single gate every onboarding path consults, so a store we
+        cannot parse must answer True: the accounts exist, we just cannot read
+        them.  Answering False would offer the create-your-account form to
+        whoever asked.
+        """
+        try:
+            users = self._read_users().get("users")
+        except AuthStoreCorruptError:
+            logger.error(
+                "Account store %s is unreadable; refusing to report this "
+                "install as unconfigured. Recover it with "
+                "'taos recover-password' or restore the file from a backup.",
+                self._user_file,
+            )
+            return True
+        return bool(users) or self._password_file.exists()
 
     def needs_onboarding(self) -> bool:
         return not self.is_configured()
 
     def is_multi_user(self) -> bool:
-        """True when two or more fully-registered users exist."""
-        users = self._read_users().get("users", [])
+        """True when two or more fully-registered users exist.
+
+        A display hint (which login form to render), so an unreadable store
+        degrades to the single-user answer rather than raising — the gate
+        that matters, :meth:`is_configured`, already failed closed.
+        """
+        try:
+            users = self._read_users().get("users", [])
+        except AuthStoreCorruptError:
+            return False
         active = [u for u in users if "password_hash" in u]
         return len(active) >= 2
 
@@ -237,6 +607,10 @@ class AuthManager:
             "last_login_at": record.get("last_login_at"),
             "created_at": record.get("created_at"),
             "capabilities": caps,
+            # Whether a PIN exists, never the PIN or its hash. Settings needs
+            # this to show which sign-in methods are active; this dict is a
+            # whitelist, so `pin_hash` cannot escape through it by accident.
+            "has_pin": bool(record.get("pin_hash")),
         }
 
     # ------------------------------------------------------------------ #
@@ -278,14 +652,14 @@ class AuthManager:
                 return u
         return None
 
-    def get_user(self, token: str | None = None) -> dict | None:
+    def get_user(self, token: str | None = None, user_agent: str | None = None) -> dict | None:
         """Return public profile.
 
         When *token* is given, return the user who owns that session.
         Otherwise fall back to the first user (back-compat).
         """
         if token:
-            user_id = self.validate_session(token)
+            user_id = self.validate_session(token, user_agent=user_agent)
             if user_id:
                 record = self._find_user_by_id(user_id)
                 if record:
@@ -312,6 +686,7 @@ class AuthManager:
     #  First-user setup (admin path)                                       #
     # ------------------------------------------------------------------ #
 
+    @_serialized
     def setup_user(self, username: str, full_name: str, email: str, password: str) -> dict:
         users = self._read_users()
         if users.get("users"):
@@ -339,6 +714,7 @@ class AuthManager:
     #  Invite lifecycle                                                    #
     # ------------------------------------------------------------------ #
 
+    @_serialized
     def add_user_invite(self, username: str, invited_by_username: str) -> str:
         """Create a pending user and return a high-entropy invite code."""
         if not username:
@@ -360,6 +736,7 @@ class AuthManager:
         self._write_users(data)
         return code
 
+    @_serialized
     def complete_invite(
         self,
         username: str,
@@ -394,6 +771,7 @@ class AuthManager:
         self._write_users(data)
         return self._public_user(record)
 
+    @_serialized
     def admin_reset_password(self, username: str, by_admin_username: str) -> str:
         """Re-issue an invite code, marking the user pending again."""
         caller = self.find_user(by_admin_username)
@@ -426,9 +804,11 @@ class AuthManager:
 
     def set_password(self, password: str) -> None:
         """Legacy code path — keeps existing tests + the simple-setup endpoint working."""
-        self._password_file.parent.mkdir(parents=True, exist_ok=True)
-        self._password_file.write_text(hash_password(password))
+        atomic_write_text(
+            self._password_file, hash_password(password), mode=0o600,
+        )
 
+    @_serialized
     def recover_password(self, new_password: str, username: str | None = None) -> str:
         """Offline recovery: force-set an account's password without the old one.
 
@@ -472,6 +852,127 @@ class AuthManager:
         # No user records: legacy single-password store.
         self.set_password(new_password)
         return "(legacy)"
+
+    # ------------------------------------------------------------------ #
+    #  PIN ops (console-only credential — see is_console_origin)           #
+    # ------------------------------------------------------------------ #
+
+    def has_pin(self, username: str | None = None) -> bool:
+        """True when the named user (or the sole user) has a PIN configured."""
+        return self._pin_user(username) is not None
+
+    def _pin_user(self, username: str | None) -> dict | None:
+        """The user record a PIN attempt should be checked against, or None.
+
+        Mirrors ``check_password``'s resolution so the two factors always agree
+        on which account is being addressed, but only ever returns a record that
+        actually carries a ``pin_hash``.
+        """
+        users = self._read_users().get("users", [])
+        if username:
+            users = [u for u in users if u.get("username") == username]
+        elif len(users) != 1:
+            # Multi-user install with no username supplied: refuse to guess.
+            # Picking "the first user" here would let a PIN set on one account
+            # unlock whichever record happened to be stored first.
+            return None
+        for u in users:
+            if u.get("pin_hash"):
+                return u
+        return None
+
+    @_serialized
+    def set_pin(self, username: str, pin: str) -> None:
+        """Set (or replace) *username*'s PIN.
+
+        The caller is responsible for having already proven the user's identity
+        with their existing credential — this method does not re-check it, in
+        the same way ``recover_password`` does not.
+        """
+        validate_pin(pin)
+        data = self._read_users()
+        for i, u in enumerate(data.get("users", [])):
+            if u.get("username") == username:
+                data["users"][i]["pin_hash"] = hash_password(pin)
+                self._write_users(data)
+                return
+        raise ValueError(f"user '{username}' not found")
+
+    @_serialized
+    def clear_pin(self, username: str) -> bool:
+        """Remove *username*'s PIN. Returns True if one was actually removed."""
+        data = self._read_users()
+        for i, u in enumerate(data.get("users", [])):
+            if u.get("username") == username:
+                removed = data["users"][i].pop("pin_hash", None) is not None
+                if removed:
+                    self._write_users(data)
+                return removed
+        raise ValueError(f"user '{username}' not found")
+
+    def check_pin(self, pin: str, username: str | None = None) -> tuple[bool, dict | None]:
+        """Verify a PIN against the stored hash. Returns ``(ok, user_record)``.
+
+        This performs NO origin check of its own. Callers MUST gate it behind
+        :func:`is_console_origin` — the route layer owns that decision because
+        only it can see the request. Keeping the two apart makes the origin rule
+        testable on its own and keeps this method honest about what it proves,
+        which is solely "this PIN matches this account".
+        """
+        record = self._pin_user(username)
+        if record is None:
+            return (False, None)
+        if not verify_password(pin, record.get("pin_hash", "")):
+            return (False, None)
+        return (True, record)
+
+    # ------------------------------------------------------------------ #
+    #  Lock-screen unlock method (console-only; see effective_unlock_method) #
+    # ------------------------------------------------------------------ #
+
+    def lock_screen_user(self) -> dict | None:
+        """The one account the console lock screen belongs to, or None.
+
+        Exactly one record in the store, and it is a full account (has a
+        password). Anything else -- no users, two users, a pending invite beside
+        the owner -- is not single-user, and the lock screen must not guess
+        whose device this is. Fails closed on an unreadable store.
+        """
+        try:
+            users = self._read_users().get("users", [])
+        except AuthStoreCorruptError:
+            return None
+        if len(users) != 1:
+            return None
+        record = users[0]
+        if not isinstance(record, dict) or "password_hash" not in record:
+            return None
+        return record
+
+    def unlock_method(self, username: str) -> str:
+        """*username*'s effective unlock method."""
+        return effective_unlock_method(self.find_user(username))
+
+    @_serialized
+    def set_unlock_method(self, username: str, method: str) -> None:
+        """Store *username*'s unlock method.
+
+        The caller must already have re-verified the account password; like
+        ``set_pin`` this does not re-check it. Only implemented methods are
+        accepted, and ``pin`` only once a PIN exists -- a stored ``pin`` with no
+        PIN would silently mean ``password``, which is not what was asked for.
+        """
+        if method not in UNLOCK_METHODS:
+            raise ValueError(f"unknown unlock method '{method}'")
+        data = self._read_users()
+        for i, u in enumerate(data.get("users", [])):
+            if u.get("username") == username:
+                if method == "pin" and not u.get("pin_hash"):
+                    raise ValueError("set a PIN first")
+                data["users"][i]["unlock_method"] = method
+                self._write_users(data)
+                return
+        raise ValueError(f"user '{username}' not found")
 
     def check_password(self, password: str, username: str | None = None) -> tuple[bool, dict | None]:
         """Verify credentials.
@@ -541,8 +1042,9 @@ class AuthManager:
             return (True, None)
         return (False, None)
 
+    @_serialized
     def change_password(self, username: str, current_password: str, new_password: str) -> bool:
-        """Self-change, requires current password."""
+        """Self-change, requires current password. Revokes all other sessions."""
         if not new_password or len(new_password) < 8:
             return False
         data = self._read_users()
@@ -555,9 +1057,11 @@ class AuthManager:
                 users[i] = u
                 data["users"] = users
                 self._write_users(data)
+                self.revoke_user_sessions(u.get("id", ""))
                 return True
         return False
 
+    @_serialized
     def update_profile(self, username: str, full_name: str | None, email: str | None) -> dict:
         """Update own profile fields."""
         data = self._read_users()
@@ -574,6 +1078,7 @@ class AuthManager:
                 return self._public_user(u)
         raise ValueError(f"user '{username}' not found")
 
+    @_serialized
     def delete_user(self, username: str, by_admin_username: str) -> None:
         """Remove a user. Admin only, can't delete self, can't delete last admin."""
         caller = self.find_user(by_admin_username)
@@ -614,7 +1119,7 @@ class AuthManager:
         }
         if user_agent:
             entry["user_agent_hash"] = hashlib.sha256(user_agent.encode()).hexdigest()
-        self._sessions[token] = entry
+        self._sessions.set_capped(token, entry, self.max_sessions_per_user)
         return token
 
     def session_ttl_for(self, long_lived: bool = False) -> int:
@@ -647,9 +1152,14 @@ class AuthManager:
                 pass
             return None
         # Client-binding check: only when the session was created with a
-        # user_agent_hash AND the caller supplies a user_agent for comparison.
+        # user_agent_hash.  When the header is omitted the caller cannot prove
+        # it is the same browser that created the session, so a stored hash
+        # MUST reject -- a missing User-Agent with a stored hash is a mismatch,
+        # not a free pass.
         stored_ua = entry.get("user_agent_hash")
-        if stored_ua and user_agent:
+        if stored_ua:
+            if not user_agent:
+                return None
             if not secrets.compare_digest(
                 stored_ua, hashlib.sha256(user_agent.encode()).hexdigest()
             ):
@@ -673,9 +1183,9 @@ class AuthManager:
             self._sessions.pop(token, None)
         return len(to_revoke)
 
-    def session_user(self, token: str) -> dict | None:
+    def session_user(self, token: str, user_agent: str | None = None) -> dict | None:
         """Return public profile of the user owning this session."""
-        user_id = self.validate_session(token)
+        user_id = self.validate_session(token, user_agent=user_agent)
         if user_id is None:
             return None
         if user_id:
@@ -684,6 +1194,22 @@ class AuthManager:
                 return self._public_user(record)
         # Legacy or no user_id — return first user
         return self.get_user()
+
+    def session_user_for_request(self, request: Request) -> dict | None:
+        """Return public profile of the user owning this session, reading user-agent from request."""
+        user_agent = request.headers.get("user-agent", "")
+        token = request.cookies.get("taos_session", "")
+        if not token:
+            return None
+        return self.session_user(token, user_agent=user_agent)
+
+    def validate_session_for_request(self, request: Request) -> str | None:
+        """Return user_id if the session is valid, reading user-agent from request."""
+        user_agent = request.headers.get("user-agent", "")
+        token = request.cookies.get("taos_session", "")
+        if not token:
+            return None
+        return self.validate_session(token, user_agent=user_agent)
 
     def cleanup_sessions(self) -> None:
         now = time.time()
@@ -714,25 +1240,146 @@ class AuthManager:
         if path.exists():
             return path.read_text().strip()
         token = secrets.token_urlsafe(32)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(token)
-        os.chmod(path, 0o600)
+        atomic_write_text(path, token, mode=0o600)
         logger.info("local auth token written to %s", path)
         return token
 
     def validate_local_token(self, presented: str) -> bool:
-        """Return True if *presented* matches the on-disk local token.
+        """Return True if *presented* matches the on-disk local token or any
+        bound agent token.
 
         Always re-reads the file so rotating the file takes effect on the
         next request. Uses ``secrets.compare_digest`` to avoid timing leaks.
+        Bound agent tokens are accepted too: each per-agent token is minted at
+        deploy time and its hash is stored in the bindings file.
         """
         if not presented:
             return False
         path = self.local_token_path()
-        if not path.exists():
+        if path.exists():
+            stored = path.read_text().strip()
+            if secrets.compare_digest(presented, stored):
+                return True
+        bindings_path = self._local_token_agent_path()
+        if not bindings_path.exists():
             return False
-        stored = path.read_text().strip()
-        return secrets.compare_digest(presented, stored)
+        try:
+            data = json.loads(bindings_path.read_text())
+        except (json.JSONDecodeError, OSError):
+            return False
+        if not isinstance(data, dict):
+            return False
+        presented_hash = hashlib.sha256(presented.encode()).hexdigest()
+        for stored_hash in data:
+            if secrets.compare_digest(presented_hash, stored_hash):
+                return True
+        return False
+
+    def mint_agent_local_token(self, agent_name: str) -> str:
+        """Mint a distinct local token for *agent_name* and bind it.
+
+        Returns the new token. The caller is responsible for delivering it to
+        the agent (e.g. via ``TAOS_LOCAL_TOKEN`` env var at deploy time).
+        """
+        token = secrets.token_urlsafe(32)
+        self.bind_local_token_agent(token, agent_name)
+        return token
+
+    def _local_token_agent_path(self) -> Path:
+        return self.data_dir / ".auth_local_token_bindings.json"
+
+    def _local_token_agent_lock_path(self) -> Path:
+        return self._local_token_agent_path().with_name(
+            self._local_token_agent_path().name + ".lock"
+        )
+
+    def bind_local_token_agent(self, token: str, agent_name: str) -> None:
+        """Record that *token* is bound to *agent_name* for skill-exec identity.
+
+        The bindings file maps ``sha256(token) -> agent_name`` so the raw token
+        is never written to disk a second time. A process-shared file lock
+        serialises the read-modify-write cycle so concurrent deploys cannot
+        lose one another's binding. The bindings file must be readable and
+        a valid JSON object; a corrupt or mis-shaped file raises rather than
+        being silently replaced. Any previous binding for the same agent is
+        removed first so an agent has at most one live token.
+        """
+        path = self._local_token_agent_path()
+        lock_path = self._local_token_agent_lock_path()
+        token_hash = hashlib.sha256(token.encode()).hexdigest()
+        lock = FileLock(str(lock_path), timeout=10)
+        with lock:
+            if path.exists():
+                try:
+                    raw = path.read_text()
+                except OSError as exc:
+                    raise AuthStoreCorruptError(
+                        f"cannot read bindings file {path}: {exc}"
+                    ) from exc
+                try:
+                    data = json.loads(raw)
+                except json.JSONDecodeError as exc:
+                    raise AuthStoreCorruptError(
+                        f"bindings file {path} is not valid JSON: {exc}"
+                    ) from exc
+                if not isinstance(data, dict):
+                    raise AuthStoreCorruptError(
+                        f"bindings file {path} is a "
+                        f"{type(data).__name__}, expected an object"
+                    )
+            else:
+                data = {}
+            for existing_hash in [k for k, v in data.items() if v == agent_name]:
+                del data[existing_hash]
+            data[token_hash] = agent_name
+            atomic_write_text(path, json.dumps(data), mode=0o600)
+
+    def unbind_local_token_agent(self, agent_name: str) -> int:
+        """Remove every entry bound to *agent_name*. Returns the count removed."""
+        path = self._local_token_agent_path()
+        lock_path = self._local_token_agent_lock_path()
+        lock = FileLock(str(lock_path), timeout=10)
+        with lock:
+            if not path.exists():
+                return 0
+            try:
+                raw = path.read_text()
+            except OSError as exc:
+                raise AuthStoreCorruptError(
+                    f"cannot read bindings file {path}: {exc}"
+                ) from exc
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                raise AuthStoreCorruptError(
+                    f"bindings file {path} is not valid JSON: {exc}"
+                ) from exc
+            if not isinstance(data, dict):
+                raise AuthStoreCorruptError(
+                    f"bindings file {path} is a "
+                    f"{type(data).__name__}, expected an object"
+                )
+            keys_to_remove = [k for k, v in data.items() if v == agent_name]
+            for k in keys_to_remove:
+                del data[k]
+            atomic_write_text(path, json.dumps(data), mode=0o600)
+            return len(keys_to_remove)
+
+    def get_local_token_agent(self, presented: str) -> str | None:
+        """Return the agent name bound to this local token, or ``None``."""
+        if not presented:
+            return None
+        path = self._local_token_agent_path()
+        if not path.exists():
+            return None
+        try:
+            data = json.loads(path.read_text())
+        except (json.JSONDecodeError, OSError):
+            return None
+        if not isinstance(data, dict):
+            return None
+        token_hash = hashlib.sha256(presented.encode()).hexdigest()
+        return data.get(token_hash)
 
     def update_last_login(self, user_id: str) -> None:
         data = self._read_users()
@@ -761,10 +1408,7 @@ def get_current_user(request: Request) -> dict[str, Any]:
     user dict needed for capability checks.
     """
     auth_mgr = request.app.state.auth
-    token = request.cookies.get("taos_session", "")
-    if not token:
-        raise HTTPException(status_code=401, detail="Authentication required")
-    user = auth_mgr.session_user(token)
+    user = auth_mgr.session_user_for_request(request)
     if user is None:
         raise HTTPException(status_code=401, detail="Authentication required")
     return user

@@ -5,8 +5,8 @@ import logging
 import sqlite3
 import time
 
-from tinyagentos.base_store import BaseStore
-from tinyagentos.projects.ids import new_id
+from tinyagentos.projects.ids import friendly_project_id, new_id
+from tinyagentos.projects.tx import ProjectsDBStore
 
 logger = logging.getLogger(__name__)
 
@@ -78,7 +78,7 @@ def _row_to_project(row, description) -> dict:
     return p
 
 
-class ProjectStore(BaseStore):
+class ProjectStore(ProjectsDBStore):
     SCHEMA = PROJECTS_SCHEMA
 
     async def _post_init(self) -> None:
@@ -90,8 +90,10 @@ class ProjectStore(BaseStore):
             "ALTER TABLE projects ADD COLUMN lead_member_id TEXT",
         ):
             try:
+                # DDL runs outside tx(): the connection is in autocommit mode,
+                # so each ALTER commits on its own and the expected
+                # duplicate-column error has no transaction left to leak.
                 await self._db.execute(col_def)
-                await self._db.commit()
             except Exception:
                 # Column already exists on fresh installs (created by SCHEMA).
                 pass
@@ -106,27 +108,27 @@ class ProjectStore(BaseStore):
         rows = await (await self._db.execute(
             "SELECT id FROM projects WHERE lead_member_id IS NULL"
         )).fetchall()
-        for (pid,) in rows:
-            cur = await self._db.execute(
-                "SELECT member_id FROM project_members WHERE project_id = ? AND is_lead = 1",
-                (pid,),
-            )
-            flagged = [r[0] for r in await cur.fetchall()]
-            if len(flagged) == 1:
-                await self._db.execute(
-                    "UPDATE projects SET lead_member_id = ? WHERE id = ?",
-                    (flagged[0], pid),
+        async with self._tx():
+            for (pid,) in rows:
+                cur = await self._db.execute(
+                    "SELECT member_id FROM project_members WHERE project_id = ? AND is_lead = 1",
+                    (pid,),
                 )
-            # Clear the legacy per-member is_lead flag so this backfill runs
-            # once — for 0, 1, or many flagged members alike. The epic removed
-            # the only writer of is_lead, so without this a lead the owner
-            # deliberately cleared (lead_member_id set NULL) would be
-            # re-promoted from the stale flag on restart.
-            await self._db.execute(
-                "UPDATE project_members SET is_lead = 0 WHERE project_id = ?",
-                (pid,),
-            )
-        await self._db.commit()
+                flagged = [r[0] for r in await cur.fetchall()]
+                if len(flagged) == 1:
+                    await self._db.execute(
+                        "UPDATE projects SET lead_member_id = ? WHERE id = ?",
+                        (flagged[0], pid),
+                    )
+                # Clear the legacy per-member is_lead flag so this backfill runs
+                # once — for 0, 1, or many flagged members alike. The epic removed
+                # the only writer of is_lead, so without this a lead the owner
+                # deliberately cleared (lead_member_id set NULL) would be
+                # re-promoted from the stale flag on restart.
+                await self._db.execute(
+                    "UPDATE project_members SET is_lead = 0 WHERE project_id = ?",
+                    (pid,),
+                )
 
     async def set_lead(self, project_id: str, member_id: "str | None") -> None:
         """Set (or clear, when member_id is None) the project's exclusive lead.
@@ -136,18 +138,78 @@ class ProjectStore(BaseStore):
         there is no partial-update window. A member_id that is not a current
         member of the project raises KeyError (the route maps it to 404).
         """
-        p = await self.get_project(project_id)
-        if p is None:
-            raise KeyError(f"project {project_id!r} not found")
-        if member_id is not None:
-            member = await self.get_member(project_id, member_id)
-            if member is None:
-                raise KeyError(f"member {member_id!r} not in project {project_id!r}")
-        await self._db.execute(
-            "UPDATE projects SET lead_member_id = ? WHERE id = ?",
-            (member_id, project_id),
-        )
-        await self._db.commit()
+        # Both checks read INSIDE the transaction: BEGIN IMMEDIATE holds the
+        # write lock, so a concurrent remove_member cannot delete the member
+        # between the check and the pointer write and leave lead_member_id
+        # dangling.
+        async with self._tx():
+            p = await self.get_project(project_id)
+            if p is None:
+                raise KeyError(f"project {project_id!r} not found")
+            if member_id is not None:
+                member = await self.get_member(project_id, member_id)
+                if member is None:
+                    raise KeyError(
+                        f"member {member_id!r} not in project {project_id!r}"
+                    )
+            await self._db.execute(
+                "UPDATE projects SET lead_member_id = ? WHERE id = ?",
+                (member_id, project_id),
+            )
+            if member_id is not None:
+                # Promote the new lead in its member row.
+                await self._db.execute(
+                    "UPDATE project_members SET is_lead = 1, role = 'lead' "
+                    "WHERE project_id = ? AND member_id = ?",
+                    (project_id, member_id),
+                )
+                # Demote any previous lead so the flag stays exclusive.
+                await self._db.execute(
+                    "UPDATE project_members SET is_lead = 0, role = 'member' "
+                    "WHERE project_id = ? AND member_id != ? AND is_lead = 1",
+                    (project_id, member_id),
+                )
+            else:
+                # Clearing lead — unset the flag everywhere on this project.
+                await self._db.execute(
+                    "UPDATE project_members SET is_lead = 0, role = 'member' "
+                    "WHERE project_id = ? AND is_lead = 1",
+                    (project_id,),
+                )
+
+    async def create_project_with_lead(
+        self,
+        name: str,
+        slug: str,
+        created_by: str,
+        member_id: str,
+        description: str = "",
+        settings: dict | None = None,
+        user_id: str = "",
+    ) -> dict:
+        """Create a project and add the lead member atomically.
+
+        Wraps ``create_project``, ``add_member`` and ``set_lead`` in a single
+        transaction so a failure after project creation never leaves an orphan
+        project with no lead.
+        """
+        async with self._tx():
+            project = await self.create_project(
+                name=name,
+                slug=slug,
+                created_by=created_by,
+                description=description,
+                settings=settings,
+                user_id=user_id,
+            )
+            await self.add_member(
+                project_id=project["id"],
+                member_id=member_id,
+                member_kind="native",
+                role="lead",
+            )
+            await self.set_lead(project["id"], member_id)
+            return project
 
     async def create_project(
         self,
@@ -158,32 +220,38 @@ class ProjectStore(BaseStore):
         settings: dict | None = None,
         user_id: str = "",
     ) -> dict:
-        pid = new_id("prj")
         now = time.time()
-        # Enforce case-insensitive name uniqueness via a query check (not a
-        # schema constraint) so existing duplicate names are not destructively
-        # rejected on upgrade. A UNIQUE(slug) constraint remains as the
-        # backstop for slug collisions caught via IntegrityError below.
-        if await self.get_project_by_name(name) is not None:
-            raise ProjectConflict("name", name)
         try:
-            await self._db.execute(
-                """INSERT INTO projects
-                   (id, name, slug, description, status, created_by, user_id, created_at, updated_at, settings)
-                   VALUES (?, ?, ?, ?, 'active', ?, ?, ?, ?, ?)""",
-                (pid, name, slug, description, created_by, user_id, now, now, json.dumps(settings or {})),
-            )
-            await self._db.commit()
+            async with self._tx():
+                # Enforce case-insensitive name uniqueness via a query check
+                # (not a schema constraint) so existing duplicate names are not
+                # destructively rejected on upgrade. A UNIQUE(slug) constraint
+                # remains as the backstop for slug collisions caught via
+                # IntegrityError below. The check reads INSIDE the transaction:
+                # there is no unique index on name, so outside it two concurrent
+                # creates would both pass and both insert.
+                if await self.get_project_by_name(name) is not None:
+                    raise ProjectConflict("name", name)
+                pid = await self._insert_with_retry(
+                    """INSERT INTO projects
+                       (id, name, slug, description, status, created_by, user_id, created_at, updated_at, settings)
+                       VALUES (?, ?, ?, ?, 'active', ?, ?, ?, ?, ?)""",
+                    (friendly_project_id(slug), name, slug, description, created_by, user_id, now, now, json.dumps(settings or {})),
+                    id_index=0,
+                    new_id_fn=lambda: new_id("prj"),
+                )
         except sqlite3.IntegrityError as exc:
             # UNIQUE(slug) is the only schema-level uniqueness a caller can
-            # trigger here; the name check above guards name collisions.
+            # trigger here; the name check above guards name collisions. tx()
+            # has already rolled the failed INSERT back, so the connection is
+            # not left holding the write lock for the other seven stores.
             if "slug" in str(exc).lower():
                 raise ProjectConflict("slug", slug) from exc
             raise
         return await self.get_project(pid)
 
     async def get_project(self, project_id: str) -> dict | None:
-        async with self._db.execute(
+        async with self._read(
             "SELECT * FROM projects WHERE id = ?", (project_id,)
         ) as cur:
             row = await cur.fetchone()
@@ -192,7 +260,7 @@ class ProjectStore(BaseStore):
             return _row_to_project(row, cur.description)
 
     async def get_project_by_slug(self, slug: str) -> dict | None:
-        async with self._db.execute(
+        async with self._read(
             "SELECT * FROM projects WHERE slug = ?", (slug,)
         ) as cur:
             row = await cur.fetchone()
@@ -201,7 +269,7 @@ class ProjectStore(BaseStore):
             return _row_to_project(row, cur.description)
 
     async def get_project_by_name(self, name: str) -> dict | None:
-        async with self._db.execute(
+        async with self._read(
             "SELECT * FROM projects WHERE LOWER(name) = LOWER(?)", (name,)
         ) as cur:
             row = await cur.fetchone()
@@ -217,7 +285,7 @@ class ProjectStore(BaseStore):
         else:
             sql = "SELECT * FROM projects WHERE status = ? ORDER BY created_at DESC"
             params = (status,)
-        async with self._db.execute(sql, params) as cur:
+        async with self._read(sql, params) as cur:
             rows = await cur.fetchall()
             desc = cur.description
         return [_row_to_project(r, desc) for r in rows]
@@ -237,7 +305,28 @@ class ProjectStore(BaseStore):
         else:
             sql = "SELECT * FROM projects WHERE user_id = ? AND status = ? ORDER BY created_at DESC"
             params = (user_id, status)
-        async with self._db.execute(sql, params) as cur:
+        async with self._read(sql, params) as cur:
+            rows = await cur.fetchall()
+            desc = cur.description
+        return [_row_to_project(r, desc) for r in rows]
+
+    async def list_writable_for_user(self, user_id: str, status: str | None = "active") -> list[dict]:
+        """List projects the user can write to: owned or member with write permission."""
+        if not user_id:
+            return []
+        status_clause = "AND p.status = ?" if status is not None else ""
+        params: list = [user_id, user_id]
+        if status is not None:
+            params.append(status)
+        sql = f"""
+            SELECT p.* FROM projects p
+            LEFT JOIN project_members m ON p.id = m.project_id AND m.member_id = ?
+            WHERE p.user_id = ? OR (m.can_edit_canvas = 1 OR m.is_lead = 1)
+            {status_clause}
+            GROUP BY p.id
+            ORDER BY p.created_at DESC
+        """
+        async with self._read(sql, params) as cur:
             rows = await cur.fetchall()
             desc = cur.description
         return [_row_to_project(r, desc) for r in rows]
@@ -261,10 +350,20 @@ class ProjectStore(BaseStore):
             return
         sets.append("updated_at = ?"); params.append(time.time())
         params.append(project_id)
-        await self._db.execute(
-            f"UPDATE projects SET {', '.join(sets)} WHERE id = ?", params
-        )
-        await self._db.commit()
+        async with self._tx():
+            # The same case-insensitive name check create_project runs, for the
+            # same reason: `projects.name` has no unique index, so a rename
+            # straight onto another project's name left two rows sharing one
+            # name and get_project_by_name returning only one of them. Reads
+            # INSIDE the transaction that writes, and ignores this project's
+            # own row so a project can still be recased.
+            if name is not None:
+                clash = await self.get_project_by_name(name)
+                if clash is not None and clash["id"] != project_id:
+                    raise ProjectConflict("name", name)
+            await self._db.execute(
+                f"UPDATE projects SET {', '.join(sets)} WHERE id = ?", params
+            )
 
     async def set_status(self, project_id: str, status: str) -> None:
         if status not in ("active", "archived", "deleted"):
@@ -272,17 +371,17 @@ class ProjectStore(BaseStore):
         now = time.time()
         col_map = {"archived": "archived_at", "deleted": "deleted_at"}
         extra_col = col_map.get(status)
-        if extra_col:
-            await self._db.execute(
-                f"UPDATE projects SET status = ?, updated_at = ?, {extra_col} = ? WHERE id = ?",
-                (status, now, now, project_id),
-            )
-        else:
-            await self._db.execute(
-                "UPDATE projects SET status = ?, updated_at = ? WHERE id = ?",
-                (status, now, project_id),
-            )
-        await self._db.commit()
+        async with self._tx():
+            if extra_col:
+                await self._db.execute(
+                    f"UPDATE projects SET status = ?, updated_at = ?, {extra_col} = ? WHERE id = ?",
+                    (status, now, now, project_id),
+                )
+            else:
+                await self._db.execute(
+                    "UPDATE projects SET status = ?, updated_at = ? WHERE id = ?",
+                    (status, now, project_id),
+                )
 
     async def add_member(
         self,
@@ -307,28 +406,29 @@ class ProjectStore(BaseStore):
             source_agent_id = None
         if memory_seed not in ("none", "snapshot", "empty"):
             raise ValueError(f"invalid memory_seed: {memory_seed}")
-        await self._db.execute(
-            """INSERT INTO project_members
-               (project_id, member_id, member_kind, role, source_agent_id, memory_seed, added_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?)
-               ON CONFLICT(project_id, member_id) DO NOTHING""",
-            (project_id, member_id, member_kind, role, source_agent_id, memory_seed, time.time()),
-        )
-        await self._db.commit()
+        async with self._tx():
+            await self._db.execute(
+                """INSERT INTO project_members
+                   (project_id, member_id, member_kind, role, source_agent_id, memory_seed, added_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(project_id, member_id) DO NOTHING""",
+                (project_id, member_id, member_kind, role, source_agent_id, memory_seed, time.time()),
+            )
 
     async def remove_member(self, project_id: str, member_id: str) -> None:
-        await self._db.execute(
-            "DELETE FROM project_members WHERE project_id = ? AND member_id = ?",
-            (project_id, member_id),
-        )
-        # Removing the designated lead unsets the pointer so it can never dangle
-        # on a member that no longer belongs to the project.
-        await self._db.execute(
-            "UPDATE projects SET lead_member_id = NULL "
-            "WHERE id = ? AND lead_member_id = ?",
-            (project_id, member_id),
-        )
-        await self._db.commit()
+        async with self._tx():
+            await self._db.execute(
+                "DELETE FROM project_members WHERE project_id = ? AND member_id = ?",
+                (project_id, member_id),
+            )
+            # Removing the designated lead unsets the pointer so it can never
+            # dangle on a member that no longer belongs to the project. Same
+            # transaction as the DELETE: the two must never diverge.
+            await self._db.execute(
+                "UPDATE projects SET lead_member_id = NULL "
+                "WHERE id = ? AND lead_member_id = ?",
+                (project_id, member_id),
+            )
 
     async def set_member_canvas(
         self,
@@ -352,15 +452,49 @@ class ProjectStore(BaseStore):
         if not sets:
             return
         params.extend([project_id, member_id])
-        await self._db.execute(
-            f"UPDATE project_members SET {', '.join(sets)} "
-            "WHERE project_id = ? AND member_id = ?",
-            params,
-        )
-        await self._db.commit()
+        async with self._tx():
+            await self._db.execute(
+                f"UPDATE project_members SET {', '.join(sets)} "
+                "WHERE project_id = ? AND member_id = ?",
+                params,
+            )
+
+    async def update_member_canvas_flags(
+        self,
+        project_id: str,
+        member_id: str,
+        *,
+        can_read: bool | None = None,
+        can_edit: bool | None = None,
+    ) -> bool:
+        """Set a member's canvas flags explicitly, revoking as well as granting.
+
+        ``set_member_canvas`` is the additive (grant-only) consent path; this is
+        the owner's explicit set/clear. A flag passed as None is left untouched.
+        Returns False when no member row matched, so the route can 404.
+        """
+        sets: list[str] = []
+        params: list = []
+        if can_read is not None:
+            sets.append("can_read_canvas = ?")
+            params.append(1 if can_read else 0)
+        if can_edit is not None:
+            sets.append("can_edit_canvas = ?")
+            params.append(1 if can_edit else 0)
+        if not sets:
+            return await self.get_member(project_id, member_id) is not None
+        params.extend([project_id, member_id])
+        async with self._tx():
+            cur = await self._db.execute(
+                f"UPDATE project_members SET {', '.join(sets)} "
+                "WHERE project_id = ? AND member_id = ?",
+                params,
+            )
+            changed = cur.rowcount == 1
+        return changed
 
     async def list_members(self, project_id: str) -> list[dict]:
-        async with self._db.execute(
+        async with self._read(
             "SELECT * FROM project_members WHERE project_id = ? ORDER BY added_at ASC",
             (project_id,),
         ) as cur:
@@ -369,7 +503,7 @@ class ProjectStore(BaseStore):
         return [dict(zip(keys, r)) for r in rows]
 
     async def get_member(self, project_id: str, member_id: str) -> dict | None:
-        async with self._db.execute(
+        async with self._read(
             "SELECT * FROM project_members WHERE project_id = ? AND member_id = ?",
             (project_id, member_id),
         ) as cur:
@@ -379,6 +513,67 @@ class ProjectStore(BaseStore):
             keys = [d[0] for d in cur.description]
         return dict(zip(keys, row))
 
+    async def is_project_member(
+        self, project_id: str, member_id: str, *, member_kind: str | None = None
+    ) -> bool:
+        """Return True if *member_id* is a member of *project_id*.
+
+        When *member_kind* is provided, only match members of that kind
+        (e.g. ``"human"`` for cross-user collab delegation checks).
+        """
+        if member_kind is not None:
+            async with self._db.execute(
+                "SELECT 1 FROM project_members "
+                "WHERE project_id = ? AND member_id = ? AND member_kind = ?",
+                (project_id, member_id, member_kind),
+            ) as cur:
+                return (await cur.fetchone()) is not None
+        else:
+            async with self._db.execute(
+                "SELECT 1 FROM project_members "
+                "WHERE project_id = ? AND member_id = ?",
+                (project_id, member_id),
+            ) as cur:
+                return (await cur.fetchone()) is not None
+
+    async def get_project_setting(
+        self, project_id: str, key: str, default=None
+    ):
+        """Read a single key from the project's JSON settings dict.
+
+        Returns *default* if the project does not exist, has no settings, or
+        the key is absent.  Also returns *default* when the settings value is
+        not a dict (malformed DB row guard).
+        """
+        project = await self.get_project(project_id)
+        if project is None:
+            return default
+        settings = project.get("settings") or {}
+        if not isinstance(settings, dict):
+            return default
+        return settings.get(key, default)
+
+    async def set_project_setting(
+        self, project_id: str, key: str, value
+    ) -> bool:
+        """Set a single key in the project's JSON settings dict.
+
+        Returns True if the project was found and updated, False otherwise.
+        """
+        project = await self.get_project(project_id)
+        if project is None:
+            return False
+        settings = project.get("settings") or {}
+        if not isinstance(settings, dict):
+            settings = {}
+        settings[key] = value
+        await self._db.execute(
+            "UPDATE projects SET settings = ?, updated_at = ? WHERE id = ?",
+            (json.dumps(settings), time.time(), project_id),
+        )
+        await self._db.commit()
+        return True
+
     async def log_activity(
         self,
         project_id: str,
@@ -386,17 +581,17 @@ class ProjectStore(BaseStore):
         kind: str,
         payload: dict | None = None,
     ) -> None:
-        await self._db.execute(
-            """INSERT INTO project_activity
-               (project_id, actor_id, kind, payload, created_at)
-               VALUES (?, ?, ?, ?, ?)""",
-            (project_id, actor_id, kind, json.dumps(payload or {}), time.time()),
-        )
-        await self._db.commit()
+        async with self._tx():
+            await self._db.execute(
+                """INSERT INTO project_activity
+                   (project_id, actor_id, kind, payload, created_at)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (project_id, actor_id, kind, json.dumps(payload or {}), time.time()),
+            )
 
     async def list_activity(self, project_id: str, limit: int = 100) -> list[dict]:
         limit = max(1, min(limit, 500))
-        async with self._db.execute(
+        async with self._read(
             """SELECT * FROM project_activity
                WHERE project_id = ?
                ORDER BY created_at DESC

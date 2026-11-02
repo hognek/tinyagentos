@@ -7,6 +7,7 @@ import yaml
 from httpx import ASGITransport, AsyncClient
 
 from tinyagentos.app import create_app
+from taos_test_csrf import csrf_event_hooks
 
 
 # ---------------------------------------------------------------------------
@@ -50,6 +51,7 @@ async def client(app):
         transport=transport,
         base_url="http://test",
         cookies={"taos_session": token},
+        event_hooks=csrf_event_hooks(),
     ) as c:
         yield c
     await ds.close()
@@ -249,7 +251,7 @@ class TestPutPersona:
 class TestAdminGate:
     async def test_put_permitted_models_forbidden_for_non_admin(self, client, app):
         """PUT /api/taos-agent/permitted-models -> 403 for a non-admin session."""
-        app.state.auth.session_user = lambda token: {"is_admin": False, "username": "guest"}
+        app.state.auth.session_user = lambda token, user_agent=None: {"is_admin": False, "username": "guest"}
         resp = await client.put(
             "/api/taos-agent/permitted-models",
             json={"models": ["ollama/m1"]},
@@ -258,7 +260,7 @@ class TestAdminGate:
 
     async def test_put_persona_forbidden_for_non_admin(self, client, app):
         """PUT /api/taos-agent/persona -> 403 for a non-admin session."""
-        app.state.auth.session_user = lambda token: {"is_admin": False, "username": "guest"}
+        app.state.auth.session_user = lambda token, user_agent=None: {"is_admin": False, "username": "guest"}
         resp = await client.put(
             "/api/taos-agent/persona",
             json={"persona": "Hacked!"},
@@ -267,7 +269,7 @@ class TestAdminGate:
 
     async def test_patch_settings_forbidden_for_non_admin(self, client, app):
         """PATCH /api/taos-agent/settings -> 403 for a non-admin session."""
-        app.state.auth.session_user = lambda token: {"is_admin": False, "username": "guest"}
+        app.state.auth.session_user = lambda token, user_agent=None: {"is_admin": False, "username": "guest"}
         resp = await client.patch(
             "/api/taos-agent/settings",
             json={"model": "ollama/hacked"},
@@ -276,6 +278,79 @@ class TestAdminGate:
 
     async def test_get_config_open_for_non_admin(self, client, app):
         """GET /api/taos-agent/config is open — no admin required."""
-        app.state.auth.session_user = lambda token: {"is_admin": False, "username": "guest"}
+        app.state.auth.session_user = lambda token, user_agent=None: {"is_admin": False, "username": "guest"}
         resp = await client.get("/api/taos-agent/config")
         assert resp.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# _safe_path_component (taos_agent_runtime)
+# ---------------------------------------------------------------------------
+
+from tinyagentos.taos_agent_runtime import _safe_path_component, system_agent_framework
+
+
+class TestSystemAgentFrameworkAgreement:
+    """The lock screen and the config endpoint must agree on the harness id.
+
+    Red-first: the two hard-coded strings diverged ('omp' vs 'opencode').
+    Both now derive from ``system_agent_framework()`` so they cannot drift.
+    """
+
+    @pytest.mark.asyncio
+    async def test_lock_widgets_and_config_framework_match(self, client, monkeypatch):
+        from tinyagentos.routes import auth as auth_mod
+
+        monkeypatch.setattr(auth_mod, "_request_is_console", lambda _r: True)
+
+        widgets_resp = await client.get("/auth/lock-widgets")
+        assert widgets_resp.status_code == 200
+        widgets = widgets_resp.json()
+        taos_agent = next(a for a in widgets["agents"] if a["name"] == "taOS Agent")
+        widgets_framework = taos_agent["framework"]
+
+        config_resp = await client.get("/api/taos-agent/config")
+        assert config_resp.status_code == 200
+        config_framework = config_resp.json()["framework"]
+
+        expected = system_agent_framework()
+        assert widgets_framework == expected, f"{widgets_framework!r} != {expected!r}"
+        assert config_framework == expected, f"{config_framework!r} != {expected!r}"
+        # Jay: "taOS agent should show as idle, not on device". A status
+        # string only; the framework above still comes from the runtime.
+        assert taos_agent["status"] == "Idle", taos_agent
+
+
+class TestSafePathComponent:
+    """Model names become filesystem path components — must be sanitized.
+
+    The function appends a short hex digest so two distinct inputs that
+    happen to slugify to the same string (e.g. ``openai/gpt-4o`` and literal
+    ``openai_gpt-4o``) do not share a home directory.
+    """
+
+    @pytest.mark.parametrize(
+        "model,expected",
+        [
+            ("gpt-4o", "gpt-4o-a2a69af7"),
+            ("openai/gpt-4o", "openai_gpt-4o-abb375db"),
+            # Dots stay but slashes are gone — no real traversal possible.
+            ("../../x", ".._.._x-9cdf6a50"),
+            ("/etc/passwd", "_etc_passwd-74acf318"),
+            ("a\\b", "a_b-c62016d0"),
+            ("a b", "a_b-c8687a08"),
+            # Dots are safe — they look odd as a dir name but can't escape.
+            ("...", "...-ab5df625"),
+            ("safe_model.name-v2", "safe_model.name-v2-88179962"),
+            ("openai/gpt-4o-mini", "openai_gpt-4o-mini-94d9f0da"),
+            ("", "-e3b0c442"),
+        ],
+    )
+    def test_slugifies_unsafe_characters(self, model, expected):
+        """Path separators and other unsafe chars are replaced with '_'.
+
+        Dots are preserved (part of the safe slug set); without real '/'
+        separators a dotted component like ``.._.._x`` cannot escape the
+        data_dir boundary.  A collision-resistant hex digest is appended.
+        """
+        assert _safe_path_component(model) == expected

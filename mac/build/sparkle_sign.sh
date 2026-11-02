@@ -1,17 +1,19 @@
 #!/usr/bin/env bash
 # Sparkle-sign the DMG and produce an appcast snippet.
 #
-# Args: --dmg <PATH> --version <X.Y.Z> --output <DIR>
+# Args: --dmg <PATH> --version <X.Y.Z> --output <DIR> [--notes-file <PATH>]
 set -euo pipefail
 
 DMG=""
 VERSION=""
 OUTPUT=""
+NOTES_FILE=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --dmg) DMG="$2"; shift 2 ;;
     --version) VERSION="$2"; shift 2 ;;
     --output) OUTPUT="$2"; shift 2 ;;
+    --notes-file) NOTES_FILE="$2"; shift 2 ;;
     *) echo "sparkle_sign.sh: unknown arg $1" >&2; exit 2 ;;
   esac
 done
@@ -25,7 +27,8 @@ PRIVATE_KEY="${SPARKLE_ED_PRIVATE_KEY:-$HOME/.taos/sparkle_ed_private.pem}"
 # Locate Sparkle's sign_update tool — bundled with Sparkle release tarball
 SIGN_UPDATE="$(command -v sign_update || true)"
 if [[ -z "$SIGN_UPDATE" ]]; then
-  for c in "$REPO_ROOT/mac/build/staging/Sparkle.framework/Versions/B/Resources/sign_update" \
+  for c in "$REPO_ROOT/mac/build/staging/sparkle-bin/sign_update" \
+           "$REPO_ROOT/mac/build/staging/Sparkle.framework/Versions/B/Resources/sign_update" \
            "/Applications/Sparkle.framework/Versions/B/Resources/sign_update"; do
     [[ -x "$c" ]] && { SIGN_UPDATE="$c"; break; }
   done
@@ -44,17 +47,19 @@ echo -n "$SIG_FIELD" > "${DMG}.sig"
 # Build the appcast snippet
 mkdir -p "$OUTPUT"
 SNIPPET="$OUTPUT/appcast-snippet.xml"
-NOTES_FILE="$REPO_ROOT/CHANGELOG.md"
-NOTES="$(awk -v v="$VERSION" 'BEGIN{p=0} /^## /{p=($2==v)} p' "$NOTES_FILE" 2>/dev/null || echo "")"
+: "${NOTES_FILE:=$REPO_ROOT/CHANGELOG.md}"
+NOTES="$(awk -v v="$VERSION" 'BEGIN{p=0} /^## /{p=($2=="["v"]")} p' "$NOTES_FILE" 2>/dev/null || echo "")"
+NOTES="${NOTES//]]>/]]]]<![CDATA[>}"
 
 cat > "$SNIPPET" <<XML
     <item>
       <title>v${VERSION}</title>
       <sparkle:version>${VERSION}</sparkle:version>
+      <sparkle:shortVersionString>${VERSION}</sparkle:shortVersionString>
       <sparkle:minimumSystemVersion>26.0</sparkle:minimumSystemVersion>
       <description><![CDATA[${NOTES}]]></description>
       <enclosure
-        url="https://taos.app/releases/$(basename "$DMG")"
+        url="https://taos.my/releases/$(basename "$DMG")"
         ${SIGNATURE_LINE}
         type="application/octet-stream"/>
     </item>

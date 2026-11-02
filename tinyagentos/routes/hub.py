@@ -6,7 +6,8 @@ chat stores: it reads and writes the node's own signed objects in the local hub
 store (``tinyagentos/hub/store.py``) and mints/uses the node's identity keypair
 (slice 1). Directory calls (identity, friend-request brokering, presence along
 edges) reach taos.my through ``tinyagentos/routes/account_proxy.py`` additions;
-peer traffic is a later slice. Nothing here talks to a peer.
+friend-accept delivers the peer handshake (``_try_handshake``); nothing else
+here talks to a peer.
 
 Slice 2 surfaces the node's own profile: render it and create/update it with a
 version bump. Slice 3 adds the social-graph surface: signed follow and
@@ -25,20 +26,27 @@ dependency (401), exactly like every other local app route.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import re
 from pathlib import Path
 from typing import Optional
 
-from fastapi import APIRouter, Depends, Request
-from fastapi.responses import JSONResponse
+from fastapi import APIRouter, Depends, Request, HTTPException
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
 
+from tinyagentos import peer as peer_channel
 from tinyagentos.auth_context import CurrentUser, current_user
+from tinyagentos.contacts_store import generate_peer_token
+from tinyagentos import task_utils
 from tinyagentos.hub import identity, posts, relationships, store as hub_store
 from tinyagentos.routes.account_proxy import _forward_to
 
 logger = logging.getLogger(__name__)
+
+_BACKGROUND_TASKS: set[asyncio.Task] = set()
 
 router = APIRouter()
 
@@ -93,6 +101,184 @@ async def _get_store(request: Request) -> hub_store.HubStore:
     await store.init()
     request.app.state.hub_store = store
     return store
+
+
+def _normalize_endpoints(endpoints) -> list:
+    """Advertised endpoints as the dict list peer links store.
+
+    Accepts a JSON string or a list; bare strings become
+    ``{"kind": "hub", "url": ..., "priority": <index>}`` (the form #2045's
+    contact grid consumes).  Anything else yields ``[]``.
+    """
+    if isinstance(endpoints, str):
+        try:
+            endpoints = json.loads(endpoints)
+        except (ValueError, TypeError):
+            endpoints = []
+    if not isinstance(endpoints, list):
+        endpoints = []
+    return [
+        {"kind": "hub", "url": e, "priority": i}
+        if isinstance(e, str)
+        else e
+        for i, e in enumerate(endpoints)
+    ]
+
+
+async def _try_handshake(
+    request: Request,
+    directory_resp: dict,
+    peer_fingerprint: str,
+) -> None:
+    """Establish a peer channel on friend-accept (collab A2).
+
+    Extracts the peer's Ed25519/X25519 pubkeys and advertised endpoints
+    from the directory response.  Falls back to the local hub_authors
+    table for pubkeys when the directory omits them.
+
+    On success a contact row is created (or refreshed) and a peer link is
+    established with a freshly minted inbound token.  Failures are
+    logged but never block the accept — the accept always succeeds even
+    when the handshake side-effect temporarily can't complete.
+    """
+    contacts_store = getattr(request.app.state, "contacts_store", None)
+    if contacts_store is None:
+        return
+
+    username = directory_resp.get("username") or directory_resp.get("target") or ""
+
+    # contact_id is keyed on the peer's signing-key fingerprint — the canonical
+    # author identifier (see hub/store.py) — never the peer-controlled username.
+    # A username collision or rename therefore can neither overwrite a pinned
+    # contact's key material nor fragment the same peer across two contact rows.
+    if not peer_fingerprint:
+        # Without a fingerprint there is nothing stable to pin TOFU against;
+        # skip the handshake rather than key on a mutable name.
+        return
+    contact_id = f"hub:{peer_fingerprint}"
+
+    # Pubkeys: directory first, then local hub_authors cache.
+    ed25519_pub = directory_resp.get("signing_pubkey") or ""
+    x25519_pub = directory_resp.get("encryption_pubkey") or ""
+
+    try:
+        # Guard: a blocked peer must not be resurrected on re-accept.
+        # Wrapped inside the try block so a store/has_edge failure never
+        # blocks the accept — the handshake is always best-effort.
+        store = await _get_store(request)
+        if peer_fingerprint and await store.has_edge(peer_fingerprint, relationships.REL_BLOCK):
+            return
+        if not ed25519_pub or not x25519_pub:
+            # Fall back to hub_authors (populated during friend-request flow).
+            store = await _get_store(request)
+            author = await store.get_author(peer_fingerprint) if peer_fingerprint else None
+            if author:
+                ed25519_pub = ed25519_pub or author.get("signing_pubkey", "")
+                x25519_pub = x25519_pub or author.get("encryption_pubkey", "")
+
+        if not ed25519_pub or not x25519_pub:
+            logger.warning(
+                "friend-accept handshake skipped: no pubkeys for %s", contact_id
+            )
+            return
+
+        # Verify the directory-supplied pubkey matches the expected peer fingerprint.
+        # A mismatch (or malformed hex from a malicious directory) means the
+        # directory returned a key for the wrong identity; skip the handshake
+        # to avoid pinning TOFU keys from an imposter.
+        if peer_fingerprint and identity.fingerprint(ed25519_pub) != peer_fingerprint:
+            logger.warning(
+                "friend-accept handshake skipped: pubkey fingerprint mismatch for %s "
+                "(expected %s)",
+                contact_id,
+                peer_fingerprint,
+            )
+            return
+
+        display_name = directory_resp.get("display_name") or username
+        endpoints = _normalize_endpoints(directory_resp.get("endpoints"))
+
+        # Create/refresh the contact row (trust-on-first-use key pinning).
+        await contacts_store.add_contact(
+            contact_id=contact_id,
+            hub_username=username,
+            display_name=display_name,
+            ed25519_pub=ed25519_pub,
+            x25519_pub=x25519_pub,
+            peer_fingerprint=peer_fingerprint,
+        )
+
+        # Mint the inbound token WE give to the remote instance; the
+        # handshake below delivers it.
+        inbound_token = generate_peer_token()
+        # The outbound_token is the token THEY mint for us: empty until their
+        # signed handshake_reply arrives, and left empty if it never does.
+        outbound_token = ""
+
+        await contacts_store.establish_peer_link(
+            contact_id=contact_id,
+            inbound_token=inbound_token,
+            outbound_token=outbound_token,
+            endpoints=endpoints,
+        )
+        logger.info(
+            "friend-accept handshake: contact=%s endpoints=%s",
+            contact_id, endpoints,
+        )
+
+        # Deliver the token to their POST /api/peer/handshake.  The SSRF
+        # allowance is built from the peer link just stored, never from the
+        # request.  This node has no self-advertised endpoint list yet, so
+        # the handshake carries none.
+        link = await contacts_store.get_peer_link(contact_id)
+        link_endpoints = (link or {}).get("endpoints") or []
+        envelope = peer_channel.send_handshake(
+            to_contact_id=contact_id,
+            inbound_token=inbound_token,
+            endpoints=[],
+            signing_pubkey="",
+            encryption_pubkey="",
+        )
+        known_endpoints = peer_channel.known_hostports(link_endpoints)
+        data_dir = request.app.state.data_dir
+
+        # Only the network exchange runs in the background; everything it
+        # needs is captured as locals above (never ``request``).
+        async def _exchange() -> None:
+            reply = await peer_channel.exchange_handshake(
+                envelope,
+                link_endpoints,
+                known_endpoints=known_endpoints,
+                data_dir=data_dir,
+            )
+            their_token = peer_channel.verify_handshake_reply(
+                reply, handshake=envelope, sender_ed25519_pub=ed25519_pub,
+            )
+            if their_token:
+                success = await contacts_store.set_outbound_token(contact_id, their_token, expected_inbound_token=inbound_token)
+                if success:
+                    logger.info("friend-accept handshake completed: contact=%s", contact_id)
+                else:
+                    logger.warning("friend-accept handshake superseded for %s", contact_id)
+            else:
+                logger.warning(
+                    "friend-accept handshake not completed: no verified reply from %s",
+                    contact_id,
+                )
+
+        async def _exchange_guarded() -> None:
+            try:
+                await asyncio.wait_for(_exchange(), timeout=30)
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "friend-accept handshake timed out for %s", contact_id
+                )
+            except Exception:
+                logger.exception("friend-accept handshake failed for %s", contact_id)
+
+        task_utils._create_supervised_task(_exchange_guarded(), _BACKGROUND_TASKS)
+    except Exception:
+        logger.exception("friend-accept handshake failed for %s", contact_id)
 
 
 # --- slice 2: own profile ---------------------------------------------------
@@ -323,6 +509,15 @@ async def accept_friend_request(
         await store.put_relationship(
             peer, relationships.REL_FRIEND, statement=statement
         )
+
+    # --- A2: friend-accept -> contact row + peer-link handshake ---
+    # The directory response carries the peer's identity material (pubkeys,
+    # endpoints) so we can establish the peer channel immediately on accept.
+    # When the directory omits these fields, we fall back to the locally cached
+    # hub_authors record (populated during the friend-request flow).
+    if peer:
+        await _try_handshake(request, resp, peer)
+
     return {"state": "accepted", "peer": peer, "directory": resp}
 
 
@@ -387,6 +582,49 @@ async def block_peer(
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning("hub block: directory edge revoke failed: %s", exc)
+
+    # Cascade to contacts: revoke the peer link so the blocked contact can no
+    # longer authenticate on the peer channel (A2 subscribe-to-block).
+    # Resolve the peer via its signing-key fingerprint — the canonical contact
+    # key — rather than the hub_authors username cache, which is peer-controlled
+    # and can be stale (renamed since the contact was pinned).  A present-but-
+    # stale username row must never break revocation.
+    contacts_store = getattr(request.app.state, "contacts_store", None)
+    if contacts_store is not None:
+        try:
+            # Resolve ALL contacts pinned to this fingerprint.  Legacy
+            # username-keyed rows (or a rename mid-flight) can leave several
+            # contacts sharing a fingerprint; revoke each one rather than
+            # silently picking the first.
+            contacts = await contacts_store.get_contacts_by_fingerprint(peer)
+            if not contacts:
+                logger.warning(
+                    "hub block: could not resolve fingerprint %s to a "
+                    "contact; peer link may still be active", peer,
+                )
+            for contact in contacts:
+                cid = contact["contact_id"]
+                revoked = await contacts_store.revoke_peer_link(cid)
+                if not revoked:
+                    # A revoke that matched no peer_link row must not be
+                    # silently treated as success — log it loudly so a
+                    # fail-open regression is visible.
+                    logger.warning(
+                        "hub block: revoke_peer_link matched no peer_link row "
+                        "for contact %s (fingerprint %s); link may already be "
+                        "absent or revoked", cid, peer,
+                    )
+                # Mark the contact as blocked so the UI reflects the distinct
+                # status rather than leaving it at the prior accepted state.
+                try:
+                    await contacts_store.set_contact_status(cid, "blocked")
+                except Exception:
+                    logger.warning(
+                        "hub block: set_contact_status blocked failed for %s", cid
+                    )
+        except Exception:
+            logger.exception("hub block: contacts-store cascade failed for %s", peer)
+
     return {"state": "blocked", "peer": peer, "severed": severed}
 
 
@@ -575,6 +813,8 @@ async def own_timeline(
     ``no-identity`` before the node has minted a hub identity, else ``ok`` with
     the posts. The timeline works fully offline from the local store.
     """
+    if not user.is_admin:
+        raise HTTPException(status_code=403, detail="forbidden")
     if not identity.exists():
         return {"state": "no-identity"}
     store = await _get_store(request)
@@ -597,6 +837,8 @@ async def delete_post_route(
     so the chain stays verifiable. Best-effort: a peer that later pulls will see
     the tombstone and drop its copy too. Returns the tombstone statement.
     """
+    if not user.is_admin:
+        raise HTTPException(status_code=403, detail="forbidden")
     identity.load_or_create()
     store = await _get_store(request)
     try:
@@ -604,3 +846,78 @@ async def delete_post_route(
     except ValueError as exc:
         return JSONResponse({"error": str(exc)}, status_code=404)
     return {"state": "ok", "tombstone": tomb}
+
+
+_CHAIN_PAGE_MAX = 500
+_SQLITE_INT_MAX = 2**63 - 1
+_BLOB_HASH_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+@router.get("/api/hub/chain")
+async def own_chain(
+    request: Request,
+    after_seq: int = 0,
+    limit: int = 100,
+    user: CurrentUser = Depends(current_user),
+):
+    """This node's own chain from ``after_seq``, with every newer tombstone.
+
+    Phase 0 of docs/design/hub-social-p2p-architecture.md: the exact payload a
+    peer will later pull, served locally only. ``entries`` is a page of chain
+    entries (``object`` is ``None`` once a tombstone dropped the body);
+    ``tombstones`` lists every tombstone after ``after_seq`` even when
+    ``entries`` is truncated, so deletes travel ahead of content. ``head`` is
+    the latest chain entry, so a reader knows how far the chain goes.
+    """
+    if not user.is_admin:
+        raise HTTPException(status_code=403, detail="forbidden")
+    # SQLite integers are signed 64-bit; a larger cursor would raise
+    # OverflowError (a 500) when bound into the query.
+    if not 0 <= after_seq <= _SQLITE_INT_MAX or not 1 <= limit <= _CHAIN_PAGE_MAX:
+        return JSONResponse(
+            {"error": f"after_seq must be 0..{_SQLITE_INT_MAX} and limit 1..{_CHAIN_PAGE_MAX}"},
+            status_code=400,
+        )
+    if not identity.exists():
+        return {"state": "no-identity"}
+    store = await _get_store(request)
+    author = identity.signing_fingerprint()
+    head = await store.get_chain_head(author)
+    return {
+        "state": "ok",
+        "author": author,
+        "head": {"seq": head["seq"], "hash": head["hash"]} if head else None,
+        "entries": await store.list_chain_range(author, after_seq=after_seq, limit=limit),
+        "tombstones": await store.list_tombstones(author, after_seq=after_seq),
+    }
+
+
+@router.get("/api/hub/blobs/{blob_hash}")
+async def get_blob(
+    blob_hash: str,
+    request: Request,
+    user: CurrentUser = Depends(current_user),
+):
+    """Raw bytes of a stored blob (an ingested post image), by content address.
+
+    Blobs are re-encoded images (``posts.ingest_image``), so anything not
+    stored as ``image/*`` is served as an opaque download. The response is
+    sandboxed and never sniffed, so a blob cannot run as a page on this origin.
+    """
+    if not user.is_admin:
+        raise HTTPException(status_code=403, detail="forbidden")
+    if not _BLOB_HASH_RE.match(blob_hash):
+        return JSONResponse({"error": "invalid blob hash"}, status_code=400)
+    store = await _get_store(request)
+    blob = await store.get_blob(blob_hash)
+    if blob is None:
+        return JSONResponse({"error": "blob not found"}, status_code=404)
+    mime = blob.get("mime") or ""
+    headers = {
+        "X-Content-Type-Options": "nosniff",
+        "Content-Security-Policy": "default-src 'none'; sandbox",
+    }
+    if not mime.startswith("image/") or mime == "image/svg+xml":
+        mime = "application/octet-stream"
+        headers["Content-Disposition"] = "attachment"
+    return Response(content=blob["data"], media_type=mime, headers=headers)

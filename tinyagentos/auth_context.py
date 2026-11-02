@@ -27,3 +27,99 @@ def require_owner_or_admin(user: CurrentUser, resource_user_id: str) -> None:
     if user.is_admin or user.user_id == resource_user_id:
         return
     raise HTTPException(status_code=403, detail="forbidden")
+
+
+def require_admin(request: Request) -> None:
+    """FastAPI dependency: 403 unless the caller is an admin or holds the host local token.
+
+    For routers that operate on SYSTEM-GLOBAL state (the secrets keystore, the
+    controller process, LLM provider config, MCP integrations): there is no
+    owner to scope to, so a plain non-admin member session must never reach
+    the handler. ``AuthMiddleware`` (tinyagentos/auth_middleware.py) stamps both
+    accepted signals on ``request.state``:
+
+    - ``is_admin`` -- True for an admin session AND for the host local token
+      when it maps to the primary user (deployed agents and ``taosctl`` present
+      that token, so they keep working unchanged);
+    - ``via == "local_token"`` -- set for a valid local token even in the
+      pre-onboarding edge case where there is no primary user yet, so
+      ``is_admin`` is False there. Checking both keeps agent tool-calls
+      working in every state the middleware allows without ever accepting a
+      bare non-admin user session.
+
+    Single-user installs are unaffected: the sole user created at setup IS the
+    admin. Use as ``APIRouter(dependencies=[Depends(require_admin)])`` for a
+    router that is admin-only end to end, or ``Depends(require_admin)`` on the
+    individual handlers of a router that mixes gated writes with open reads.
+    Mirrors ``routes/settings.py::_require_admin_or_local_token`` and
+    ``routes/skill_exec.py::_is_admin_or_local_token``.
+    """
+    if getattr(request.state, "is_admin", False):
+        return
+    if getattr(request.state, "via", None) == "local_token":
+        return
+    raise HTTPException(status_code=403, detail="forbidden")
+
+
+async def resolve_agent_owner(request: Request, agent_id: str) -> str | None:
+    """Return the ``user_id`` that owns *agent_id* per the agent registry, or ``None``.
+
+    *agent_id* may be a config agent name, a canonical id
+    (``slug-YYYYMMDD-HHMMSS``), a bare slug, or a handle -- the spellings routes
+    accept for an agent. ``None`` means the registry cannot attribute the agent
+    to anyone (unknown id, registry not wired, or not initialised); callers must
+    treat that as NOT owned by the caller, never as free-for-all.
+
+    Ownership is compared on UNIQUE keys only. A config agent is attributed
+    through its ``registry_canonical_id`` and nothing else: its name is a slug
+    any user can also mint as a registry display name or handle, so resolving
+    the name by slug or handle would authorise that user against somebody
+    else's agent. A config agent with no ``registry_canonical_id``, or whose
+    identity is not active, is nobody's.
+    A name that is not a config agent resolves by canonical id, then by handle
+    (unique among active rows), then by slug only when exactly one active row
+    carries it; an ambiguous slug attributes nobody.
+    """
+    registry = getattr(request.app.state, "agent_registry", None)
+    if registry is None:
+        return None
+    from tinyagentos.agent_db import find_agent
+
+    config = getattr(request.app.state, "config", None)
+    config_agent = find_agent(config, agent_id) if config is not None else None
+    try:
+        if config_agent is not None:
+            canonical_id = config_agent.get("registry_canonical_id")
+            record = await registry.get(canonical_id) if canonical_id else None
+            # A suspended or revoked identity keeps its config entry and its
+            # secrets; its owner must not keep access through them.
+            if record is not None and record.get("status") != "active":
+                record = None
+        else:
+            record = await registry.get(agent_id)
+            if record is None:
+                record = await registry.get_by_handle(agent_id)
+            if record is None and await registry.count_by_slug(agent_id) == 1:
+                record = await registry.get_by_slug(agent_id)
+    except RuntimeError:  # store not initialised
+        return None
+    if record is None:
+        return None
+    return record.get("user_id") or None
+
+
+async def require_agent_owner_or_admin(
+    request: Request, user: CurrentUser, agent_id: str
+) -> None:
+    """403 unless *user* is an admin or the registry says it owns *agent_id*.
+
+    Fail-closed for non-admins: an agent the registry cannot attribute (unknown
+    id, or a config-only agent with no registry row) is nobody's to expose, so
+    only an admin may act on it.
+    """
+    if user.is_admin:
+        return
+    owner = await resolve_agent_owner(request, agent_id)
+    if owner is None:
+        raise HTTPException(status_code=403, detail="forbidden")
+    require_owner_or_admin(user, owner)

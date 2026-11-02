@@ -25,8 +25,8 @@ plus `/approve` and `/deny`, per-agent grants keyed
 Two gaps stop an agent from posting a decision:
 
 1. There is no decisions scope. `_ALLOWED_SCOPES` in
-   `routes/agent_registry.py:90` is `memory_read/write, a2a_send/receive,
-   files_read/write, tools_execute, registry_feeds_read, project_tasks,
+   `routes/agent_registry.py:90` is `a2a_send/receive,
+   files_read/write, registry_feeds_read, project_tasks,
    canvas_read/write`. Nothing covers decisions.
 2. `create_decision` (`routes/decisions.py:123`) is human-only
    (`Depends(current_user)`) and hard-codes `user_id=user.user_id`. There is no

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import json
 import stat
 import time
 
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
+from taos_test_csrf import csrf_event_hooks
 
 from tinyagentos.auth import (
     AuthManager,
@@ -135,6 +137,114 @@ class TestAuthManager:
         assert t1 not in mgr._sessions
         assert t2 in mgr._sessions
 
+    def test_prune_expired_sessions_at_startup(self, tmp_path):
+        """Expired entries are pruned when AuthManager is initialized."""
+        mgr = AuthManager(tmp_path)
+        # Create an expired session (will be written to file)
+        token = mgr.create_session(user_id="uid1")
+        # Manually expire it and force prune
+        mgr._sessions[token] = {"user_id": "uid1", "expires_at": time.time() - 1, "long_lived": False}
+        mgr.cleanup_sessions()
+        assert token not in mgr._sessions
+        
+        # Create a valid session
+        token2 = mgr.create_session(user_id="uid2")
+        # Verify it's still valid
+        assert mgr.validate_session(token2) is not None
+
+    def test_prune_at_startup_removes_expired(self, tmp_path):
+        """Expired sessions from previous run are pruned at startup."""
+        # Create a file with expired session content (simulating previous run)
+        session_data = {"expired_token": {"user_id": "uid1", "expires_at": time.time() - 3600, "long_lived": False}}
+        sessions_file = tmp_path / ".auth_sessions"
+        sessions_file.write_text(json.dumps(session_data))
+        
+        # Now create a new manager - should prune the expired session
+        mgr2 = AuthManager(tmp_path)
+        # The expired token should be removed
+        assert "expired_token" not in mgr2._sessions
+
+    def test_prune_at_startup_preserves_unexpired(self, tmp_path):
+        """Unexpired sessions survive startup pruning."""
+        # Create a file with valid session content (simulating previous run)
+        token1 = "valid_token_123"
+        session_data = {token1: {"user_id": "uid1", "expires_at": time.time() + 3600, "long_lived": False}}
+        sessions_file = tmp_path / ".auth_sessions"
+        sessions_file.write_text(json.dumps(session_data))
+        
+        # New manager should preserve it
+        mgr2 = AuthManager(tmp_path)
+        assert token1 in mgr2._sessions
+
+    def test_prune_long_lived_unexpired_survives(self, tmp_path):
+        """Long-lived sessions survive pruning when unexpired."""
+        # Create a file with long-lived valid session (simulating previous run)
+        token1 = "long_lived_token_456"
+        session_data = {token1: {"user_id": "uid1", "expires_at": time.time() + 3600, "long_lived": True}}
+        sessions_file = tmp_path / ".auth_sessions"
+        sessions_file.write_text(json.dumps(session_data))
+        
+        # New manager should preserve it
+        mgr2 = AuthManager(tmp_path)
+        assert token1 in mgr2._sessions
+        assert mgr2._sessions[token1]["long_lived"] is True
+
+    def test_prune_at_startup_shrinks_the_file(self, tmp_path):
+        """Startup pruning must persist: the sessions FILE shrinks at init,
+        not merely the in-memory view (which _load() already prunes)."""
+        expired = {
+            f"tok{i}": {"user_id": "u", "expires_at": time.time() - 10, "long_lived": False}
+            for i in range(50)
+        }
+        expired["live"] = {"user_id": "u", "expires_at": time.time() + 3600, "long_lived": False}
+        sessions_file = tmp_path / ".auth_sessions"
+        sessions_file.write_text(json.dumps(expired))
+        size_before = sessions_file.stat().st_size
+
+        AuthManager(tmp_path)
+
+        on_disk = json.loads(sessions_file.read_text())
+        assert list(on_disk) == ["live"]
+        assert sessions_file.stat().st_size < size_before
+
+    def test_session_cap_evicts_oldest_for_same_user(self, tmp_path):
+        """Minting past the per-user cap evicts that user's OLDEST session
+        only; other users' sessions and the newest N survive (tsk-wmclfd)."""
+        mgr = AuthManager(tmp_path)
+        mgr.max_sessions_per_user = 3
+        other = mgr.create_session(user_id="uid2")
+        tokens = [mgr.create_session(user_id="uid1") for _ in range(4)]
+
+        oldest, newest = tokens[0], tokens[1:]
+        assert oldest not in mgr._sessions
+        assert mgr.validate_session(oldest) is None
+        for t in newest:
+            assert mgr.validate_session(t) == "uid1"
+        assert mgr.validate_session(other) == "uid2"
+        on_disk = json.loads((tmp_path / ".auth_sessions").read_text())
+        assert sum(1 for e in on_disk.values() if e["user_id"] == "uid1") == 3
+
+    def test_session_cap_keeps_ua_binding(self, tmp_path):
+        """Capped minting must not drop the User-Agent binding of survivors."""
+        mgr = AuthManager(tmp_path)
+        mgr.max_sessions_per_user = 2
+        tokens = [mgr.create_session(user_id="uid1", user_agent="ua-a") for _ in range(3)]
+        assert mgr.validate_session(tokens[-1], user_agent="ua-a") == "uid1"
+        assert mgr.validate_session(tokens[-1], user_agent="ua-b") is None
+        assert mgr.validate_session(tokens[-1]) is None
+
+    def test_prune_already_clean_is_noop(self, tmp_path):
+        """Pruning an already-clean store (no expired entries) is a no-op."""
+        # Create a file with no expired entries (simulating clean state)
+        token1 = "valid_token_789"
+        session_data = {token1: {"user_id": "uid1", "expires_at": time.time() + 3600, "long_lived": False}}
+        sessions_file = tmp_path / ".auth_sessions"
+        sessions_file.write_text(json.dumps(session_data))
+        
+        # Create new manager - should preserve the valid session
+        mgr2 = AuthManager(tmp_path)
+        assert token1 in mgr2._sessions
+
 
 # --- Integration tests for routes ---
 
@@ -166,8 +276,24 @@ async def auth_client(app):
     if relationship_mgr._db is not None:
         await relationship_mgr.close()
     await relationship_mgr.init()
+    # Initialise agent registry and grants stores used by auth routes
+    agent_registry = app.state.agent_registry
+    if agent_registry._db is not None:
+        await agent_registry.close()
+    await agent_registry.init()
+    agent_grants = app.state.agent_grants
+    if agent_grants._db is not None:
+        await agent_grants.close()
+    await agent_grants.init()
     transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as c:
+    async with AsyncClient(
+        transport=transport,
+        base_url="http://test",
+        # Tests here pass `cookies=login.cookies` per request rather than
+        # seeding the jar, so the hook is the only place that sees the
+        # csrf_token this client actually carries.
+        event_hooks=csrf_event_hooks(),
+    ) as c:
         yield c
     await relationship_mgr.close()
     await channel_store.close()
@@ -177,6 +303,58 @@ async def auth_client(app):
     await store.close()
     await app.state.qmd_client.close()
     await app.state.http_client.aclose()
+    await agent_grants.close()
+    await agent_registry.close()
+
+
+class TestCorruptStoreOverTheApi:
+    """A read that cannot answer must say so, not answer plausibly.
+
+    `list_users()` and friends raise AuthStoreCorruptError rather than
+    degrade to an empty list — "no users" and "cannot read the users" are
+    different facts. One app-level handler turns that into a single honest
+    503 instead of an opaque 500 per route.
+    """
+
+    @pytest.mark.asyncio
+    async def test_users_route_returns_503_not_an_empty_list(self, app, auth_client):
+        app.state.auth.setup_user("admin", "Admin", "", "adminpass")
+        login = await auth_client.post(
+            "/auth/login", json={"username": "admin", "password": "adminpass"},
+        )
+        assert login.status_code == 200
+
+        users_file = app.state.auth._user_file
+        users_file.write_bytes(b"\0" * users_file.stat().st_size)
+
+        resp = await auth_client.get("/auth/users")
+        assert resp.status_code == 503
+        assert resp.json()["error"] == "account_store_unreadable"
+
+    @pytest.mark.asyncio
+    async def test_status_reports_the_store_instead_of_offering_setup(
+        self, app, auth_client,
+    ):
+        app.state.auth.setup_user("admin", "Admin", "", "adminpass")
+        users_file = app.state.auth._user_file
+        users_file.write_bytes(b"\0" * users_file.stat().st_size)
+
+        resp = await auth_client.get("/auth/status")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["store_error"] == "unreadable"
+        assert body["configured"] is True
+        assert body["needs_onboarding"] is False
+
+    @pytest.mark.asyncio
+    async def test_setup_page_does_not_offer_the_form(self, app, auth_client):
+        app.state.auth.setup_user("admin", "Admin", "", "adminpass")
+        users_file = app.state.auth._user_file
+        users_file.write_bytes(b"\0" * users_file.stat().st_size)
+
+        resp = await auth_client.get("/auth/setup", follow_redirects=False)
+        assert resp.status_code == 303
+        assert resp.headers["location"] == "/auth/login"
 
 
 class TestAuthRoutes:
@@ -651,6 +829,102 @@ class TestMultiUser:
         assert resp.status_code == 401
 
 
+class TestCompleteInviteFromSession:
+    """The SPA completes an invite from the session the invite code opened.
+
+    LoginGate never sees the code (/auth/status does not return it), so it
+    posts /auth/complete without one. The invitee's own pending session
+    stands in for the code; no other session does.
+    """
+
+    async def _invite(self, auth_client, *usernames):
+        await auth_client.post(
+            "/auth/setup",
+            json={"username": "admin", "full_name": "Admin", "email": "", "password": "adminpass", "auto_login": False},
+        )
+        admin = await auth_client.post(
+            "/auth/login",
+            json={"username": "admin", "password": "adminpass", "auto_login": False},
+        )
+        codes = {}
+        for name in usernames:
+            add = await auth_client.post("/auth/users", json={"username": name}, cookies=admin.cookies)
+            codes[name] = add.json()["invite_code"]
+        return admin.cookies, codes
+
+    async def _pending_session(self, auth_client, username, code):
+        login = await auth_client.post(
+            "/auth/login",
+            json={"username": username, "password": code, "auto_login": False},
+        )
+        assert login.json()["needs_onboarding"] is True
+        return login.cookies
+
+    def _body(self, username):
+        return {"username": username, "full_name": "Ivy", "email": "", "password": "ivypass1", "auto_login": False}
+
+    @pytest.mark.asyncio
+    async def test_pending_session_completes_without_the_code(self, app, auth_client):
+        _, codes = await self._invite(auth_client, "ivy")
+        cookies = await self._pending_session(auth_client, "ivy", codes["ivy"])
+        resp = await auth_client.post("/auth/complete", json=self._body("ivy"), cookies=cookies)
+        assert resp.status_code == 200, resp.text
+        relogin = await auth_client.post(
+            "/auth/login",
+            json={"username": "ivy", "password": "ivypass1", "auto_login": False},
+        )
+        assert relogin.status_code == 200, relogin.text
+        assert relogin.json()["ok"] is True
+
+    @pytest.mark.asyncio
+    async def test_no_code_and_no_session_is_refused(self, app, auth_client):
+        await self._invite(auth_client, "ivy")
+        # The client jar kept the admin login's cookie; this case sends none.
+        auth_client.cookies.clear()
+        resp = await auth_client.post("/auth/complete", json=self._body("ivy"))
+        assert resp.status_code == 400, resp.text
+
+    @pytest.mark.asyncio
+    async def test_another_invitees_session_is_refused(self, app, auth_client):
+        _, codes = await self._invite(auth_client, "ivy", "jack")
+        jack = await self._pending_session(auth_client, "jack", codes["jack"])
+        resp = await auth_client.post("/auth/complete", json=self._body("ivy"), cookies=jack)
+        assert resp.status_code == 400, resp.text
+        # ivy's invite is untouched: her code still opens a pending session
+        await self._pending_session(auth_client, "ivy", codes["ivy"])
+
+    @pytest.mark.asyncio
+    async def test_admin_session_is_refused(self, app, auth_client):
+        admin, codes = await self._invite(auth_client, "ivy")
+        resp = await auth_client.post("/auth/complete", json=self._body("ivy"), cookies=admin)
+        assert resp.status_code == 400, resp.text
+        await self._pending_session(auth_client, "ivy", codes["ivy"])
+
+    @pytest.mark.asyncio
+    async def test_pending_session_without_the_csrf_token_is_refused(self, app, auth_client):
+        # /auth/complete is CSRF-exempt by path, so the session branch checks
+        # the double-submit token itself: a cross-site form carrying the
+        # pending cookie must not set the invitee's password.
+        _, codes = await self._invite(auth_client, "ivy")
+        cookies = await self._pending_session(auth_client, "ivy", codes["ivy"])
+        resp = await auth_client.post(
+            "/auth/complete",
+            json=self._body("ivy"),
+            cookies=cookies,
+            headers={"X-CSRF-Token": "forged"},
+        )
+        assert resp.status_code == 400, resp.text
+        await self._pending_session(auth_client, "ivy", codes["ivy"])
+
+    @pytest.mark.asyncio
+    async def test_wrong_code_is_still_refused_with_a_pending_session(self, app, auth_client):
+        _, codes = await self._invite(auth_client, "ivy")
+        cookies = await self._pending_session(auth_client, "ivy", codes["ivy"])
+        body = {**self._body("ivy"), "invite_code": "not-the-code"}
+        resp = await auth_client.post("/auth/complete", json=body, cookies=cookies)
+        assert resp.status_code == 400, resp.text
+
+
 class TestLocalToken:
     def test_token_created_on_first_access(self, tmp_path):
         mgr = AuthManager(tmp_path)
@@ -712,10 +986,26 @@ async def no_cookie_client(app):
     if relationship_mgr._db is not None:
         await relationship_mgr.close()
     await relationship_mgr.init()
+    # Initialise agent registry and grants stores used by auth routes
+    agent_registry = app.state.agent_registry
+    if agent_registry._db is not None:
+        await agent_registry.close()
+    await agent_registry.init()
+    agent_grants = app.state.agent_grants
+    if agent_grants._db is not None:
+        await agent_grants.close()
+    await agent_grants.init()
     # Configure auth so the app isn't in onboarding mode
     app.state.auth.setup_user("admin", "Test Admin", "", "testpass")
     transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as c:
+    async with AsyncClient(
+        transport=transport,
+        base_url="http://test",
+        # Tests here pass `cookies=login.cookies` per request rather than
+        # seeding the jar, so the hook is the only place that sees the
+        # csrf_token this client actually carries.
+        event_hooks=csrf_event_hooks(),
+    ) as c:
         yield c
     await relationship_mgr.close()
     await channel_store.close()
@@ -725,6 +1015,8 @@ async def no_cookie_client(app):
     await store.close()
     await app.state.qmd_client.close()
     await app.state.http_client.aclose()
+    await agent_grants.close()
+    await agent_registry.close()
 
 
 class TestMiddlewareBearerPath:
@@ -1118,13 +1410,229 @@ class TestSessionClientBinding:
         assert user_id == rec["id"]
 
     def test_session_with_ua_hash_validates_without_ua_param(self, tmp_path):
-        """When caller doesn't supply user_agent, hash check is skipped."""
+        """When caller doesn't supply user_agent and session has a UA hash, validation fails."""
         mgr = AuthManager(tmp_path)
         mgr.setup_user("alice", "Alice", "", "alicepwd1")
         rec = mgr.find_user("alice")
         token = mgr.create_session(
             user_id=rec["id"], user_agent="TestAgent/1.0"
         )
-        # No user_agent param => skip check
+        # User-Agent hash is stored, but no user_agent param supplied -> validation fails
         user_id = mgr.validate_session(token)
-        assert user_id == rec["id"]
+        assert user_id is None
+
+
+class TestAuthStatusUserAgentSymmetry:
+    """/auth/status and /auth/me must apply the SAME User-Agent binding check
+    as the API middleware. When they diverge, a session whose UA hash no
+    longer matches (browser auto-update rotates the UA string) reads
+    authenticated on /auth/status while every /api/* call 401s, and the SPA's
+    LoginGate remount-loops on the contradiction (beta.46 PWA refresh loop,
+    2026-08-10)."""
+
+    @pytest.mark.asyncio
+    async def test_status_rejects_session_with_rotated_user_agent(self, app, auth_client):
+        app.state.auth.set_password("passw0rd")
+        resp = await auth_client.post(
+            "/auth/login",
+            data={"password": "passw0rd"},
+            headers={"user-agent": "TaosPWA/1.0 (old browser)"},
+            follow_redirects=False,
+        )
+        assert "taos_session" in resp.headers.get("set-cookie", "")
+        # Same UA -> still authenticated.
+        ok = await auth_client.get(
+            "/auth/status", headers={"user-agent": "TaosPWA/1.0 (old browser)"}
+        )
+        assert ok.json()["authenticated"] is True
+        # Rotated UA (browser updated) -> the middleware would 401 every API
+        # call, so status must agree and report unauthenticated.
+        rotated = await auth_client.get(
+            "/auth/status", headers={"user-agent": "TaosPWA/2.0 (updated browser)"}
+        )
+        assert rotated.json()["authenticated"] is False
+
+    @pytest.mark.asyncio
+    async def test_me_rejects_session_with_rotated_user_agent(self, app, auth_client):
+        app.state.auth.set_password("passw0rd")
+        resp = await auth_client.post(
+            "/auth/login",
+            data={"password": "passw0rd"},
+            headers={"user-agent": "TaosPWA/1.0 (old browser)"},
+            follow_redirects=False,
+        )
+        assert "taos_session" in resp.headers.get("set-cookie", "")
+        ok = await auth_client.get(
+            "/auth/me", headers={"user-agent": "TaosPWA/1.0 (old browser)"}
+        )
+        assert ok.status_code != 401
+        rotated = await auth_client.get(
+            "/auth/me", headers={"user-agent": "TaosPWA/2.0 (updated browser)"}
+        )
+        assert rotated.status_code == 401
+
+
+# --- Non-object JSON bodies must be a 400, never a 500 -------------------------
+#
+# request.json() accepts null / [] / 1 / "x" -- all valid JSON, none of them a
+# mapping. Every one of these routes then calls body.get(), which raises
+# AttributeError and surfaces as a 500 for what is plainly a malformed request.
+# /auth/login, /auth/setup and /auth/complete are all session-exempt, so the
+# 500 is reachable by anyone who can talk to the port.
+
+# Sent as raw content, not via json=, because httpx omits the body entirely
+# for json=None -- which would test "no body" rather than the literal null.
+_NON_OBJECT_BODIES = ["null", "[]", "1", '"x"']
+_JSON_CT = {"content-type": "application/json"}
+
+
+class TestNonObjectJsonBody:
+    @pytest.mark.parametrize("body", _NON_OBJECT_BODIES)
+    @pytest.mark.asyncio
+    async def test_login_rejects_non_object_body(self, auth_client, body):
+        resp = await auth_client.post("/auth/login", content=body, headers=_JSON_CT)
+        assert resp.status_code == 400, f"{body!r} produced {resp.status_code}"
+
+    @pytest.mark.parametrize("body", _NON_OBJECT_BODIES)
+    @pytest.mark.asyncio
+    async def test_setup_rejects_non_object_body(self, auth_client, body):
+        # Unconfigured store, so the is_configured() 409 short-circuit above the
+        # body.get() calls does not mask the defect.
+        resp = await auth_client.post("/auth/setup", content=body, headers=_JSON_CT)
+        assert resp.status_code == 400, f"{body!r} produced {resp.status_code}"
+
+    @pytest.mark.parametrize("body", _NON_OBJECT_BODIES)
+    @pytest.mark.asyncio
+    async def test_complete_rejects_non_object_body(self, auth_client, body):
+        resp = await auth_client.post("/auth/complete", content=body, headers=_JSON_CT)
+        assert resp.status_code == 400, f"{body!r} produced {resp.status_code}"
+
+    @pytest.mark.parametrize("body", _NON_OBJECT_BODIES)
+    @pytest.mark.asyncio
+    async def test_add_user_rejects_non_object_body(self, auth_client, body):
+        await auth_client.post(
+            "/auth/setup",
+            json={"username": "admin", "full_name": "Admin", "email": "", "password": "adminpass", "auto_login": False},
+        )
+        login = await auth_client.post(
+            "/auth/login",
+            json={"username": "admin", "password": "adminpass", "auto_login": False},
+        )
+        resp = await auth_client.post("/auth/users", content=body, headers=_JSON_CT, cookies=login.cookies)
+        assert resp.status_code == 400, f"{body!r} produced {resp.status_code}"
+
+    @pytest.mark.parametrize("body", _NON_OBJECT_BODIES)
+    @pytest.mark.asyncio
+    async def test_update_profile_rejects_non_object_body(self, auth_client, body):
+        await auth_client.post(
+            "/auth/setup",
+            json={"username": "admin", "full_name": "Admin", "email": "", "password": "adminpass", "auto_login": False},
+        )
+        login = await auth_client.post(
+            "/auth/login",
+            json={"username": "admin", "password": "adminpass", "auto_login": False},
+        )
+        resp = await auth_client.post(
+            "/auth/users/admin/profile", content=body, headers=_JSON_CT, cookies=login.cookies
+        )
+        assert resp.status_code == 400, f"{body!r} produced {resp.status_code}"
+
+    @pytest.mark.parametrize("body", _NON_OBJECT_BODIES)
+    @pytest.mark.asyncio
+    async def test_change_password_rejects_non_object_body(self, auth_client, body):
+        await auth_client.post(
+            "/auth/setup",
+            json={"username": "admin", "full_name": "Admin", "email": "", "password": "adminpass", "auto_login": False},
+        )
+        login = await auth_client.post(
+            "/auth/login",
+            json={"username": "admin", "password": "adminpass", "auto_login": False},
+        )
+        resp = await auth_client.post(
+            "/auth/users/admin/password", content=body, headers=_JSON_CT, cookies=login.cookies
+        )
+        assert resp.status_code == 400, f"{body!r} produced {resp.status_code}"
+
+
+# ---------------------------------------------------------------------------
+# RED-FIRST test for the session_user / validate_session user-agent binding fix
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestSessionUserAgentBindingRED:
+    """RED-FIRST: Proves the fix threads User-Agent into every caller.
+
+    Before the fix, a browser login stores a User-Agent hash (routes/auth.py
+    creates sessions with user_agent). After the fix, EVERY caller that omits
+    user_agent (e.g. chat routes, /me, etc.) must thread the request's
+    User-Agent header. This test demonstrates that before the fix, such
+    callers reject logged-in browser users with 401. After the fix, they
+    accept them when the User-Agent matches.
+    """
+
+    @pytest.mark.asyncio
+    async def test_browser_user_agent_binding_fixes_auth_endpoints(self, app, client):
+        """UA-binding guard: login with a User-Agent, call protected endpoints, succeed."""
+        app.state.auth.set_password("testpass")
+
+        login_headers = {"user-agent": "taos-ua-test/1"}
+        resp = await client.post(
+            "/auth/login",
+            data={"password": "testpass"},
+            headers=login_headers,
+            follow_redirects=False,
+        )
+        assert resp.status_code == 303
+        assert "taos_session" in resp.headers.get("set-cookie", "")
+
+        nodes_resp = await client.get(
+            "/api/browser/nodes",
+            headers=login_headers,
+        )
+        assert nodes_resp.status_code != 401, (
+            f"/api/browser/nodes rejected authenticated session: {nodes_resp.status_code}"
+        )
+
+        status_resp = await client.get(
+            "/auth/status",
+            headers=login_headers,
+        )
+        assert status_resp.status_code == 200
+        assert status_resp.json()["authenticated"] is True
+
+        different_headers = {"user-agent": "different-agent/1"}
+        status_resp_different = await client.get(
+            "/auth/status",
+            headers=different_headers,
+        )
+        assert status_resp_different.status_code == 200
+        assert status_resp_different.json()["authenticated"] is False
+
+        user_id = app.state.auth.find_user("admin")["id"]
+        channel = await app.state.chat_channels.create_channel(
+            "test-ua-binding", "dm", "user", members=[user_id],
+        )
+        msg = await app.state.chat_messages.send_message(
+            channel_id=channel["id"],
+            author_id=user_id,
+            author_type="user",
+            content="test message",
+        )
+
+        edit_resp = await client.patch(
+            f"/api/chat/messages/{msg['id']}",
+            json={"content": "edited"},
+            headers=login_headers,
+        )
+        assert edit_resp.status_code == 200, (
+            f"Edit with matching UA should succeed, got: {edit_resp.status_code}"
+        )
+
+        edit_resp_diff = await client.patch(
+            f"/api/chat/messages/{msg['id']}",
+            json={"content": "edited2"},
+            headers=different_headers,
+        )
+        assert edit_resp_diff.status_code == 401, (
+            f"Edit with different UA should be 401, got: {edit_resp_diff.status_code}"
+        )

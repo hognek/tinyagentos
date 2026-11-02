@@ -1,3 +1,5 @@
+> **Status (2026-08-14): Not implemented.** The file paths referenced below are proposed, not present in the codebase.
+
 # Unified GPU Work Queue (taOS #1864) Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan slice-by-slice. Steps use checkbox (`- [ ]`) syntax for tracking.
@@ -1539,6 +1541,8 @@ async def unload_model(client: "httpx.AsyncClient", *, backend_type: str,
 ```
 
 **Live-Pi flag:** the rkllama route existence is verified; the exact JSON body key must be confirmed against the deployed fork (`src/rkllama/server/server.py:368`) during the B5 hardware gate. If the fork expects `{"model_name": ...}` instead, change only the adapter body and its request-shape test; the interface above is stable either way.
+
+**Landed ahead of B1 (#3229):** `tinyagentos/backend_unload.py` exists with this interface and one registered adapter, `llama-swap`: `POST {base}/api/models/unload/{model}` (answers 200 also when the model is not running, 404 for an unknown model; its unload-all routes are never used). llama-swap is a multi-model proxy, so it is unload-capable unlike llama-cpp/vllm. B1 adds ollama and rkllama to the module's `_UNLOADERS` registry and extends the tests below to match (`UNLOAD_CAPABLE_TYPES` then has all three). For llama-swap the sweep confirms the unload by re-polling `/running` rather than `/api/ps`; confirming the VRAM was actually freed (`free_vram_mb`) is only possible on NVIDIA today (#3228).
 
 - [ ] **Step 1: Write the failing tests**
 

@@ -17,6 +17,7 @@ from httpx import ASGITransport, AsyncClient
 
 from tinyagentos.projects.project_store import ProjectStore
 from tinyagentos.auth_context import CurrentUser, require_owner_or_admin
+from taos_test_csrf import csrf_event_hooks
 
 
 # ---------------------------------------------------------------------------
@@ -187,6 +188,7 @@ async def member_client(app, tmp_data_dir):
         transport=transport,
         base_url="http://test",
         cookies={"taos_session": token},
+        event_hooks=csrf_event_hooks(),
     ) as c:
         c._test_uid = member_uid
         c._test_app = app
@@ -211,10 +213,12 @@ async def two_member_clients(app, tmp_data_dir):
     async with AsyncClient(
         transport=transport, base_url="http://test",
         cookies={"taos_session": alice_token},
+        event_hooks=csrf_event_hooks(),
     ) as alice_c:
         async with AsyncClient(
             transport=transport, base_url="http://test",
             cookies={"taos_session": bob_token},
+            event_hooks=csrf_event_hooks(),
         ) as bob_c:
             alice_c._test_uid = alice_uid
             alice_c._test_app = app
@@ -287,36 +291,42 @@ async def test_owner_can_get_own_project(member_client):
 
 
 @pytest.mark.asyncio
-async def test_non_owner_update_returns_403(two_member_clients):
-    """A non-owner patching another user's project gets 403."""
+async def test_non_owner_update_returns_404(two_member_clients):
+    """WHY: a non-owner must not be able to distinguish 'exists but forbidden' from 'does not exist'."""
     alice, bob = two_member_clients
     resp = await alice.post("/api/projects", json={"name": "A", "slug": "a-upd"})
     pid = resp.json()["id"]
 
     resp = await bob.patch(f"/api/projects/{pid}", json={"name": "Hijacked"})
-    assert resp.status_code == 403
+    assert resp.status_code == 404
 
 
 @pytest.mark.asyncio
-async def test_non_owner_delete_returns_403(two_member_clients):
-    """A non-owner deleting another user's project gets 403."""
+async def test_non_owner_delete_returns_404(two_member_clients):
+    """WHY: a non-owner must not be able to distinguish 'exists but forbidden' from 'does not exist'."""
     alice, bob = two_member_clients
     resp = await alice.post("/api/projects", json={"name": "A", "slug": "a-del"})
     pid = resp.json()["id"]
 
     resp = await bob.delete(f"/api/projects/{pid}")
-    assert resp.status_code == 403
+    assert resp.status_code == 404
 
 
 @pytest.mark.asyncio
-async def test_non_owner_archive_returns_403(two_member_clients):
-    """A non-owner archiving another user's project gets 403."""
+async def test_non_owner_oracle_closed(two_member_clients):
+    """Both missing and forbidden projects return identical 404 bodies."""
     alice, bob = two_member_clients
-    resp = await alice.post("/api/projects", json={"name": "A", "slug": "a-arch"})
-    pid = resp.json()["id"]
+    resp = await alice.post("/api/projects", json={"name": "A", "slug": "alice-real"})
+    alice_pid = resp.json()["id"]
+    non_existent_id = "proj-non-existent"
 
-    resp = await bob.post(f"/api/projects/{pid}/archive")
-    assert resp.status_code == 403
+    # Both return 404 with identical error messages
+    missing_resp = await bob.patch(f"/api/projects/{non_existent_id}", json={"name": "Hijacked"})
+    forbidden_resp = await bob.patch(f"/api/projects/{alice_pid}", json={"name": "Hijacked"})
+
+    assert missing_resp.status_code == 404
+    assert forbidden_resp.status_code == 404
+    assert missing_resp.json() == forbidden_resp.json()
 
 
 @pytest.mark.asyncio
@@ -335,6 +345,7 @@ async def test_admin_sees_all_projects(two_member_clients):
     async with AsyncClient(
         transport=transport, base_url="http://test",
         cookies={"taos_session": admin_token},
+        event_hooks=csrf_event_hooks(),
     ) as admin_c:
         # default status=active; alice and bob's projects are active
         resp = await admin_c.get("/api/projects")
@@ -359,6 +370,7 @@ async def test_admin_can_get_any_project(two_member_clients):
     async with AsyncClient(
         transport=transport, base_url="http://test",
         cookies={"taos_session": admin_token},
+        event_hooks=csrf_event_hooks(),
     ) as admin_c:
         resp = await admin_c.get(f"/api/projects/{pid}")
         assert resp.status_code == 200
@@ -380,6 +392,7 @@ async def test_admin_can_update_any_project(two_member_clients):
     async with AsyncClient(
         transport=transport, base_url="http://test",
         cookies={"taos_session": admin_token},
+        event_hooks=csrf_event_hooks(),
     ) as admin_c:
         resp = await admin_c.patch(f"/api/projects/{pid}", json={"name": "Admin Updated"})
         assert resp.status_code == 200
@@ -482,6 +495,7 @@ async def test_legacy_row_hidden_from_members(app, tmp_data_dir):
     async with AsyncClient(
         transport=transport, base_url="http://test",
         cookies={"taos_session": member_token},
+        event_hooks=csrf_event_hooks(),
     ) as member_c:
         # Member cannot see legacy row in list (legacy rows have status='active')
         resp = await member_c.get("/api/projects")
@@ -495,6 +509,7 @@ async def test_legacy_row_hidden_from_members(app, tmp_data_dir):
     async with AsyncClient(
         transport=transport, base_url="http://test",
         cookies={"taos_session": admin_token},
+        event_hooks=csrf_event_hooks(),
     ) as admin_c:
         # Admin CAN see legacy row in list (legacy rows have status='active')
         resp = await admin_c.get("/api/projects")

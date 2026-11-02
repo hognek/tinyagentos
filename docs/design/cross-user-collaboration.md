@@ -138,6 +138,14 @@ CREATE TABLE peer_links (
   scopes. This keeps the JWT/scope world (agents) and the peer world (instances)
   disjoint, so nothing in `VALID_SCOPES` needs to change for humans and the
   equality-tested `_ALLOWED_SCOPES` sync stays untouched.
+- **Token exchange:** the accepter delivers its token in a signed handshake to
+  `POST /api/peer/handshake`, the one peer route with no bearer (the requester
+  holds no token for it yet). It is authenticated by the signature over the key
+  in the envelope body, which must match the `from` fingerprint, plus the
+  requester's own outgoing friend-request (or friend) edge. The requester pins
+  the accepter and answers with a signed `handshake_reply` carrying its own
+  token. Delivery uses the SSRF guard, which allows a private or CGNAT address
+  only for an exact host and port recorded on that contact's peer link.
 
 **Peer token vs. project-level authorization:** the peer token authenticates the
   contact identity and unlocks the route family. However, operations that carry a
@@ -276,7 +284,7 @@ ALTER TABLE agent_registry ADD COLUMN sponsor_contact_id TEXT;  -- NULL for all 
   immutable for the grant lifetime; reject null or mismatched `project_id`
   at every project-scoped route, following the existing scope contract in
   `agent_auth_requests.py`. Anything more
-  (`files_read`, `canvas_write`, `memory_*`, `tools_execute`) requires an explicit,
+  (`files_read`, `canvas_write`, `memory_read`, `memory_write` and `tools_execute`) requires an explicit,
   per-scope Decisions approval and is displayed permanently in the Agents app.
   `files_write` and `decisions_write` are **denied to sponsored identities in v1**
   (enforced in grant minting, not just UX).
@@ -403,7 +411,9 @@ for T0, verified by a test that a guest node cannot reach a second node); persis
 after contact-revoke (cascade is transactional: contact row, peer link,
 memberships, sponsored identities, outbox purge).
 
-**Rate limits:** peer routes 60 req/min/contact, chat 600 msgs/day/contact,
+**Rate limits:** peer routes 60 req/min/contact (a moving window from the
+shared `tinyagentos/rate_limit.py`; the 429 carries `Retry-After`),
+chat 600 msgs/day/contact,
 pending delegation requests at most 3/contact (mirrors invite pending-cap 10
 spirit), envelope size at most 32KB. Hub relay: at most 200 queued
 envelopes/recipient.
@@ -427,6 +437,9 @@ lane (real build/test CI, fork-approval rules apply), FLEET = free-model builder
 - A1 LEAD: `contacts_store` plus `peer_links` plus envelope sign/verify plus peer
   route family plus rate limits.
 - A2 LEAD: friend-accept to contact-row plus handshake wiring (hub subscription).
+  **Deviation:** the peer-link token is minted locally without hub delivery —
+  the token exchange requires both instances to be online simultaneously, which
+  is acceptable for a pilot and avoids hub-trust assumptions for bearer tokens.
 - A3 HOGNEK: hub sealed-envelope relay endpoints on taos.my (T1, not pilot-blocking,
   can trail).
 - A4 FLEET (cards): ContactsApp taOS section UI; presence dots; request

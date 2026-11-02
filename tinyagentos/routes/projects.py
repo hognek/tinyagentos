@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import re
 import time as _time
 import uuid
 
@@ -11,24 +10,33 @@ import json as _json
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from typing import Literal
 
 from tinyagentos.agent_token_auth import (
     PROJECT_SCOPE_MISMATCH_DETAIL,
+    check_agent_project_grants,
     check_agent_scope_for_project,
 )
-from tinyagentos.auth_context import CurrentUser, current_user, require_owner_or_admin
+from tinyagentos.auth_context import CurrentUser, current_user
+from tinyagentos.notification_labels import actor_label, project_label, task_label
+from tinyagentos.projects.element_store import _SLUG_RE
 from tinyagentos.projects.folders import (
     ensure_element_folder,
     ensure_project_layout,
     write_project_yaml,
 )
 from tinyagentos.projects.project_store import ProjectConflict
-from tinyagentos.projects.task_store import _ELEMENT_CLEAR
+from tinyagentos.projects.task_store import TaskStatus
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
-_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,62}$")
+# The documented task status enum surfaced by the kanban read endpoints.  The
+# store itself is more permissive internally (it also tracks ``cancelled`` and
+# ``quarantined``), but the READ/aggregate API surface only advertises these
+# three and must reject anything else rather than silently filter to an empty
+# list (which would hide a caller's typo).
+_TASK_STATUS_ENUM = tuple(member.value for member in TaskStatus)
 
 
 async def _is_field_free(store, field: str, value: str) -> bool:
@@ -90,6 +98,10 @@ class UpdateProjectIn(BaseModel):
     name: str | None = None
     description: str | None = None
     settings: dict | None = None
+
+
+class ProjectSettingIn(BaseModel):
+    value: object
 
 
 def _mirror(request: Request, project: dict) -> None:
@@ -199,26 +211,57 @@ async def update_project(
     request: Request,
     user: CurrentUser = Depends(current_user),
 ):
-    store = request.app.state.project_store
-    p = await store.get_project(project_id)
-    if p is None:
-        return JSONResponse({"error": "not found"}, status_code=404)
-    require_owner_or_admin(user, p["user_id"])
-    await store.update_project(
-        project_id,
-        name=payload.name,
-        description=payload.description,
-        settings=payload.settings,
-    )
-    p = await store.get_project(project_id)
-    await store.log_activity(project_id, user.user_id, "project.updated", payload.model_dump(exclude_none=True))
+    pstore = request.app.state.project_store
+    project_or_err = await _get_owned_project(pstore, project_id, user)
+    if isinstance(project_or_err, JSONResponse):
+        return project_or_err
+    p = project_or_err
+    try:
+        await pstore.update_project(
+            project_id,
+            name=payload.name,
+            description=payload.description,
+            settings=payload.settings,
+        )
+    except ProjectConflict as e:
+        suggestions = await _free_suggestions(pstore, e.field, e.taken)
+        return JSONResponse(
+            {
+                "error": str(e),
+                "field": e.field,
+                "taken": e.taken,
+                "suggestions": suggestions,
+            },
+            status_code=409,
+        )
+    p = await pstore.get_project(project_id)
+    await pstore.log_activity(project_id, user.user_id, "project.updated", payload.model_dump(exclude_none=True))
     _mirror(request, p)
     return p
 
 
-@router.post("/api/projects/{project_id}/archive")
-async def archive_project(
+@router.get("/api/projects/{project_id}/settings/{key}")
+async def get_project_setting_route(
     project_id: str,
+    key: str,
+    request: Request,
+    user: CurrentUser = Depends(current_user),
+):
+    store = request.app.state.project_store
+    p = await store.get_project(project_id)
+    if p is None:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    if not user.is_admin and user.user_id != p["user_id"]:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    value = await store.get_project_setting(project_id, key)
+    return {"key": key, "value": value}
+
+
+@router.put("/api/projects/{project_id}/settings/{key}")
+async def set_project_setting_route(
+    project_id: str,
+    key: str,
+    payload: ProjectSettingIn,
     request: Request,
     user: CurrentUser = Depends(current_user),
 ):
@@ -227,9 +270,29 @@ async def archive_project(
     if p is None:
         return JSONResponse({"error": "not found"}, status_code=404)
     require_owner_or_admin(user, p["user_id"])
-    await store.set_status(project_id, "archived")
-    p = await store.get_project(project_id)
-    await store.log_activity(project_id, user.user_id, "project.archived", {})
+    ok = await store.set_project_setting(project_id, key, payload.value)
+    if not ok:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    await store.log_activity(
+        project_id, user.user_id, "project.settings.updated", {"key": key}
+    )
+    return {"key": key, "value": payload.value}
+
+
+@router.post("/api/projects/{project_id}/archive")
+async def archive_project(
+    project_id: str,
+    request: Request,
+    user: CurrentUser = Depends(current_user),
+):
+    pstore = request.app.state.project_store
+    project_or_err = await _get_owned_project(pstore, project_id, user)
+    if isinstance(project_or_err, JSONResponse):
+        return project_or_err
+    p = project_or_err
+    await pstore.set_status(project_id, "archived")
+    p = await pstore.get_project(project_id)
+    await pstore.log_activity(project_id, user.user_id, "project.archived", {})
     return p
 
 
@@ -239,14 +302,14 @@ async def delete_project(
     request: Request,
     user: CurrentUser = Depends(current_user),
 ):
-    store = request.app.state.project_store
-    project = await store.get_project(project_id)
-    if project is None:
-        return JSONResponse({"error": "not found"}, status_code=404)
-    require_owner_or_admin(user, project["user_id"])
+    pstore = request.app.state.project_store
+    project_or_err = await _get_owned_project(pstore, project_id, user)
+    if isinstance(project_or_err, JSONResponse):
+        return project_or_err
+    project = project_or_err
 
-    await store.set_status(project_id, "deleted")
-    await store.log_activity(project_id, user.user_id, "project.deleted", {})
+    await pstore.set_status(project_id, "deleted")
+    await pstore.log_activity(project_id, user.user_id, "project.deleted", {})
 
     # Archive scoped chat channels
     channels = request.app.state.chat_channels
@@ -267,7 +330,7 @@ async def delete_project(
             "project folder tombstone failed for slug=%s: %s", project.get("slug"), exc
         )
 
-    return await store.get_project(project_id)
+    return await pstore.get_project(project_id)
 
 
 class AddMemberIn(BaseModel):
@@ -286,11 +349,11 @@ async def add_member(
     request: Request,
     user: CurrentUser = Depends(current_user),
 ):
-    store = request.app.state.project_store
-    project = await store.get_project(project_id)
-    if project is None:
-        return JSONResponse({"error": "project not found"}, status_code=404)
-    require_owner_or_admin(user, project["user_id"])
+    pstore = request.app.state.project_store
+    project_or_err = await _get_owned_project(pstore, project_id, user)
+    if isinstance(project_or_err, JSONResponse):
+        return project_or_err
+    project = project_or_err
 
     if payload.mode == "native":
         if not payload.agent_id:
@@ -316,7 +379,7 @@ async def add_member(
     else:
         return JSONResponse({"error": "mode must be native|clone|human"}, status_code=400)
 
-    await store.add_member(
+    await pstore.add_member(
         project_id=project_id,
         member_id=member_id,
         member_kind=member_kind,
@@ -324,11 +387,11 @@ async def add_member(
         source_agent_id=source_agent_id,
         memory_seed=memory_seed,
     )
-    await store.log_activity(
+    await pstore.log_activity(
         project_id, user.user_id, "member.added",
         {"member_id": member_id, "kind": member_kind, "memory_seed": memory_seed},
     )
-    members = await store.list_members(project_id)
+    members = await pstore.list_members(project_id)
     _mirror(request, {**project, "members": members})
     try:
         from tinyagentos.projects.a2a import ensure_a2a_channel
@@ -376,31 +439,101 @@ async def set_project_lead(
     Session-only (owner or admin, same gate as the members routes). A member id
     not in the project returns 404.
     """
-    store = request.app.state.project_store
-    p = await store.get_project(project_id)
-    if p is None:
-        return JSONResponse({"error": "not found"}, status_code=404)
-    require_owner_or_admin(user, p["user_id"])
+    pstore = request.app.state.project_store
+    project_or_err = await _get_owned_project(pstore, project_id, user)
+    if isinstance(project_or_err, JSONResponse):
+        return project_or_err
+    p = project_or_err
     try:
-        await store.set_lead(project_id, body.member_id)
+        await pstore.set_lead(project_id, body.member_id)
     except KeyError as e:
         return JSONResponse({"error": str(e)}, status_code=404)
-    await store.log_activity(
+    await pstore.log_activity(
         project_id, user.user_id, "project.lead_changed", {"member_id": body.member_id}
     )
-    members = await store.list_members(project_id)
+    members = await pstore.list_members(project_id)
     _mirror(request, {**p, "members": members})
     try:
         from tinyagentos.projects.a2a import ensure_a2a_channel
         await ensure_a2a_channel(
             request.app.state.chat_channels,
-            store,
+            pstore,
             project_id,
             config=getattr(request.app.state, "config", None),
         )
     except Exception:
         logger.warning("a2a ensure failed for project %s on set_lead", project_id, exc_info=True)
     return {"ok": True, "lead_member_id": body.member_id}
+
+
+async def _cloud_agent_canonical_id(request: Request, project_id: str, member_id: str) -> "str | None":
+    """Return ``member_id`` when that identity was minted by redeeming a kind
+    'cloud_agent' invite on this project, else None.
+
+    Lookup chain: the member row's member_id is the registry canonical_id; the
+    redeemed invite records the auth request it created
+    (``redeemed_request_id``), and that request's decision carries the minted
+    ``canonical_id``. The handle in ``redeemed_by`` is not used: handles are
+    re-issued once the old identity is gone, the canonical_id never is.
+    """
+    invites = getattr(request.app.state, "project_invites", None)
+    auth_store = getattr(request.app.state, "auth_requests", None)
+    if invites is None or auth_store is None:
+        return None
+    for inv in await invites.list_for_project(project_id):
+        if inv.get("kind") != "cloud_agent" or inv.get("status") != "redeemed":
+            continue
+        req_id = inv.get("redeemed_request_id")
+        if not req_id:
+            continue
+        record = await auth_store.get(req_id)
+        if record and record.get("canonical_id") == member_id:
+            return member_id
+    return None
+
+
+async def _revoke_cloud_agent_identity(
+    request: Request, project_id: str, member_id: str, user: CurrentUser
+) -> None:
+    """Revoke the registry identity of a cloud_agent member being removed (G5).
+
+    A cloud agent's identity exists only for the project it was invited to, so
+    removing it from the project also kills its token: the canonical_id lands
+    on GET /api/agents/registry/revoked and every agent-JWT route refuses it.
+    Members from kind 'agent' invites (and every other member) are untouched.
+    Uses the same store transition + governance audit as
+    DELETE /api/agents/registry/{id}.
+    """
+    canonical_id = await _cloud_agent_canonical_id(request, project_id, member_id)
+    if canonical_id is None:
+        return
+    from tinyagentos.routes.agent_registry import _audit_governance, _get_store
+
+    registry = _get_store(request)
+    record = await registry.get(canonical_id)
+    if record is None or record.get("status") == "revoked":
+        return
+    before_status = record.get("status") or "active"
+    try:
+        await registry.revoke(canonical_id)
+    except ValueError:
+        # Re-read to handle concurrent revoke during cloud_agent member removal
+        record = await registry.get(canonical_id)
+        if record is None or record.get("status") == "revoked":
+            # The revoke already happened, continue to remove_member
+            return
+        # Re-raise if the status hasn't changed
+        raise
+    await _audit_governance(
+        request,
+        action="revoke",
+        canonical_id=canonical_id,
+        actor_user_id=user.user_id,
+        before_status=before_status,
+        after_status="revoked",
+        reason="cloud_agent member removed",
+        project_id=project_id,
+    )
 
 
 @router.delete("/api/projects/{project_id}/members/{member_id}")
@@ -410,14 +543,18 @@ async def remove_member(
     request: Request,
     user: CurrentUser = Depends(current_user),
 ):
-    store = request.app.state.project_store
-    project = await store.get_project(project_id)
-    if project is None:
-        return JSONResponse({"error": "not found"}, status_code=404)
-    require_owner_or_admin(user, project["user_id"])
-    await store.remove_member(project_id, member_id)
-    await store.log_activity(project_id, user.user_id, "member.removed", {"member_id": member_id})
-    members = await store.list_members(project_id)
+    pstore = request.app.state.project_store
+    project_or_err = await _get_owned_project(pstore, project_id, user)
+    if isinstance(project_or_err, JSONResponse):
+        return project_or_err
+    project = project_or_err
+    # Revoke BEFORE removing the row: if the revoke fails the member is still
+    # listed and the owner can retry, instead of a gone member whose token
+    # stays live.
+    await _revoke_cloud_agent_identity(request, project_id, member_id, user)
+    await pstore.remove_member(project_id, member_id)
+    await pstore.log_activity(project_id, user.user_id, "member.removed", {"member_id": member_id})
+    members = await pstore.list_members(project_id)
     _mirror(request, {**project, "members": members})
     try:
         from tinyagentos.projects.a2a import ensure_a2a_channel
@@ -469,6 +606,8 @@ class _TaskRequestModelMixin:
 
 
 class CreateTaskIn(_TaskRequestModelMixin, BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     title: str
     body: str = ""
     priority: int = 0
@@ -477,18 +616,64 @@ class CreateTaskIn(_TaskRequestModelMixin, BaseModel):
     parent_task_id: str | None = None
     element_id: str | None = None
 
+    @model_validator(mode="after")
+    def _assert_body_for_claimable(self) -> CreateTaskIn:
+        labels = self.labels
+        has_claimable = any(l.strip().lower() == "claimable" for l in labels)
+        if has_claimable and not self.body.strip():
+            raise ValueError(
+                "Claimable cards must have a non-empty body"
+            )
+        return self
+
+
+# Task columns the PATCH route can write as NULL, i.e. the fields for which an
+# explicit ``null`` is a real edit ("unassign me", "orphan this card") rather
+# than a typo.  Every other field must carry a value.
+_NULLABLE_TASK_FIELDS = frozenset({"assignee_id", "parent_task_id", "element_id"})
+
 
 class UpdateTaskIn(_TaskRequestModelMixin, BaseModel):
+    # extra="forbid", as on CreateTaskIn: a key this route cannot write -- a
+    # misspelling, or a read-only column such as id/created_by/claimed_by -- is
+    # refused 422 instead of being answered 200 with the task it did not change
+    # (tsk-5xq2mw).  A dropped write that reports success passes every caller
+    # check short of a re-read.
+    model_config = ConfigDict(extra="forbid")
+
     title: str | None = None
     body: str | None = None
     priority: int | None = None
     labels: list[str] | None = None
-    status: str | None = None
+    status: TaskStatus | None = None
+    # Omitted -> unchanged; null -> cleared (the board's "Unassigned" and
+    # "Orphans" lanes send exactly that).
     assignee_id: str | None = None
     parent_task_id: str | None = None
-    # Omit to leave the element tag unchanged; send "none" to clear it to
-    # project-level (NULL); send a real element id to move the task.
+    # Omit to leave the element tag unchanged; send null (or the legacy "none"
+    # string) to clear it to project-level; send a real element id to move the
+    # task.
     element_id: str | None = None
+
+    @model_validator(mode="after")
+    def _reject_null_on_non_nullable_fields(self) -> UpdateTaskIn:
+        """A null for a column that cannot hold one is a caller mistake.
+
+        Treating it as "field omitted" would answer 200 with the unchanged
+        task -- the same silent drop this route is being fixed for -- so it is
+        a 422 naming the offending fields.
+        """
+        nulled = sorted(
+            f
+            for f in self.model_fields_set
+            if f not in _NULLABLE_TASK_FIELDS and getattr(self, f) is None
+        )
+        if nulled:
+            raise ValueError(
+                f"{', '.join(nulled)}: null is not a valid value; "
+                "omit the field to leave it unchanged"
+            )
+        return self
 
 
 class ClaimIn(_TaskRequestModelMixin, BaseModel):
@@ -497,6 +682,7 @@ class ClaimIn(_TaskRequestModelMixin, BaseModel):
 
 class ReleaseIn(_TaskRequestModelMixin, BaseModel):
     releaser_id: str
+    strike: bool = True
 
 
 class CloseIn(_TaskRequestModelMixin, BaseModel):
@@ -539,7 +725,12 @@ async def _require_task_in_project(
 
 
 async def _authorize_task_actor(
-    request: Request, pstore, project_id: str, scope: str = "project_tasks"
+    request: Request,
+    pstore,
+    project_id: str,
+    scope: str = "project_tasks",
+    agent_grants: "dict[str, dict] | None" = None,
+    agent_canonical_id: "str | None" = None,
 ) -> "tuple[str, bool, dict] | JSONResponse":
     """Resolve the actor for a task route that accepts EITHER a session
     owner/admin OR an approved external agent's registry JWT holding ``scope``
@@ -548,6 +739,16 @@ async def _authorize_task_actor(
     ``scope`` is a parameter because authoring uses a SEPARATE, narrower grant
     (``project_tasks_create``): project_tasks is documented and tested as read
     plus lifecycle plus comments, so creation must not ride on it.
+
+    ``agent_grants`` / ``agent_canonical_id`` are an optional fast path for the
+    cross-project aggregate: the caller resolves the agent's identity + grant
+    map ONCE (via ``check_agent_project_grants``) and passes the ``{project_id:
+    grant}`` lookup here so the per-project authorization is an O(1) dict
+    membership instead of re-verifying the token and re-fetching
+    ``list_grants`` for every project (an O(K) grant-store N+1).  The security
+    invariants are unchanged -- membership in the pre-built map is exactly the
+    same active-grant-bound-to-project predicate ``check_agent_scope_for_project``
+    enforces, and the identity/active/rotation checks already ran once upstream.
 
     Returns ``(actor_id, is_agent, project)`` on success, or a JSONResponse to
     return directly.  These routes take ``request: Request`` and auth INSIDE the
@@ -570,6 +771,21 @@ async def _authorize_task_actor(
         if isinstance(project_or_err, JSONResponse):
             return project_or_err
         return (user.user_id, False, project_or_err)
+
+    if agent_grants is not None:
+        # Grant-aware fast path (aggregate): the caller already verified the
+        # agent and built the active project_tasks -> grant map once.  A missing
+        # entry means "no active grant bound to this project" -> same
+        # existence-hiding 404 as the slow path, so it never confirms a
+        # project the agent is not entitled to.
+        if agent_canonical_id is None:
+            raise ValueError("canonical_id required with agent_grants")
+        if project_id not in agent_grants:
+            return JSONResponse({"error": "not found"}, status_code=404)
+        project = await pstore.get_project(project_id)
+        if project is None:
+            return JSONResponse({"error": "not found"}, status_code=404)
+        return (agent_canonical_id, True, project)
 
     try:
         caller = await check_agent_scope_for_project(
@@ -632,6 +848,17 @@ async def _authorize_project_lead(
     if project.get("lead_member_id") != caller:
         return JSONResponse({"error": "not found"}, status_code=404)
     return (caller, True, project)
+
+
+async def _task_event_message(
+    request: Request, task: dict, task_id: str, verb: str, actor_id: "str | None"
+) -> str:
+    """Notification text for a task lifecycle event, by name rather than id:
+    '"Fix login" closed by Jay on taOS' (tsk-i7ghpa)."""
+    state = request.app.state
+    actor = await actor_label(state, actor_id)
+    project = await project_label(state, task.get("project_id"))
+    return f"{task_label(task, task_id)} {verb} by {actor} on {project}"
 
 
 def _resolve_actor(
@@ -727,7 +954,7 @@ async def create_task(
 async def list_tasks(
     project_id: str,
     request: Request,
-    status: str | None = None,
+    status: TaskStatus | None = None,
     element_id: str | None = None,
 ):
     pstore = request.app.state.project_store
@@ -738,18 +965,154 @@ async def list_tasks(
     return {"items": await store.list_tasks(project_id=project_id, status=status, element_id=element_id)}
 
 
+async def _caller_project_candidates(
+    request: Request, pstore
+) -> "tuple[list[dict], dict[str, dict] | None, str | None]":
+    """Candidate projects for the cross-project kanban aggregate.
+
+    This is scoped ENUMERATION, not authorization: it returns only projects the
+    caller could already name for itself, and the per-project
+    ``_authorize_task_actor`` gate applied by the aggregate route remains the
+    authoritative check (defence in depth).  It must never surface a project the
+    caller is not entitled to:
+
+      * session owner/admin -> own projects (``list_for_user``) or all (admin);
+      * registry-JWT agent   -> only projects it holds an active
+        ``project_tasks`` grant for (grant-gated, taOS #1862).
+
+    A caller with neither a session nor a Bearer never reaches this helper (the
+    auth middleware 401s first), so the empty fallbacks below are belt-and-braces
+    rather than the primary gate.
+
+    Returns ``(projects, agent_grants, canonical_id)``: for a session
+    owner/admin the last two are ``(None, None)``; for a registry-JWT agent
+    ``agent_grants`` is the active ``project_tasks`` -> grant map resolved by a
+    SINGLE ``check_agent_project_grants`` call (so the aggregate's per-project
+    re-check is O(1) rather than an O(K) grant-store N+1), and ``canonical_id``
+    is the verified agent identity.
+    """
+    uid = getattr(request.state, "user_id", None)
+    if uid:
+        user = CurrentUser(
+            user_id=uid, is_admin=bool(getattr(request.state, "is_admin", False))
+        )
+        if user.is_admin:
+            return await pstore.list_projects(status="active"), None, None
+        return await pstore.list_for_user(uid, status="active"), None, None
+
+    # No session: a registry-JWT agent (the middleware only passes a Bearer
+    # through on the allowlist and leaves user_id=None).  Resolve WHO the agent
+    # is AND its active project_tasks grants in one grant-store read.
+    canonical_id, grants_by_project = await check_agent_project_grants(
+        request, "project_tasks"
+    )
+    if not canonical_id:
+        return [], None, None
+    projects: list[dict] = []
+    for pid in grants_by_project:
+        p = await pstore.get_project(pid)
+        if p is not None:
+            projects.append(p)
+    return projects, grants_by_project, canonical_id
+
+
+@router.get("/api/projects/tasks/aggregate")
+async def list_tasks_aggregate(
+    request: Request,
+    status: str | None = None,
+):
+    """Cross-project aggregate of the caller's kanban boards (READ ONLY).
+
+    Returns every project the caller is authorized to see -- its own boards for
+    a session owner, or the boards it holds a ``project_tasks`` grant for as an
+    agent -- each with that project's tasks.  The per-project
+    ``_authorize_task_actor`` gate is applied to EVERY candidate, so a caller
+    entitled to project A can never receive project B in the aggregate (the
+    whole point of this endpoint).  ``status`` filters tasks to
+    ``open`` / ``claimed`` / ``closed`` and is validated up front (400 on
+    anything else), so a typo is surfaced rather than silently returning an
+    empty board.
+    """
+    if status is not None and status not in _TASK_STATUS_ENUM:
+        return JSONResponse(
+            {"error": f"invalid status {status!r}; must be one of open|claimed|closed"},
+            status_code=400,
+        )
+    pstore = request.app.state.project_store
+    store = request.app.state.project_task_store
+    candidates, agent_grants, agent_canonical_id = await _caller_project_candidates(
+        request, pstore
+    )
+    items: list[dict] = []
+    for project in candidates:
+        # The agent's grant map (and canonical_id) is resolved ONCE upstream and
+        # reused here so the per-project check is O(1); for a session caller
+        # agent_grants is None and _authorize_task_actor takes its normal path.
+        try:
+            auth = await _authorize_task_actor(
+                request,
+                pstore,
+                project["id"],
+                scope="project_tasks",
+                agent_grants=agent_grants,
+                agent_canonical_id=agent_canonical_id,
+            )
+        except HTTPException:
+            # Any per-project authorization failure (agent not active, token
+            # superseded, grant revoked mid-iteration, ...) is swallowed: a
+            # project the caller is not entitled to is simply omitted rather
+            # than aborting the whole aggregate with an unhandled 403/500 after
+            # some boards were already collected.
+            continue
+        if isinstance(auth, JSONResponse):
+            # Not authorized for THIS project -> excluded from the aggregate, so
+            # it cannot leak another project's board to the caller.
+            continue
+        # Re-check status inside the loop (TOCTOU defence): a project archived
+        # between the candidate listing and this per-project check must NOT leak
+        # into the response -- the aggregate contract is "active projects only".
+        # Read the FRESH object returned by _authorize_task_actor (auth[2]) rather
+        # than the stale `project` loop variable from the candidates snapshot,
+        # which may still report "active" after the project was archived.
+        fresh_project = auth[2]
+        if (fresh_project or {}).get("status") != "active":
+            continue
+        tasks = await store.list_tasks(project_id=project["id"], status=status)
+        items.append(
+            {
+                "project_id": project["id"],
+                "name": project.get("name"),
+                "slug": project.get("slug"),
+                "tasks": tasks,
+            }
+        )
+    return {"items": items}
+
+
 @router.get("/api/projects/{project_id}/tasks/ready")
 async def ready_tasks(
     project_id: str,
     request: Request,
     element_id: str | None = None,
+    limit: int = 50,
 ):
+    """List ready (open, unclaimed, unblocked) tasks for the project.
+
+    ``limit`` is clamped to ``[1, 500]`` in the store: a floor of 1 stops
+    ``?limit=0`` / negative inputs from being silently widened to unbounded
+    or the default 50 (the LIMIT -1 SQLite trap, see taosmd #415), and the
+    500 cap keeps the route from streaming an unreasonable window back to a
+    caller.  The view honours the ``blocked-on:<id>`` label convention
+    alongside ``task_relationships`` edges (defect tsk-wkah3z).
+    """
     pstore = request.app.state.project_store
     auth = await _authorize_task_actor(request, pstore, project_id)
     if isinstance(auth, JSONResponse):
         return auth
     store = request.app.state.project_task_store
-    return {"items": await store.list_ready_tasks(project_id=project_id, element_id=element_id)}
+    return {"items": await store.list_ready_tasks(
+        project_id=project_id, element_id=element_id, limit=limit
+    )}
 
 
 @router.get("/api/projects/{project_id}/tasks/{task_id}")
@@ -766,6 +1129,10 @@ async def get_task(
     t = await store.get_task(task_id)
     if t is None or t["project_id"] != project_id:
         return JSONResponse({"error": "not found"}, status_code=404)
+    strikes = getattr(request.app.state, "task_strikes", None)
+    if strikes is not None:
+        t["strike_count"] = await strikes.count_strikes(task_id)
+        t["latest_strike"] = await strikes.latest(task_id)
     return t
 
 
@@ -811,13 +1178,16 @@ async def update_task(
             )
 
     # Field whitelist for agents: title, body, labels, priority ONLY.
-    # Any other field that is set is rejected 403 (future fields included)
+    # Any other field the caller SENT is rejected 403 (future fields included)
     # so the surface stays minimal and future task fields are protected by
     # default. assignee_id and parent_task_id stay human-only: an agent may
-    # not reassign work to itself or rewire hierarchies.
+    # not reassign work to itself or rewire hierarchies -- including by
+    # clearing them, which is why this keys on which fields were sent rather
+    # than on their value (an explicit null is a write too, tsk-5xq2mw).
+    sent = payload.model_fields_set
     if is_agent:
-        for f in payload.model_fields:
-            if f not in _AGENT_EDITABLE_FIELDS and getattr(payload, f) is not None:
+        for f in sorted(sent):
+            if f not in _AGENT_EDITABLE_FIELDS:
                 return JSONResponse(
                     {"error": f"field {f!r} is not editable by agents"},
                     status_code=403,
@@ -839,14 +1209,17 @@ async def update_task(
             cur = await store.get_task(cur["parent_task_id"])
 
     estore = request.app.state.project_element_store
+    # Keyed on what the caller SENT: an omitted field is unchanged, a field
+    # sent as null clears its column (the model has already refused a null on
+    # a column that cannot hold one).
     update_fields: dict = {}
     for f in ("title", "body", "priority", "labels", "status", "assignee_id", "parent_task_id"):
-        v = getattr(payload, f)
-        if v is not None:
-            update_fields[f] = v
-    if payload.element_id is not None:
-        if payload.element_id == "none":
-            update_fields["element_id"] = _ELEMENT_CLEAR
+        if f in sent:
+            update_fields[f] = getattr(payload, f)
+    if "element_id" in sent:
+        # "none" is the legacy spelling of the clear; a real null means the same.
+        if payload.element_id is None or payload.element_id == "none":
+            update_fields["element_id"] = None
         else:
             el_check = await _require_active_element(estore, project_id, payload.element_id)
             if isinstance(el_check, JSONResponse):
@@ -896,7 +1269,11 @@ async def claim_task(
     await pstore.log_activity(project_id, claimer_id, "task.claimed", {"task_id": task_id})
     notifs = getattr(request.app.state, "notifications", None)
     if notifs is not None:
-        await notifs.emit_event("task.claimed", "Task claimed", f"{task_id} claimed by {claimer_id}")
+        await notifs.emit_event(
+            "task.claimed",
+            "Task claimed",
+            await _task_event_message(request, existing, task_id, "claimed", claimer_id),
+        )
     return await store.get_task(task_id)
 
 
@@ -919,6 +1296,10 @@ async def mark_task_claimable(
     ``claimable`` label and preserves every other label, so granting it to the
     lead agent does not widen the ``project_tasks`` scope beyond a single-label
     toggle.
+
+    The grant adds only ``claimable`` (following the free-builders convention),
+    but the revoke removes BOTH ``claimable`` and ``fleet:claimable`` because
+    safety is paramount: the dispatcher must not select this card after a hold.
     """
     pstore = request.app.state.project_store
     auth = await _authorize_project_lead(request, pstore, project_id)
@@ -930,11 +1311,12 @@ async def mark_task_claimable(
     if existing is None or existing["project_id"] != project_id:
         return JSONResponse({"error": "not found"}, status_code=404)
     labels = list(existing.get("labels") or [])
-    has = "claimable" in labels
-    if payload.claimable and not has:
+    has_claimable = "claimable" in labels
+    has_fleet = "fleet:claimable" in labels
+    if payload.claimable and not has_claimable:
         labels.append("claimable")
-    elif not payload.claimable and has:
-        labels = [lbl for lbl in labels if lbl != "claimable"]
+    elif not payload.claimable and (has_claimable or has_fleet):
+        labels = [lbl for lbl in labels if lbl not in ("claimable", "fleet:claimable")]
     else:
         return await store.get_task(task_id)  # already in the requested state
     await store.update_task(task_id, labels=labels)
@@ -952,6 +1334,15 @@ async def release_task(
     payload: ReleaseIn,
     request: Request,
 ):
+    """Release a claimed task back to the ready pool.
+
+    The request body accepts ``releaser_id`` (required) and ``strike`` (optional,
+    defaults to ``true``).  When ``strike`` is ``false`` the release clears the
+    claim and returns the task to ``open`` without recording a dispatch-failed
+    strike or quarantining the card.  Callers that release a task because the
+    executor killed the run (watchdog, model hang, tooling fault) should set
+    ``strike`` to ``false`` so those innocent exits do not accumulate strikes.
+    """
     pstore = request.app.state.project_store
     auth = await _authorize_task_actor(request, pstore, project_id)
     if isinstance(auth, JSONResponse):
@@ -964,7 +1355,7 @@ async def release_task(
     existing = await store.get_task(task_id)
     if existing is None or existing["project_id"] != project_id:
         return JSONResponse({"error": "not found"}, status_code=404)
-    ok = await store.release_task(task_id, releaser_id)
+    ok = await store.release_task(task_id, releaser_id, strike=payload.strike)
     if not ok:
         return JSONResponse({"error": "not claimed by releaser"}, status_code=409)
     _beads_mark_dirty(request, project_id)
@@ -990,14 +1381,35 @@ async def close_task(
     existing = await store.get_task(task_id)
     if existing is None or existing["project_id"] != project_id:
         return JSONResponse({"error": "not found"}, status_code=404)
-    ok = await store.close_task(task_id, closed_by=closed_by, reason=payload.reason)
+    # Ownership-guard bypass: a card claimed by one agent may still be closed
+    # by the project lead (lead_member_id), the project owner (user_id), or a
+    # session admin.  The lead is typically an AGENT registry id, so an
+    # admin/owner session caller (a USER id) can never equal it -- widen the
+    # bypass to cover all three (issue #2191).
+    force = (
+        project.get("lead_member_id") == actor_id
+        or project.get("user_id") == actor_id
+        or bool(getattr(request.state, "is_admin", False))
+    )
+    if not force and not existing.get("claimed_by") and existing.get("created_by") != closed_by:
+        return JSONResponse(
+            {"error": "only the card's author, the project lead, owner or an admin may close an unclaimed card"},
+            status_code=403,
+        )
+    ok = await store.close_task(task_id, closed_by=closed_by, reason=payload.reason, force=force)
     if not ok:
+        if existing.get("claimed_by") and existing["claimed_by"] != closed_by:
+            return JSONResponse({"error": "not claimed by you"}, status_code=409)
         return JSONResponse({"error": "cannot close"}, status_code=409)
     _beads_mark_dirty(request, project_id)
     await pstore.log_activity(project_id, closed_by, "task.closed", {"task_id": task_id})
     notifs = getattr(request.app.state, "notifications", None)
     if notifs is not None:
-        await notifs.emit_event("task.closed", "Task closed", f"{task_id} closed by {closed_by}")
+        await notifs.emit_event(
+            "task.closed",
+            "Task closed",
+            await _task_event_message(request, existing, task_id, "closed", closed_by),
+        )
     task = await store.get_task(task_id)
     qmd = getattr(request.app.state, "qmd_client", None)
     if qmd is not None and task is not None:
@@ -1039,7 +1451,49 @@ async def reopen_task(
     await pstore.log_activity(project_id, actor, "task.reopened", {"task_id": task_id})
     notifs = getattr(request.app.state, "notifications", None)
     if notifs is not None:
-        await notifs.emit_event("task.reopened", "Task reopened", f"{task_id} reopened by {actor}")
+        await notifs.emit_event(
+            "task.reopened",
+            "Task reopened",
+            await _task_event_message(request, existing, task_id, "reopened", actor),
+        )
+    return await store.get_task(task_id)
+
+
+@router.post("/api/projects/{project_id}/tasks/{task_id}/unquarantine")
+async def unquarantine_task(
+    project_id: str,
+    task_id: str,
+    request: Request,
+):
+    """Return a quarantined card to the open pool and clear its strikes.
+
+    LEAD-only curation, mirroring mark_task_claimable: only a project LEAD
+    (session owner/admin, or the lead agent's ``project_tasks`` token) may
+    retry a quarantined card -- a plain project_tasks worker cannot self
+    un-quarantine. See ProjectTaskStore.unquarantine_task for the strike-clear
+    behaviour.
+    """
+    pstore = request.app.state.project_store
+    auth = await _authorize_project_lead(request, pstore, project_id)
+    if isinstance(auth, JSONResponse):
+        return auth
+    actor_id, _is_agent, _project = auth
+    store = request.app.state.project_task_store
+    existing = await store.get_task(task_id)
+    if existing is None or existing["project_id"] != project_id:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    ok = await store.unquarantine_task(task_id, actor_id)
+    if not ok:
+        return JSONResponse({"error": "task is not quarantined"}, status_code=409)
+    _beads_mark_dirty(request, project_id)
+    await pstore.log_activity(project_id, actor_id, "task.unquarantined", {"task_id": task_id})
+    notifs = getattr(request.app.state, "notifications", None)
+    if notifs is not None:
+        await notifs.emit_event(
+            "task.unquarantined",
+            "Task unquarantined",
+            await _task_event_message(request, existing, task_id, "unquarantined", actor_id),
+        )
     return await store.get_task(task_id)
 
 
@@ -1143,6 +1597,76 @@ class AddCommentIn(_TaskRequestModelMixin, BaseModel):
     replies_to_comment_id: str | None = None
 
 
+class CreateChecklistItemIn(_TaskRequestModelMixin, BaseModel):
+    text: str
+
+
+# ---------------------------------------------------------------------------
+# Checklist routes
+# ---------------------------------------------------------------------------
+
+@router.post("/api/projects/{project_id}/tasks/{task_id}/checklist-items")
+async def create_checklist_item(
+    project_id: str,
+    task_id: str,
+    payload: CreateChecklistItemIn,
+    request: Request,
+):
+    """Create a checklist item for a task.
+
+    Authorized as session owner/admin or an agent holding
+    ``project_tasks_create`` on this project.
+    """
+    pstore = request.app.state.project_store
+    auth = await _authorize_task_actor(
+        request, pstore, project_id, scope="project_tasks_create"
+    )
+    if isinstance(auth, JSONResponse):
+        return auth
+    actor_id, _is_agent, _project = auth
+    store = request.app.state.project_task_store
+    t = await _require_task_in_project(store, project_id, task_id)
+    if isinstance(t, JSONResponse):
+        return t
+    item = await store.create_checklist_item(
+        task_id=task_id,
+        text=payload.text,
+        created_by=actor_id,
+    )
+    _beads_mark_dirty(request, project_id)
+    await pstore.log_activity(
+        project_id, actor_id, "checklist.item.created", {"task_id": task_id, "item_id": item["id"], "text": item["text"]}
+    )
+    return item
+
+
+@router.get("/api/projects/{project_id}/tasks/{task_id}/checklist-items")
+async def list_checklist_items(
+    project_id: str,
+    task_id: str,
+    request: Request,
+    include_archived: bool = False,
+):
+    """List checklist items for a task.
+
+    By default shows only non-archived items. Set ``include_archived=true``
+    to see all items including archived ones.
+    """
+    pstore = request.app.state.project_store
+    auth = await _authorize_task_actor(request, pstore, project_id)
+    if isinstance(auth, JSONResponse):
+        return auth
+    store = request.app.state.project_task_store
+    guard = await _require_task_in_project(store, project_id, task_id)
+    if isinstance(guard, JSONResponse):
+        return guard
+    items = await store.list_checklist_items(
+        task_id=task_id,
+        include_archived=include_archived,
+    )
+    return {"items": items}
+
+
 @router.post("/api/projects/{project_id}/tasks/{task_id}/comments")
 async def add_comment(
     project_id: str,
@@ -1167,6 +1691,8 @@ async def add_comment(
     guard = await _require_task_in_project(store, project_id, task_id)
     if isinstance(guard, JSONResponse):
         return guard
+    if not payload.body or not payload.body.strip():
+        return JSONResponse({"error": "comment body must not be empty"}, status_code=422)
     try:
         return await store.add_comment(
             task_id=task_id,
@@ -1200,7 +1726,7 @@ async def list_relationships(
     project_id: str,
     task_id: str,
     request: Request,
-    direction: str = "from",
+    direction: Literal["from", "to"] = "from",
     user: CurrentUser = Depends(current_user),
 ):
     pstore = request.app.state.project_store
@@ -1266,7 +1792,8 @@ async def project_events(
     if isinstance(project_or_err, JSONResponse):
         return project_or_err
     broker = request.app.state.project_event_broker
-    queue = await broker.subscribe(project_id)
+    last_event_id = request.headers.get("last-event-id")
+    queue = await broker.subscribe(project_id, last_event_id=last_event_id)
 
     async def event_stream():
         try:
@@ -1276,7 +1803,11 @@ async def project_events(
                 try:
                     ev = await _asyncio.wait_for(queue.get(), timeout=15.0)
                     payload = {"kind": ev.kind, "payload": ev.payload, "ts": ev.ts}
-                    yield f"data: {_json.dumps(payload)}\n\n"
+                    lines = [f"data: {_json.dumps(payload)}"]
+                    if ev.id is not None:
+                        lines.append(f"id: {ev.id}")
+                    lines.append("")
+                    yield "\n".join(lines) + "\n"
                 except _asyncio.TimeoutError:
                     yield ": heartbeat\n\n"
         finally:
@@ -1485,7 +2016,7 @@ async def delete_element(
     project_id: str,
     element_id: str,
     request: Request,
-    mode: str = "strict",
+    mode: Literal["strict", "untag"] = "strict",
     user: CurrentUser = Depends(current_user),
 ):
     pstore = request.app.state.project_store

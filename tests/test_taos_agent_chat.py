@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -17,6 +18,7 @@ import yaml
 from httpx import ASGITransport, AsyncClient
 
 from tinyagentos.app import create_app
+from taos_test_csrf import csrf_event_hooks
 
 
 # ---------------------------------------------------------------------------
@@ -60,6 +62,7 @@ async def client(app):
         transport=transport,
         base_url="http://test",
         cookies={"taos_session": token},
+        event_hooks=csrf_event_hooks(),
     ) as c:
         yield c
     await ds.close()
@@ -78,9 +81,23 @@ def _fake_server(base_url: str = "http://127.0.0.1:4188"):
 
 
 def _make_mock_proxy(running: bool = True):
-    proxy = MagicMock()
-    proxy.is_running.return_value = running
-    return proxy
+    """A key-service stand-in. ``running`` used to mean "LiteLLM is up"; with
+    LiteLLM gone the only LLM path is the gateway, so the chat route's
+    gateway check is what these tests steer instead (see the autouse
+    ``_gateway_can_serve`` fixture and ``test_chat_no_gateway_path_returns_503``)."""
+    return MagicMock(spec=["port", "create_agent_key", "update_agent_key"])
+
+
+@pytest.fixture(autouse=True)
+def _gateway_can_serve(monkeypatch):
+    """The chat route refuses (503) a model the gateway cannot route; these
+    tests are about the opencode turn, not routing, so the gateway can serve."""
+    import tinyagentos.routes.taos_agent as ta_module
+
+    async def no_problem(app_state, model, prefs):
+        return None
+
+    monkeypatch.setattr(ta_module, "opencode_gateway_problem", no_problem)
 
 
 def _parse_ndjson(text: str) -> list[dict]:
@@ -110,10 +127,15 @@ async def test_chat_no_model_returns_400(client):
 
 
 @pytest.mark.asyncio
-async def test_chat_proxy_not_running_returns_503(client, app):
-    """POST /api/taos-agent/chat when proxy not running → 503."""
+async def test_chat_no_gateway_path_returns_503(client, app, monkeypatch):
+    """POST /api/taos-agent/chat when the gateway cannot serve the model → 503."""
+    import tinyagentos.routes.taos_agent as ta_module
+
+    async def problem(app_state, model, prefs):
+        return "the taOS LLM gateway cannot serve it: model 'gpt-4o' is not in the routing table"
+
+    monkeypatch.setattr(ta_module, "opencode_gateway_problem", problem)
     await client.patch("/api/taos-agent/settings", json={"model": "gpt-4o"})
-    app.state.llm_proxy = _make_mock_proxy(running=False)
 
     resp = await client.post(
         "/api/taos-agent/chat",
@@ -296,6 +318,208 @@ async def test_chat_error_path_ndjson(client, app, monkeypatch):
     assert items[-1] == {"done": True}
 
 
+@pytest.mark.asyncio
+async def test_chat_queued_message_survives_turn_error(client, app, monkeypatch):
+    """A message queued mid-turn is surfaced even when the turn ERRORS.
+
+    The sink's error path enqueues _DONE early, which used to strand the
+    queued-message frames _drive's finally emits behind it in a queue nobody
+    read - the queued user's message silently evaporated on the most common
+    failure (a model-proxy error). The generator now drains the settled
+    queue after the early _DONE.
+    """
+    await client.patch("/api/taos-agent/settings", json={"model": "gpt-4o"})
+    app.state.llm_proxy = _make_mock_proxy(running=True)
+    app.state.taos_opencode_password = "testpw"
+    app.state.taos_opencode_session_id = None
+
+    server = _fake_server()
+
+    async def fake_ensure_server(state, model):
+        return server
+
+    monkeypatch.setattr(
+        "tinyagentos.routes.taos_agent.ensure_taos_opencode_server",
+        fake_ensure_server,
+    )
+
+    class _QueueThenErrorAdapter:
+        def __init__(self, cfg, sink):
+            self._sink = sink
+            self.session_id = None
+
+        async def ensure_session(self):
+            self.session_id = "ses_qerr"
+
+        async def prompt(self, text, trace_id=None, attachments=None):
+            # A second user message lands while this turn is in flight...
+            loop = app.state.taos_agent_loop
+            from tinyagentos.agent_loop import LoopAction
+            action = await loop.handle_message("urgent follow-up", msg_id="q1")
+            assert action is LoopAction.QUEUED
+            # ...and then the turn fails (the common model-proxy shape).
+            self._sink({"kind": "error", "error": "proxy exploded"})
+
+        async def close(self):
+            pass
+
+    monkeypatch.setattr(
+        "tinyagentos.routes.taos_agent.OpenCodeAdapter",
+        _QueueThenErrorAdapter,
+    )
+
+    resp = await client.post(
+        "/api/taos-agent/chat",
+        json={"messages": [{"role": "user", "content": "Hi"}]},
+    )
+    assert resp.status_code == 200
+    assert "urgent follow-up" in resp.text
+    items = _parse_ndjson(resp.text)
+    assert items[-1] == {"done": True}
+    # And the loop is back to IDLE - the failed turn must not wedge it.
+    assert app.state.taos_agent_loop.state.value == "idle"
+
+
+# ---------------------------------------------------------------------------
+# Claude Code shell rules: queued request should NOT overwrite active turn's rules
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_chat_queued_message_claude_code_shell_rules_overwrites_active_turn(client, app, monkeypatch):
+    """RED test: A queued taOS agent chat request overwrites the active turn's shell rules.
+
+    The bug: In chat() (POST /api/taos-agent/chat) the claude_code harness is ONE shared object
+    (ensure_taos_claude_code_harness keeps it on app.state), and the line
+    `harness.shell_rules = await shell_profile.rules_for(store, shell_user)` runs BEFORE
+    `action = await agent_loop.handle_message(text, msg_id=trace_id)`. A second request that
+    comes back LoopAction.QUEUED (it never runs a turn) has already replaced the active turn's
+    rules with ITS user's allow/deny list, and the active turn's ClaudeCodeHarness.run_turn()
+    calls write_settings() from harness.shell_rules, so the active turn can run under the
+    other user's shell profile.
+
+    Expected failure before fix: The fake harness.shell_rules is {'allow': ['queued-user-rule'],
+    'deny': []} after the queued request, showing it overwrote the active turn's rules.
+    """
+    # Monkeypatch the imports as specified in the task
+    import tinyagentos.routes.taos_agent as ta_module
+    from tinyagentos.taos_agent_runtime import FRAMEWORK_CLAUDE_CODE
+
+    monkeypatch.setattr(ta_module, "system_agent_framework", lambda app_state: FRAMEWORK_CLAUDE_CODE)
+
+    # Create a fake harness with active-user rules
+    fake_harness = SimpleNamespace(
+        shell_rules={'allow': ['active-user-rule'], 'deny': []},
+        redact=lambda s: s
+    )
+
+    async def fake_ensure_taos_claude_code_harness(app_state, model, system_prompt):
+        return fake_harness
+
+    monkeypatch.setattr(ta_module, "ensure_taos_claude_code_harness", fake_ensure_taos_claude_code_harness)
+
+    # Mock shell_profile.rules_for to return queued-user rules
+    async def fake_rules_for(store, shell_user):
+        return {'allow': ['queued-user-rule'], 'deny': []}
+
+    mock_shell_profile = SimpleNamespace(rules_for=AsyncMock(side_effect=fake_rules_for))
+    monkeypatch.setattr(ta_module, "shell_profile", mock_shell_profile)
+
+    # Mock ClaudeCodeCliAdapter with a dummy class (never called on the queued path)
+    mock_adapter = MagicMock()
+    monkeypatch.setattr(ta_module, "ClaudeCodeCliAdapter", lambda cfg, sink: mock_adapter)
+
+    # Set up the agent loop mid-turn
+    from tinyagentos.agent_loop import AgentLoop, LoopAction
+    loop = AgentLoop()
+    app.state.taos_agent_loop = loop
+    # Put the loop mid-turn
+    await loop.handle_message('busy', msg_id='t0')
+
+    # Configure the model and password for Claude Code
+    await client.patch("/api/taos-agent/settings", json={"model": "claude-3-7-sonnet-20250219"})
+    app.state.taos_opencode_password = "testpw"
+    app.state.taos_opencode_session_id = None
+
+    # POST /api/taos-agent/chat
+    resp = await client.post(
+        "/api/taos-agent/chat",
+        json={
+            "messages": [{"role": "user", "content": "Hello"}],
+            "model": "claude-3-7-sonnet-20250219"
+        },
+    )
+
+    # Assert the response text contains 'queued'
+    assert resp.status_code == 200
+    assert "queued" in resp.text.lower()
+
+# ---------------------------------------------------------------------------
+# Claude Code shell rules: accepted turn must load the shell profile
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_chat_accepted_claude_code_turn_loads_shell_profile(client, app, monkeypatch):
+    """An ACCEPTED claude_code chat turn (turn owns the agent, nothing queued)
+    must still load the shell profile, i.e. harness.shell_rules equals what
+    shell_profile.rules_for returned for that user."""
+    import tinyagentos.routes.taos_agent as ta_module
+    from tinyagentos.taos_agent_runtime import FRAMEWORK_CLAUDE_CODE
+
+    monkeypatch.setattr(ta_module, "system_agent_framework", lambda app_state: FRAMEWORK_CLAUDE_CODE)
+
+    expected_rules = {"allow": ["ls", "cat"], "deny": ["curl"]}
+
+    fake_harness = SimpleNamespace(
+        shell_rules=None,
+        redact=lambda s: s,
+    )
+
+    async def fake_ensure_taos_claude_code_harness(app_state, model, system_prompt):
+        return fake_harness
+
+    monkeypatch.setattr(ta_module, "ensure_taos_claude_code_harness", fake_ensure_taos_claude_code_harness)
+
+    async def fake_rules_for(store, shell_user):
+        return expected_rules
+
+    mock_shell_profile = SimpleNamespace(
+        rules_for=AsyncMock(side_effect=fake_rules_for),
+        raise_shell_asks=AsyncMock(return_value=[]),
+    )
+    monkeypatch.setattr(ta_module, "shell_profile", mock_shell_profile)
+
+    class _DummyAdapter:
+        def __init__(self, cfg, sink):
+            self._sink = sink
+            self.session_id = None
+
+        async def ensure_session(self):
+            self.session_id = "ses_ok"
+
+        async def prompt(self, text, trace_id=None, attachments=None):
+            self._sink({"kind": "final"})
+
+        async def close(self):
+            pass
+
+    monkeypatch.setattr(ta_module, "ClaudeCodeCliAdapter", _DummyAdapter)
+
+    from tinyagentos.agent_loop import AgentLoop
+    loop = AgentLoop()
+    app.state.taos_agent_loop = loop
+    await client.patch("/api/taos-agent/settings", json={"model": "claude-3-7-sonnet-20250219"})
+    app.state.taos_opencode_password = "testpw"
+    app.state.taos_opencode_session_id = None
+
+    resp = await client.post(
+        "/api/taos-agent/chat",
+        json={"messages": [{"role": "user", "content": "Hi"}], "model": "claude-3-7-sonnet-20250219"},
+    )
+    assert resp.status_code == 200
+    assert fake_harness.shell_rules == expected_rules
+
+
 # ---------------------------------------------------------------------------
 # ensure_taos_opencode_server: key minting and master-key fallback
 # ---------------------------------------------------------------------------
@@ -329,7 +553,6 @@ async def test_ensure_server_uses_agent_key_when_available(tmp_path, monkeypatch
 
     mock_proxy = MagicMock()
     mock_proxy.create_agent_key = AsyncMock(return_value="sk-agent-key-123")
-    mock_proxy.is_running.return_value = True
 
     state = SimpleNamespace(
         data_dir=tmp_path,
@@ -348,11 +571,14 @@ async def test_ensure_server_uses_agent_key_when_available(tmp_path, monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_ensure_server_falls_back_to_master_key(tmp_path, monkeypatch):
-    """When create_agent_key returns None, the server falls back to the master key."""
+async def test_ensure_server_falls_back_to_a_scoped_key_not_the_master_key(tmp_path, monkeypatch):
+    """When create_agent_key returns None, the server gets a key scoped to its
+    model from the local key store (LiteLLM removal stage 2a), never the
+    LiteLLM master key."""
     import tinyagentos.taos_agent_runtime as rt
-    from tinyagentos.litellm_config import get_litellm_master_key
-    expected_master_key = get_litellm_master_key(tmp_path)
+    from tinyagentos.litellm_keystore import LiteLLMKeyStore, default_keystore_path
+    master_key = "sk-taos-stale-litellm-master-key-0123456789"
+    (tmp_path / ".litellm_master_key").write_text(master_key)
 
     spawned_cfgs: list = []
 
@@ -375,7 +601,6 @@ async def test_ensure_server_falls_back_to_master_key(tmp_path, monkeypatch):
 
     mock_proxy = MagicMock()
     mock_proxy.create_agent_key = AsyncMock(return_value=None)
-    mock_proxy.is_running.return_value = True
 
     state = SimpleNamespace(
         data_dir=tmp_path,
@@ -389,8 +614,11 @@ async def test_ensure_server_falls_back_to_master_key(tmp_path, monkeypatch):
     await rt.ensure_taos_opencode_server(state, "gpt-4o")
 
     assert len(spawned_cfgs) == 1
-    assert spawned_cfgs[0].litellm_key == expected_master_key
-    assert state.taos_opencode_key == expected_master_key
+    key = spawned_cfgs[0].litellm_key
+    assert key != master_key and state.taos_opencode_key == key
+    actual_key_info = LiteLLMKeyStore(default_keystore_path(tmp_path)).lookup(key)
+    actual_models = actual_key_info["allowed_models"]
+    assert actual_models == ["gpt-4o", "taos-embedding-default"]
 
 
 @pytest.mark.asyncio
@@ -426,7 +654,6 @@ async def test_ensure_server_reuses_persisted_key(tmp_path, monkeypatch):
     mock_proxy = MagicMock()
     mock_proxy.create_agent_key = AsyncMock(return_value="sk-NEW-should-not-be-used")
     mock_proxy.update_agent_key = AsyncMock(return_value=True)
-    mock_proxy.is_running.return_value = True
 
     state = SimpleNamespace(
         data_dir=tmp_path,
@@ -447,55 +674,147 @@ async def test_ensure_server_reuses_persisted_key(tmp_path, monkeypatch):
     mock_proxy.update_agent_key.assert_awaited()
 
 
-# ---------------------------------------------------------------------------
-# Degraded-birth detection and self-heal
-# ---------------------------------------------------------------------------
-
 @pytest.mark.asyncio
-async def test_ensure_server_born_degraded_when_proxy_not_running(tmp_path, monkeypatch):
-    """Server built while proxy not running sets the born_degraded flag."""
+async def test_ensure_server_rescope_failure_keeps_cached_server(tmp_path, monkeypatch):
+    """When a persisted key is not in the local key store (legacy key),
+    update_agent_key returns False. The runtime must mint a new local-store
+    key, persist it, and use it. The server must NOT be marked as born
+    degraded (proxy is running). A second ensure call reuses the cached server."""
     import tinyagentos.taos_agent_runtime as rt
+    from tinyagentos.litellm_keystore import LiteLLMKeyStore, default_keystore_path
+
+    spawned_cfgs: list = []
 
     class _FakeServer:
         def __init__(self, cfg):
+            spawned_cfgs.append(cfg)
             self._cfg = cfg
-
         async def ensure_running(self, **kwargs):
             pass
-
         async def stop(self):
             pass
-
         @property
         def base_url(self):
             return f"http://127.0.0.1:{self._cfg.port}"
-
         def is_running(self):
-            return False
+            return True
 
     monkeypatch.setattr(rt, "OpenCodeServer", _FakeServer)
 
+    class _FakeSettings:
+        async def get_preference(self, user, ns):
+            # Legacy key that is NOT in the local store
+            return {"llm_key": "sk-legacy-postgres-key", "permitted_models": ["gpt-4o", "claude"]}
+        async def save_preference(self, user, ns, prefs):
+            pass
+
     mock_proxy = MagicMock()
-    mock_proxy.is_running.return_value = False
-    mock_proxy.create_agent_key = AsyncMock(return_value=None)
+    mock_proxy.port = 7834
+    mock_proxy.inhouse_keys = True
+    mock_proxy.create_agent_key = AsyncMock(return_value="sk-should-not-be-used")
+    # update_agent_key returns False because the key is not in the local store
+    mock_proxy.update_agent_key = AsyncMock(return_value=False)
+
+    # Gateway enabled but model not routable -> falls back to LiteLLM
+    import tinyagentos.llm_gateway as lg
+    monkeypatch.setattr(lg, "enabled", lambda: True)
+    async def mock_models_problem(*a, **kw):
+        return "model 'gpt-4o' is not in the routing table"
+    monkeypatch.setattr("tinyagentos.llm_gateway.cutover.models_problem", mock_models_problem)
 
     state = SimpleNamespace(
         data_dir=tmp_path,
         llm_proxy=mock_proxy,
+        desktop_settings=_FakeSettings(),
         taos_opencode_password=None,
         taos_opencode_server=None,
         taos_opencode_model=None,
         taos_opencode_session_id=None,
     )
 
+    # First call: must create the server with a NEW local key, NOT degraded.
     await rt.ensure_taos_opencode_server(state, "gpt-4o")
 
-    assert state.taos_opencode_born_degraded is True
+    assert len(spawned_cfgs) == 1
+    key = spawned_cfgs[0].litellm_key
+    # The key must be a NEW local-store key, not the legacy one
+    assert key != "sk-legacy-postgres-key"
+    # The key must exist in the local key store
+    store = LiteLLMKeyStore(default_keystore_path(tmp_path))
+    rec = store.lookup(key)
+    assert rec is not None, f"key {key!r} not found in local store"
+    assert rec["agent"] == "taos-agent"
+    # Proxy IS running, re-scope failed (legacy key) -> minted local key, NOT degraded.
+    mock_proxy.update_agent_key.assert_awaited()
+    mock_proxy.create_agent_key.assert_not_called()
+
+    # Second call: must reuse the cached server, no restart churn.
+    mock_proxy.update_agent_key.reset_mock()
+    await rt.ensure_taos_opencode_server(state, "gpt-4o")
+    assert len(spawned_cfgs) == 1
 
 
 @pytest.mark.asyncio
-async def test_ensure_server_self_heals_when_proxy_becomes_ready(tmp_path, monkeypatch):
-    """Second ensure call with proxy now running rebuilds: old server stopped, new one created, flag cleared."""
+async def test_ensure_server_serializes_concurrent_different_models(tmp_path, monkeypatch):
+    """Two concurrent requests for different models must not both start a
+    server on the shared TAOS_OPENCODE_PORT. Regression for the race where the
+    existing-server check and ensure_running are separated by several awaits,
+    so two requests could both observe `existing is None` and double-start
+    (and the stop-on-model-change path can then clobber a server the other is
+    still starting)."""
+    import tinyagentos.taos_agent_runtime as rt
+
+    alive = {"count": 0, "peak": 0}
+
+    class _FakeServer:
+        def __init__(self, cfg):
+            self._cfg = cfg
+        async def ensure_running(self, **kwargs):
+            alive["count"] += 1
+            alive["peak"] = max(alive["peak"], alive["count"])
+            await asyncio.sleep(0)  # widen the overlap window
+        async def stop(self):
+            alive["count"] -= 1
+        @property
+        def base_url(self):
+            return f"http://127.0.0.1:{self._cfg.port}"
+        def is_running(self):
+            return True
+
+    monkeypatch.setattr(rt, "OpenCodeServer", _FakeServer)
+
+    async def _mint_key(*args, **kwargs):
+        # Yield here so both coroutines interleave at the key-mint await,
+        # before either caches a server — without the lock both then proceed
+        # to create a server on the shared port (peak alive == 2).
+        await asyncio.sleep(0)
+        return "sk-test"
+
+    mock_proxy = MagicMock()
+    mock_proxy.create_agent_key = _mint_key
+
+    state = SimpleNamespace(data_dir=tmp_path, llm_proxy=mock_proxy)
+
+    await asyncio.gather(
+        rt.ensure_taos_opencode_server(state, "model-a"),
+        rt.ensure_taos_opencode_server(state, "model-b"),
+    )
+
+    assert alive["peak"] == 1, (
+        f"two servers started concurrently (peak alive={alive['peak']}); "
+        "the lifecycle must be serialized by the app-state lock"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Degraded-birth detection and self-heal
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_ensure_server_model_switch_clears_legacy_session_id(tmp_path, monkeypatch):
+    """When the model changes, the legacy ``taos_opencode_session_id`` attr is
+    set to None so the desktop chat path does not feed a stale session from the
+    previous model into the new server."""
     import tinyagentos.taos_agent_runtime as rt
 
     stop_calls: list[str] = []
@@ -510,7 +829,7 @@ async def test_ensure_server_self_heals_when_proxy_becomes_ready(tmp_path, monke
             pass
 
         async def stop(self):
-            stop_calls.append("stopped")
+            stop_calls.append(f"stopped:{self._cfg.home}")
 
         @property
         def base_url(self):
@@ -522,7 +841,6 @@ async def test_ensure_server_self_heals_when_proxy_becomes_ready(tmp_path, monke
     monkeypatch.setattr(rt, "OpenCodeServer", _FakeServer)
 
     mock_proxy = MagicMock()
-    mock_proxy.is_running.return_value = False
     mock_proxy.create_agent_key = AsyncMock(return_value="sk-key-1")
 
     state = SimpleNamespace(
@@ -534,20 +852,87 @@ async def test_ensure_server_self_heals_when_proxy_becomes_ready(tmp_path, monke
         taos_opencode_session_id=None,
     )
 
-    # First call: proxy not ready, server born degraded.
+    # First call: create model A's server and simulate a session.
     await rt.ensure_taos_opencode_server(state, "gpt-4o")
-    assert state.taos_opencode_born_degraded is True
     assert len(spawned_cfgs) == 1
+    # Simulate the desktop chat path having stored a session id.
+    state.taos_opencode_session_id = "ses-old-model"
+    state.taos_opencode_sessions["gpt-4o"] = "ses-old-model"
 
-    # Proxy comes up.
-    mock_proxy.is_running.return_value = True
+    # Second call: switch to model B — must stop model A and clear the legacy
+    # session id so the desktop chat path sees None for the new model.
+    await rt.ensure_taos_opencode_server(state, "claude-sonnet")
 
-    # Second call: proxy is ready now, so should tear down and rebuild.
+    assert len(stop_calls) >= 1, "old-model server must have been stopped"
+    assert len(spawned_cfgs) == 2, "a new server must have been created"
+    assert state.taos_opencode_session_id is None, (
+        "legacy session id must be cleared after model switch; got "
+        f"{state.taos_opencode_session_id!r}"
+    )
+    assert "gpt-4o" not in state.taos_opencode_servers
+    assert "gpt-4o" not in state.taos_opencode_sessions
+    assert "claude-sonnet" in state.taos_opencode_servers
+
+
+@pytest.mark.asyncio
+async def test_ensure_server_model_switch_preserves_home_directory(tmp_path, monkeypatch):
+    """Switching models stops the old server but must NOT delete the old
+    model's home directory. The per-model home IS the conversation store, so
+    deleting it on model switch discards history and re-pays the one-time SQLite
+    migration the 180s ensure_running deadline exists to absorb. Regression for
+    the stop-on-model-change path that previously ``shutil.rmtree``'d the
+    previous model's home."""
+    import tinyagentos.taos_agent_runtime as rt
+
+    spawned_cfgs: list = []
+
+    class _FakeServer:
+        def __init__(self, cfg):
+            spawned_cfgs.append(cfg)
+            self._cfg = cfg
+
+        async def ensure_running(self, **kwargs):
+            pass
+
+        async def stop(self):
+            pass
+
+        @property
+        def base_url(self):
+            return f"http://127.0.0.1:{self._cfg.port}"
+
+        def is_running(self):
+            return True
+
+    monkeypatch.setattr(rt, "OpenCodeServer", _FakeServer)
+
+    mock_proxy = MagicMock()
+    mock_proxy.create_agent_key = AsyncMock(return_value="sk-key-1")
+
+    state = SimpleNamespace(
+        data_dir=tmp_path,
+        llm_proxy=mock_proxy,
+        taos_opencode_password=None,
+        taos_opencode_server=None,
+        taos_opencode_model=None,
+        taos_opencode_session_id=None,
+    )
+
+    # Start model A, then drop a marker file into its home directory.
+    await rt.ensure_taos_opencode_server(state, "gpt-4o")
+    home_a = Path(spawned_cfgs[0].home)
+    home_a.mkdir(parents=True, exist_ok=True)
+    marker = home_a / "conversation-history.sqlite"
+    marker.write_text("precious conversation history")
+
+    # Switch to model B (stops A), then switch back to A.
+    await rt.ensure_taos_opencode_server(state, "claude-sonnet")
     await rt.ensure_taos_opencode_server(state, "gpt-4o")
 
-    assert len(stop_calls) == 1, "old server must have been stopped"
-    assert len(spawned_cfgs) == 2, "a new server must have been created"
-    assert state.taos_opencode_born_degraded is False
+    assert marker.exists(), (
+        "model A's home directory was deleted on model switch; the per-model "
+        "home is the conversation store and must survive a stop-on-model-change"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -657,177 +1042,269 @@ async def test_chat_normal_stream_no_spurious_error(client, app, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# ensure_taos_opencode_server: GitHub token injection + refresh
+# AgentLoop serialization: concurrent POSTs no longer race on the shared
+# opencode session (tsk-icpt4i)
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_ensure_server_injects_github_token_into_config(tmp_path, monkeypatch):
-    """When app.state exposes secrets/config/http_client and a token is
-    resolvable, the freshly built server config carries it as github_token."""
+async def test_chat_concurrent_second_request_queued_and_surfaced(client, app, monkeypatch):
+    """While a turn is in flight, a second POST gets a single queued-notice
+    frame + done, and after the first turn completes its message is surfaced
+    in the first stream's tail before the final done."""
+    await client.patch("/api/taos-agent/settings", json={"model": "gpt-4o"})
+    app.state.llm_proxy = _make_mock_proxy(running=True)
+    app.state.taos_opencode_password = "testpw"
+    app.state.taos_opencode_session_id = None
+
+    server = _fake_server()
+
+    async def fake_ensure_server(state, model):
+        return server
+
+    monkeypatch.setattr(
+        "tinyagentos.routes.taos_agent.ensure_taos_opencode_server",
+        fake_ensure_server,
+    )
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    class _BlockingAdapter:
+        def __init__(self, cfg, sink):
+            self._sink = sink
+            self.session_id = None
+
+        async def ensure_session(self):
+            self.session_id = "ses_block"
+
+        async def prompt(self, text, trace_id=None, attachments=None):
+            self._sink({"kind": "delta", "content": f"reply:{text}"})
+            started.set()
+            await release.wait()
+            self._sink({"kind": "final", "content": f"reply:{text}"})
+
+        async def close(self):
+            pass
+
+    monkeypatch.setattr(
+        "tinyagentos.routes.taos_agent.OpenCodeAdapter",
+        _BlockingAdapter,
+    )
+
+    first = asyncio.create_task(client.post(
+        "/api/taos-agent/chat",
+        json={"messages": [{"role": "user", "content": "first message"}]},
+    ))
+    await asyncio.wait_for(started.wait(), timeout=5)
+
+    # Second request while the first turn is mid-flight → queued notice.
+    resp2 = await client.post(
+        "/api/taos-agent/chat",
+        json={"messages": [{"role": "user", "content": "second message"}]},
+    )
+    assert resp2.status_code == 200
+    items2 = _parse_ndjson(resp2.text)
+    assert len(items2) == 2
+    assert "queued" in items2[0]["delta"].lower()
+    assert items2[-1] == {"done": True}
+
+    # Let the first turn complete: its stream tail surfaces the queued message.
+    release.set()
+    resp1 = await asyncio.wait_for(first, timeout=5)
+    assert resp1.status_code == 200
+    items1 = _parse_ndjson(resp1.text)
+    tail = [
+        i for i in items1
+        if "queued message received while working" in i.get("delta", "")
+    ]
+    assert len(tail) == 1
+    assert "second message" in tail[0]["delta"]
+    assert items1[-1] == {"done": True}
+    # The queued frame comes after the turn's own reply delta.
+    assert items1.index(tail[0]) > items1.index({"delta": "reply:first message"})
+
+
+@pytest.mark.asyncio
+async def test_chat_loop_idle_again_after_turn(client, app, monkeypatch):
+    """After a completed turn the loop is IDLE, so the next POST is driven
+    immediately (no stale queued notice)."""
+    from tinyagentos.agent_loop import LoopState
+
+    await client.patch("/api/taos-agent/settings", json={"model": "gpt-4o"})
+    app.state.llm_proxy = _make_mock_proxy(running=True)
+    app.state.taos_opencode_password = "testpw"
+    app.state.taos_opencode_session_id = None
+
+    server = _fake_server()
+
+    async def fake_ensure_server(state, model):
+        return server
+
+    monkeypatch.setattr(
+        "tinyagentos.routes.taos_agent.ensure_taos_opencode_server",
+        fake_ensure_server,
+    )
+
+    class _NormalAdapter:
+        def __init__(self, cfg, sink):
+            self._sink = sink
+            self.session_id = None
+
+        async def ensure_session(self):
+            self.session_id = "ses_seq"
+
+        async def prompt(self, text, trace_id=None, attachments=None):
+            self._sink({"kind": "delta", "content": "pong"})
+            self._sink({"kind": "final", "content": "pong"})
+
+        async def close(self):
+            pass
+
+    monkeypatch.setattr(
+        "tinyagentos.routes.taos_agent.OpenCodeAdapter",
+        _NormalAdapter,
+    )
+
+    for _ in range(2):
+        resp = await client.post(
+            "/api/taos-agent/chat",
+            json={"messages": [{"role": "user", "content": "Hi"}]},
+        )
+        assert resp.status_code == 200
+        items = _parse_ndjson(resp.text)
+        assert {"delta": "pong"} in items
+        assert not any("queued" in i.get("delta", "").lower() for i in items)
+    assert app.state.taos_agent_loop.state is LoopState.IDLE
+
+
+# ---------------------------------------------------------------------------
+# GET /api/taos-agent/status — scoped payload (tsk-icpt4i)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_status_defaults_to_idle_without_loop(client):
+    resp = await client.get("/api/taos-agent/status")
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "state": "idle",
+        "current_turn_id": None,
+        "queued_count": 0,
+        "subagents": [],
+    }
+
+
+@pytest.mark.asyncio
+async def test_status_scopes_subagent_fields(client, app):
+    """result/error stay server-side: subagent dicts expose ONLY
+    id/task/state/started_at."""
+    from tinyagentos.agent_loop import AgentLoop
+
+    loop = AgentLoop()
+    app.state.taos_agent_loop = loop
+
+    async def ok_worker(progress):
+        return {"secret": "server-side result payload"}
+
+    async def bad_worker(progress):
+        raise RuntimeError("server-side error detail")
+
+    ok_id = await loop.spawn_subagent("index files", ok_worker)
+    bad_id = await loop.spawn_subagent("doomed job", bad_worker)
+    await loop.await_subagent(ok_id)
+    with pytest.raises(RuntimeError, match="server-side error detail"):
+        await loop.await_subagent(bad_id)
+
+    resp = await client.get("/api/taos-agent/status")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert set(data.keys()) == {"state", "current_turn_id", "queued_count", "subagents"}
+    assert data["state"] == "idle"
+    assert data["queued_count"] == 0
+    assert len(data["subagents"]) == 2
+    by_id = {s["id"]: s for s in data["subagents"]}
+    assert by_id[ok_id]["state"] == "completed"
+    assert by_id[bad_id]["state"] == "failed"
+    for sub in data["subagents"]:
+        assert set(sub.keys()) == {"id", "task", "state", "started_at"}
+        assert "result" not in sub
+        assert "error" not in sub
+    # The payloads must not leak anywhere in the response body.
+    assert "server-side" not in resp.text
+
+
+# ---------------------------------------------------------------------------
+# ensure_taos_opencode_server: legacy key re-scope failure remints locally
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_taos_agent_legacy_key_rescope_fail_remints(tmp_path, monkeypatch):
+    """Stored legacy key (not in local store), update_agent_key returns False,
+    gateway routable -> the key handed to opencode must be a local-store key
+    (store.lookup(key) is not None), not the legacy one."""
     import tinyagentos.taos_agent_runtime as rt
+    from tinyagentos.litellm_keystore import LiteLLMKeyStore, default_keystore_path
 
     spawned_cfgs: list = []
-    refresh_calls: list = []
 
     class _FakeServer:
         def __init__(self, cfg):
             spawned_cfgs.append(cfg)
             self._cfg = cfg
-
         async def ensure_running(self, **kwargs):
             pass
-
         async def stop(self):
             pass
-
         @property
         def base_url(self):
             return f"http://127.0.0.1:{self._cfg.port}"
-
         def is_running(self):
             return True
 
-        def set_github_token(self, token):
-            refresh_calls.append(token)
-
     monkeypatch.setattr(rt, "OpenCodeServer", _FakeServer)
-    resolve_mock = AsyncMock(return_value="ghs_runtime_token")
-    monkeypatch.setattr(rt, "_resolve_taos_github_token", resolve_mock)
+
+    class _FakeSettings:
+        async def get_preference(self, user, ns):
+            # Legacy key that is NOT in the local store
+            return {"llm_key": "sk-legacy-postgres-key", "permitted_models": ["gpt-4o"]}
+        async def save_preference(self, user, ns, prefs):
+            pass
 
     mock_proxy = MagicMock()
-    mock_proxy.create_agent_key = AsyncMock(return_value="sk-test")
-    mock_proxy.is_running.return_value = True
+    mock_proxy.port = 7834
+    # update_agent_key returns False because the key is not in the local store
+    mock_proxy.update_agent_key = AsyncMock(return_value=False)
+    # create_agent_key should NOT be called - we want to test _mint_local_taos_agent_key
+    mock_proxy.create_agent_key = AsyncMock(return_value="sk-should-not-be-used")
 
     state = SimpleNamespace(
         data_dir=tmp_path,
         llm_proxy=mock_proxy,
-        secrets=AsyncMock(),
-        config=MagicMock(),
-        http_client=AsyncMock(),
+        desktop_settings=_FakeSettings(),
         taos_opencode_password=None,
         taos_opencode_server=None,
         taos_opencode_model=None,
         taos_opencode_session_id=None,
     )
 
-    await rt.ensure_taos_opencode_server(state, "gpt-4o")
-
-    assert len(spawned_cfgs) == 1
-    assert spawned_cfgs[0].github_token == "ghs_runtime_token"
-    # A fresh server gets the token pushed once after construction.
-    assert refresh_calls == ["ghs_runtime_token"]
-    # env injection path used the resolved token.
-    resolve_mock.assert_awaited_once_with(state)
-
-
-@pytest.mark.asyncio
-async def test_ensure_server_refreshes_token_on_existing_server(tmp_path, monkeypatch):
-    """A long-lived server gets set_github_token called every call so the
-    short-lived token is rotated before expiry (the env is fixed at spawn;
-    the credential file is the rotation channel)."""
-    import tinyagentos.taos_agent_runtime as rt
-
-    refresh_calls: list = []
-
-    class _FakeServer:
-        def __init__(self, cfg):
-            self._cfg = cfg
-
-        async def ensure_running(self, **kwargs):
-            pass
-
-        async def stop(self):
-            pass
-
-        @property
-        def base_url(self):
-            return f"http://127.0.0.1:{self._cfg.port}"
-
-        def is_running(self):
-            return True
-
-        def set_github_token(self, token):
-            refresh_calls.append(token)
-
-    server = _FakeServer(MagicMock())
-    monkeypatch.setattr(rt, "OpenCodeServer", _FakeServer)
-
-    mock_proxy = MagicMock()
-    mock_proxy.create_agent_key = AsyncMock(return_value="sk-test")
-    mock_proxy.is_running.return_value = True
-
-    tokens = iter(["ghs_first", "ghs_refreshed"])
-
-    async def _fake_resolve(app_state):
-        return next(tokens)
-
-    monkeypatch.setattr(rt, "_resolve_taos_github_token", _fake_resolve)
-
-    state = SimpleNamespace(
-        data_dir=tmp_path,
-        llm_proxy=mock_proxy,
-        secrets=AsyncMock(),
-        config=MagicMock(),
-        http_client=AsyncMock(),
-        taos_opencode_password=None,
-        taos_opencode_server=server,
-        taos_opencode_model="gpt-4o",
-        taos_opencode_session_id=None,
-    )
-
-    await rt.ensure_taos_opencode_server(state, "gpt-4o")
-    await rt.ensure_taos_opencode_server(state, "gpt-4o")
-
-    # The server exists (not rebuilt): each call refreshed the token.
-    assert refresh_calls == ["ghs_first", "ghs_refreshed"]
-    # keep the fake server's config usable if a future test asserts on it
-    assert server._cfg is not None
-
-
-@pytest.mark.asyncio
-async def test_ensure_server_without_secrets_omits_token(tmp_path, monkeypatch):
-    """When app.state lacks the secrets store (early tests, degraded wiring),
-    no token is resolved and the server config has github_token=None."""
-    import tinyagentos.taos_agent_runtime as rt
-
-    spawned_cfgs: list = []
-
-    class _FakeServer:
-        def __init__(self, cfg):
-            spawned_cfgs.append(cfg)
-            self._cfg = cfg
-
-        async def ensure_running(self, **kwargs):
-            pass
-
-        async def stop(self):
-            pass
-
-        @property
-        def base_url(self):
-            return f"http://127.0.0.1:{self._cfg.port}"
-
-        def is_running(self):
-            return True
-
-    monkeypatch.setattr(rt, "OpenCodeServer", _FakeServer)
-    # _resolve_taos_github_token is left real: without a secrets store on
-    # app.state its getattr guards return None, so this also exercises the
-    # degraded-wiring path of the helper.
-    mock_proxy = MagicMock()
-    mock_proxy.create_agent_key = AsyncMock(return_value="sk-test")
-    mock_proxy.is_running.return_value = True
-
-    state = SimpleNamespace(
-        data_dir=tmp_path,
-        llm_proxy=mock_proxy,
-        taos_opencode_password=None,
-        taos_opencode_server=None,
-        taos_opencode_model=None,
-        taos_opencode_session_id=None,
-    )
+    # Gateway is enabled and can serve the model
+    import tinyagentos.llm_gateway as lg
+    monkeypatch.setattr(lg, "enabled", lambda: True)
+    async def mock_models_problem(*a, **kw):
+        return None
+    monkeypatch.setattr("tinyagentos.llm_gateway.cutover.models_problem", mock_models_problem)
 
     await rt.ensure_taos_opencode_server(state, "gpt-4o")
 
     assert len(spawned_cfgs) == 1
-    assert spawned_cfgs[0].github_token is None
+    key = spawned_cfgs[0].litellm_key
+    # The key must be a NEW local-store key, not the legacy one
+    assert key != "sk-legacy-postgres-key"
+    # The key must exist in the local key store
+    store = LiteLLMKeyStore(default_keystore_path(tmp_path))
+    rec = store.lookup(key)
+    assert rec is not None, f"key {key!r} not found in local store"
+    assert rec["agent"] == "taos-agent"
+    assert "gpt-4o" in rec["allowed_models"]
+    assert "taos-embedding-default" in rec["allowed_models"]
+    # The legacy key must NOT be in the store
+    assert store.lookup("sk-legacy-postgres-key") is None

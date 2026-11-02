@@ -80,9 +80,9 @@ function buildProps(overrides: Partial<ChannelSidebarProps> = {}): ChannelSideba
     bus: { channels: [], available: false, loaded: false },
     busSelected: null,
     onSelectBusChannel: vi.fn(),
-    formatRelativeTime: (ts) => String(ts),
-    thinkingChannelIds: [],
-    ...overrides,
+     formatRelativeTime: (ts) => String(ts),
+     agentPresence: {},
+     ...overrides,
   };
 }
 
@@ -263,6 +263,17 @@ describe("ChannelSidebar — channel type icons", () => {
     const a2aSpan = container.querySelector(".bg-accent-soft");
     expect(a2aSpan).toBeTruthy();
   });
+
+  it("renders Globe icon for dm-remote channels", () => {
+    const ch = makeChannel({ id: "dmr-1", name: "remote-peer", type: "dm-remote", members: ["user", "hub:peer"] });
+    const sections = [makeSection("Remote", [ch])];
+    render(
+      <ChannelSidebar {...buildProps({ sections })} />,
+    );
+    expect(screen.getByText("remote-peer")).toBeInTheDocument();
+    const channelRow = screen.getByLabelText(`Channel ${ch.name}`);
+    expect(channelRow.querySelector('[data-lucide="globe"]')).toBeTruthy();
+  });
 });
 
 /* ------------------------------------------------------------------ */
@@ -270,17 +281,27 @@ describe("ChannelSidebar — channel type icons", () => {
 /* ------------------------------------------------------------------ */
 
 describe("ChannelSidebar — mobile", () => {
-  it("renders connection status with mobile inline styles", () => {
+  it("renders connection status with mobile inline styles when connecting", () => {
     const { container } = render(
-      <ChannelSidebar {...buildProps({ isMobile: true, wsStatus: "connected" })} />,
+      <ChannelSidebar {...buildProps({ isMobile: true, wsStatus: "connecting" })} />,
     );
-    expect(screen.getByText("Connected")).toBeInTheDocument();
+    expect(screen.getByText("Connecting…")).toBeInTheDocument();
     // Mobile uses inline styles — verify the wrapper div padding via longhands
     // (jsdom re-serialises shorthands; asserting longhands is stable across versions)
     const mobileContainer = container.firstChild as HTMLElement;
     expect(mobileContainer.style.paddingTop).toBe("8px");
     expect(mobileContainer.style.paddingRight).toBe("0px");
     expect(mobileContainer.style.paddingBottom).toBe("16px");
+  });
+
+  it("does not render connection status text when wsStatus is connected", () => {
+    render(<ChannelSidebar {...buildProps({ isMobile: true, wsStatus: "connected" })} />);
+    expect(screen.queryByText("Connected")).not.toBeInTheDocument();
+  });
+
+  it("renders MobileChatList search input on mobile", () => {
+    render(<ChannelSidebar {...buildProps({ isMobile: true, wsStatus: "connected" })} />);
+    expect(screen.getByLabelText("Search chats")).toBeInTheDocument();
   });
 
   it("renders empty state on mobile", () => {
@@ -350,8 +371,177 @@ describe("ChannelSidebar — mobile", () => {
         {...buildProps({ isMobile: true, sections, onSelectChannel })}
       />,
     );
-    fireEvent.click(screen.getByRole("button", { name: `Channel ${ch.name}` }));
+    fireEvent.click(screen.getByRole("button", { name: `Chat ${ch.name}` }));
     expect(onSelectChannel).toHaveBeenCalledWith("ch-1");
+  });
+
+  it("renders People chip on mobile when liveAgents are present and filters people DMs", () => {
+    const onSelectChannel = vi.fn();
+    const dmAgent = makeDmChannel({ id: "dm-juniper", name: "juniper", members: ["user", "juniper"] });
+    const dmPerson = makeDmChannel({ id: "dm-mum", name: "mum", members: ["user", "mum"] });
+    const sections = [makeSection("DMs", [dmAgent, dmPerson])];
+    render(
+      <ChannelSidebar
+        {...buildProps({
+          isMobile: true,
+          sections,
+          liveAgents: [{ name: "juniper" }],
+          onSelectChannel,
+          agentRosterReady: true,
+        })}
+      />,
+    );
+    // People chip should render
+    const peopleChip = screen.getByRole("button", { name: "People" });
+    expect(peopleChip).toBeInTheDocument();
+    // Click People chip
+    fireEvent.click(peopleChip);
+    // Should show "mum" (person DM) and not "juniper" (agent DM)
+    expect(screen.getByText("mum")).toBeInTheDocument();
+    expect(screen.queryByText("juniper")).not.toBeInTheDocument();
+  });
+
+  /* RED-FIRST: test (i) - when liveAgents and archivedAgents are both empty,
+     agentNames is undefined, so all DMs stay under Agents (back-compat) */
+  it("mobile, liveAgents=[] and archivedAgents=[], one dm channel: Agents chip shown, no People chip", () => {
+    const onSelectChannel = vi.fn();
+    const dm = makeDmChannel({ id: "dm-someagent", name: "some-agent", members: ["user", "some-agent"] });
+    const sections = [makeSection("DMs", [dm])];
+    render(
+      <ChannelSidebar
+        {...buildProps({
+          isMobile: true,
+          sections,
+          liveAgents: [],
+          archivedAgents: [],
+          agentRosterReady: false,
+          onSelectChannel,
+        })}
+      />
+    );
+    // Agents chip should be shown (back-compat: all DMs are agents)
+    const agentsChip = screen.getByRole("button", { name: "Agents" });
+    expect(agentsChip).toBeInTheDocument();
+    // People chip should NOT be shown (no agentNames = back-compat)
+    const peopleChip = screen.queryByRole("button", { name: "People" });
+    expect(peopleChip).not.toBeInTheDocument();
+    // Clicking Agents chip should show the DM
+    fireEvent.click(agentsChip);
+    expect(screen.getByText("some-agent")).toBeInTheDocument();
+  });
+
+  /* RED-FIRST: test (ii) - with live agent + archived agent,
+      archived agent's name is included in agentNames,
+      so DM with archived agent is classified as agent DM, not people DM */
+  it("mobile, liveAgents + archivedAgents: archived agent DM classified as agent, People chip does NOT list it", () => {
+    const onSelectChannel = vi.fn();
+    const dmArchived = makeDmChannel({ id: "dm-oldbot", name: "old-bot", members: ["user", "old-bot"] });
+    const dmPerson = makeDmChannel({ id: "dm-mum", name: "mum", members: ["user", "mum"] });
+    const sections = [makeSection("DMs", [dmArchived, dmPerson])];
+    render(
+      <ChannelSidebar
+        {...buildProps({
+          isMobile: true,
+          sections,
+          liveAgents: [{ name: "some-agent" }],
+          archivedAgents: [{ id: "a1", archived_slug: "old-bot-x", original: { name: "old-bot" } }],
+          agentRosterReady: true,
+          onSelectChannel,
+        })}
+      />,
+    );
+    // Both "Agents" and "People" chips should render (there are DMs in both categories)
+    const agentsChip = screen.getByRole("button", { name: "Agents" });
+    expect(agentsChip).toBeInTheDocument();
+    const peopleChip = screen.getByRole("button", { name: "People" });
+    expect(peopleChip).toBeInTheDocument();
+    // Click People chip - should NOT list the old-bot DM (it's now an agent DM)
+    fireEvent.click(peopleChip);
+    expect(screen.queryByText("old-bot")).not.toBeInTheDocument();
+    expect(screen.getByText("mum")).toBeInTheDocument();
+    // Click Agents chip - should list the old-bot DM
+    fireEvent.click(agentsChip);
+    expect(screen.getByText("old-bot")).toBeInTheDocument();
+  });
+
+  /* RED-FIRST: test (iii) - mobile, agentRosterReady false,
+      liveAgents=[{name:"some-agent"}], dms with members ["user","old-bot"] and ["user","mum"]: no "People" chip button is shown */
+  it("mobile, agentRosterReady false, liveAgents=[{name:\"some-agent\"}], dms with members [\"user\",\"old-bot\"] and [\"user\",\"mum\"]: no \"People\" chip button is shown", () => {
+    const onSelectChannel = vi.fn();
+    const dmAgent = makeDmChannel({ id: "dm-agent", name: "some-agent", members: ["user", "some-agent"] });
+    const dmPerson = makeDmChannel({ id: "dm-person", name: "old-bot", members: ["user", "old-bot"] });
+    const sections = [makeSection("DMs", [dmAgent, dmPerson])];
+    render(
+      <ChannelSidebar
+        {...buildProps({
+          isMobile: true,
+          sections,
+          liveAgents: [{ name: "some-agent" }],
+          archivedAgents: [],
+          agentRosterReady: false,
+          onSelectChannel,
+        })}
+      />,
+    );
+    // People chip should NOT be shown when agentRosterReady is false
+    const peopleChip = screen.queryByRole("button", { name: "People" });
+    expect(peopleChip).not.toBeInTheDocument();
+    // Both DMs should appear under Agents (back-compat when roster not ready)
+    const agentsChip = screen.getByRole("button", { name: "Agents" });
+    expect(agentsChip).toBeInTheDocument();
+    fireEvent.click(agentsChip);
+    expect(screen.getByText("some-agent")).toBeInTheDocument();
+    expect(screen.getByText("old-bot")).toBeInTheDocument();
+  });
+
+  /* RED-FIRST: test (iv) - mobile, agentRosterReady true, liveAgents=[] and archivedAgents=[], dm with members ["user","mum"]: a "People" chip is shown and lists "mum" */
+  it("mobile, agentRosterReady true, liveAgents=[] and archivedAgents=[], dm with members [\"user\",\"mum\"]: a \"People\" chip is shown and lists \"mum\"", () => {
+    const onSelectChannel = vi.fn();
+    const dmPerson = makeDmChannel({ id: "dm-person", name: "mum", members: ["user", "mum"] });
+    const sections = [makeSection("DMs", [dmPerson])];
+    render(
+      <ChannelSidebar
+        {...buildProps({
+          isMobile: true,
+          sections,
+          liveAgents: [],
+          archivedAgents: [],
+          agentRosterReady: true,
+          onSelectChannel,
+        })}
+      />,
+    );
+    // People chip should be shown when roster is ready (even if empty)
+    const peopleChip = screen.getByRole("button", { name: "People" });
+    expect(peopleChip).toBeInTheDocument();
+    // Agents chip should NOT be shown (no agents)
+    const agentsChip = screen.queryByRole("button", { name: "Agents" });
+    expect(agentsChip).not.toBeInTheDocument();
+    // Clicking People chip should show the person DM
+    fireEvent.click(peopleChip);
+    expect(screen.getByText("mum")).toBeInTheDocument();
+  });
+
+  it("mobile, archived agent known only by archived_slug: its DM is classified as agent", () => {
+    const dmSlug = makeDmChannel({ id: "dm-slug", name: "old-bot-x", members: ["user", "old-bot-x"] });
+    const dmPerson = makeDmChannel({ id: "dm-mum", name: "mum", members: ["user", "mum"] });
+    const sections = [makeSection("DMs", [dmSlug, dmPerson])];
+    render(
+      <ChannelSidebar
+        {...buildProps({
+          isMobile: true,
+          sections,
+          liveAgents: [{ name: "some-agent" }],
+          archivedAgents: [{ id: "a1", archived_slug: "old-bot-x" }],
+          agentRosterReady: true,
+          onSelectChannel: vi.fn(),
+        })}
+      />
+    );
+    fireEvent.click(screen.getByRole("button", { name: "People" }));
+    expect(screen.queryByText("old-bot-x")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Agents" }));
+    expect(screen.getByText("old-bot-x")).toBeInTheDocument();
   });
 });
 
@@ -563,29 +753,45 @@ describe("ChannelSidebar — projects", () => {
     expect(onSelectChannel).toHaveBeenCalledWith("pc-1");
   });
 
-  it("renders Projects section on mobile", () => {
+  it("renders project channels in unified list on mobile", () => {
     render(
       <ChannelSidebar
         {...buildProps({ isMobile: true, projectGroups: [projectGroup] })}
       />,
     );
-    expect(screen.getByText(/Projects/)).toBeInTheDocument();
+    // Project channels appear in the unified MobileChatList
+    expect(screen.getByText("proj-general")).toBeInTheDocument();
+    expect(screen.getByText("proj-dev")).toBeInTheDocument();
   });
 
-  it("calls onToggleProjects on mobile Projects header click", () => {
-    const onToggleProjects = vi.fn();
+  it("shows a working dot on a working bound project channel (desktop)", () => {
+    render(
+      <ChannelSidebar
+        {...buildProps({
+          projectGroups: [projectGroup],
+          agentPresence: { "pc-1": "working" },
+        })}
+      />,
+    );
+    const btn = screen.getByRole("button", { name: "Channel proj-general" });
+    const dot = btn.querySelector(".taos-status-pulse");
+    expect(dot).toBeTruthy();
+    expect(dot).toHaveClass("bg-amber-400");
+  });
+
+  it("does not show presence dot on mobile for project channel (intentionally omitted)", () => {
     render(
       <ChannelSidebar
         {...buildProps({
           isMobile: true,
           projectGroups: [projectGroup],
-          projectsExpanded: false,
-          onToggleProjects,
+          agentPresence: { "pc-1": "working" },
         })}
       />,
     );
-    fireEvent.click(screen.getByText(/Projects/));
-    expect(onToggleProjects).toHaveBeenCalledOnce();
+    const btn = screen.getByRole("button", { name: "Chat proj-general" });
+    expect(btn.querySelector(".taos-status-pulse")).toBeNull();
+    expect(btn.querySelector('[aria-label^="Agent is"]')).toBeNull();
   });
 });
 
@@ -622,6 +828,8 @@ describe("ChannelSidebar — A2A bus", () => {
         })}
       />,
     );
+    // Bus section is collapsible on mobile — expand it first
+    fireEvent.click(screen.getByText("Agent activity"));
     expect(screen.getByText("mobile-bus")).toBeInTheDocument();
   });
 });
@@ -714,16 +922,16 @@ describe("ChannelSidebar — edge cases", () => {
 });
 
 /* ------------------------------------------------------------------ */
-/*  Live thinking badge                                                 */
+/*  Agent presence dots                                                 */
 /* ------------------------------------------------------------------ */
 
-describe("ChannelSidebar — thinking badge", () => {
-  it("shows a pulsing amber dot on a thinking channel (desktop)", () => {
+describe("ChannelSidebar — presence dots", () => {
+  it("shows a pulsing amber 'working' dot on a working agent channel (desktop)", () => {
     const ch = makeChannel({ id: "ch-1", name: "session-alice" });
-    const sections = [makeSection("Live", [ch])];
+    const sections = [makeSection("Agents-DMs", [ch])];
     const { container } = render(
       <ChannelSidebar
-        {...buildProps({ sections, thinkingChannelIds: ["ch-1"] })}
+        {...buildProps({ sections, agentPresence: { "ch-1": "working" } })}
       />,
     );
     const btn = screen.getByRole("button", { name: `Channel ${ch.name}` });
@@ -732,38 +940,66 @@ describe("ChannelSidebar — thinking badge", () => {
     expect(dot).toHaveClass("bg-amber-400");
   });
 
-  it("does not show thinking dot on non-thinking channels (desktop)", () => {
-    const ch = makeChannel({ id: "ch-1", name: "general" });
-    const sections = [makeSection("Topics", [ch])];
+  it("shows a solid green 'live' dot on a live agent channel (desktop)", () => {
+    const ch = makeChannel({ id: "ch-1", name: "session-alice" });
+    const sections = [makeSection("Agents-DMs", [ch])];
     render(
       <ChannelSidebar
-        {...buildProps({ sections, thinkingChannelIds: [] })}
+        {...buildProps({ sections, agentPresence: { "ch-1": "live" } })}
       />,
     );
     const btn = screen.getByRole("button", { name: `Channel ${ch.name}` });
     expect(btn.querySelector(".taos-status-pulse")).toBeNull();
+    const dot = btn.querySelector('[aria-label="Agent is live"]');
+    expect(dot).toBeTruthy();
+    expect(dot).toHaveClass("bg-emerald-400");
   });
 
-  it("shows thinking dot on mobile when channel is thinking", () => {
-    const ch = makeChannel({ id: "ch-1", name: "session-bob" });
-    const sections = [makeSection("Live", [ch])];
-    const { container } = render(
+  it("shows a muted gray 'idle' dot on an idle agent channel (desktop)", () => {
+    const ch = makeChannel({ id: "ch-1", name: "session-alice" });
+    const sections = [makeSection("Agents-DMs", [ch])];
+    render(
       <ChannelSidebar
-        {...buildProps({ isMobile: true, sections, thinkingChannelIds: ["ch-1"] })}
+        {...buildProps({ sections, agentPresence: { "ch-1": "idle" } })}
       />,
     );
     const btn = screen.getByRole("button", { name: `Channel ${ch.name}` });
-    const dot = btn.querySelector(".taos-status-pulse");
+    expect(btn.querySelector(".taos-status-pulse")).toBeNull();
+    const dot = btn.querySelector('[aria-label="Agent is idle"]');
     expect(dot).toBeTruthy();
-    expect(dot).toHaveClass("bg-amber-400");
+    expect(dot).toHaveClass("bg-shell-text-tertiary");
   });
 
-  it("clears thinking dot when channel leaves thinkingChannelIds", () => {
+  it("does not show a presence dot when channel has no presence entry", () => {
+    const ch = makeChannel({ id: "ch-1", name: "general" });
+    const sections = [makeSection("Topics", [ch])];
+    render(
+      <ChannelSidebar {...buildProps({ sections, agentPresence: {} })} />,
+    );
+    const btn = screen.getByRole("button", { name: `Channel ${ch.name}` });
+    expect(btn.querySelector(".taos-status-pulse")).toBeNull();
+    expect(btn.querySelector('[aria-label^="Agent is"]')).toBeNull();
+  });
+
+  it("does not show presence dot on mobile (intentionally omitted)", () => {
+    const ch = makeChannel({ id: "ch-1", name: "session-bob" });
+    const sections = [makeSection("Agents-DMs", [ch])];
+    render(
+      <ChannelSidebar
+        {...buildProps({ isMobile: true, sections, agentPresence: { "ch-1": "working" } })}
+      />,
+    );
+    const btn = screen.getByRole("button", { name: `Chat ${ch.name}` });
+    expect(btn.querySelector(".taos-status-pulse")).toBeNull();
+    expect(btn.querySelector('[aria-label^="Agent is"]')).toBeNull();
+  });
+
+  it("clears presence dot when channel leaves the presence map", () => {
     const ch = makeChannel({ id: "ch-1", name: "session-carol" });
-    const sections = [makeSection("Live", [ch])];
+    const sections = [makeSection("Agents-DMs", [ch])];
     const { rerender } = render(
       <ChannelSidebar
-        {...buildProps({ sections, thinkingChannelIds: ["ch-1"] })}
+        {...buildProps({ sections, agentPresence: { "ch-1": "working" } })}
       />,
     );
     let btn = screen.getByRole("button", { name: `Channel ${ch.name}` });
@@ -771,10 +1007,144 @@ describe("ChannelSidebar — thinking badge", () => {
 
     rerender(
       <ChannelSidebar
-        {...buildProps({ sections, thinkingChannelIds: [] })}
+        {...buildProps({ sections, agentPresence: {} })}
       />,
     );
     btn = screen.getByRole("button", { name: `Channel ${ch.name}` });
     expect(btn.querySelector(".taos-status-pulse")).toBeNull();
+  });
+
+  it("does not show live dot on mobile when channel is live (intentionally omitted)", () => {
+    const ch = makeChannel({ id: "ch-1", name: "session-dave" });
+    const sections = [makeSection("Agents-DMs", [ch])];
+    render(
+      <ChannelSidebar
+        {...buildProps({ isMobile: true, sections, agentPresence: { "ch-1": "live" } })}
+      />,
+    );
+    const btn = screen.getByRole("button", { name: `Chat ${ch.name}` });
+    expect(btn.querySelector(".taos-status-pulse")).toBeNull();
+    expect(btn.querySelector('[aria-label="Agent is live"]')).toBeNull();
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/*  Active-channel accent rail                                          */
+/* ------------------------------------------------------------------ */
+
+describe("ChannelSidebar — accent rail", () => {
+  it("applies accent-left border to the selected channel (desktop)", () => {
+    const ch = makeChannel({ id: "ch-1", name: "general" });
+    const sections = [makeSection("Channels", [ch])];
+    render(
+      <ChannelSidebar
+        {...buildProps({ sections, selectedChannel: "ch-1" })}
+      />,
+    );
+    const btn = screen.getByRole("button", { name: `Channel ${ch.name}` });
+    expect(btn.className).toContain("border-l-2");
+    expect(btn.className).toContain("border-accent-line");
+  });
+
+  it("does not apply accent-left border to unselected channel (desktop)", () => {
+    const ch = makeChannel({ id: "ch-1", name: "general" });
+    const sections = [makeSection("Channels", [ch])];
+    render(
+      <ChannelSidebar
+        {...buildProps({ sections, selectedChannel: null })}
+      />,
+    );
+    const btn = screen.getByRole("button", { name: `Channel ${ch.name}` });
+    expect(btn.className).not.toContain("border-l-2");
+    expect(btn.className).not.toContain("border-accent-line");
+  });
+
+  it("highlights selected channel with active background on mobile", () => {
+    const ch = makeChannel({ id: "ch-1", name: "general" });
+    const sections = [makeSection("Channels", [ch])];
+    render(
+      <ChannelSidebar
+        {...buildProps({ isMobile: true, sections, selectedChannel: "ch-1" })}
+      />,
+    );
+    const btn = screen.getByRole("button", { name: `Chat ${ch.name}` });
+    expect(btn.style.background).toBe("var(--color-shell-surface-active)");
+  });
+
+  it("does not highlight unselected channel on mobile", () => {
+    const ch = makeChannel({ id: "ch-1", name: "general" });
+    const sections = [makeSection("Channels", [ch])];
+    render(
+      <ChannelSidebar
+        {...buildProps({ isMobile: true, sections, selectedChannel: null })}
+      />,
+    );
+    const btn = screen.getByRole("button", { name: `Chat ${ch.name}` });
+    expect(btn.style.background).not.toBe("var(--color-shell-surface-active)");
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/*  Selected-channel accent rail                                       */
+/* ------------------------------------------------------------------ */
+
+describe("ChannelSidebar — selected accent rail", () => {
+  const projectGroup = {
+    id: "proj-1",
+    name: "My Project",
+    channels: [makeChannel({ id: "pc-1", name: "proj-general" })],
+  };
+
+  it("shows the accent rail on the selected project channel (desktop)", () => {
+    render(
+      <ChannelSidebar
+        {...buildProps({ projectGroups: [projectGroup], selectedChannel: "pc-1" })}
+      />,
+    );
+    const btn = screen.getByRole("button", { name: "Channel proj-general" });
+    expect(btn).toHaveClass("border-l-2", "border-accent-line");
+  });
+
+  it("highlights selected project channel with active background on mobile", () => {
+    render(
+      <ChannelSidebar
+        {...buildProps({
+          isMobile: true,
+          projectGroups: [projectGroup],
+          selectedChannel: "pc-1",
+        })}
+      />,
+    );
+    const btn = screen.getByRole("button", { name: "Chat proj-general" });
+    expect(btn.style.background).toBe("var(--color-shell-surface-active)");
+  });
+
+  it("shows the accent rail on the selected archived channel (desktop)", () => {
+    render(
+      <ChannelSidebar
+        {...buildProps({
+          archivedChannels: [makeChannel({ id: "arc-1", name: "old-chan" })],
+          archivedExpanded: true,
+          selectedChannel: "arc-1",
+        })}
+      />,
+    );
+    const btn = screen.getByRole("button", { name: "Archived channel old-chan" });
+    expect(btn).toHaveClass("border-l-2", "border-accent-line");
+  });
+
+  it("highlights selected archived channel with active background on mobile", () => {
+    render(
+      <ChannelSidebar
+        {...buildProps({
+          isMobile: true,
+          archivedChannels: [makeChannel({ id: "arc-1", name: "old-chan" })],
+          archivedExpanded: true,
+          selectedChannel: "arc-1",
+        })}
+      />,
+    );
+    const btn = screen.getByRole("button", { name: "Archived channel old-chan" });
+    expect(btn.style.background).toBe("var(--color-shell-surface-active)");
   });
 });

@@ -262,7 +262,7 @@ Here's a quick map of the apps available from the desktop dock and launchpad.
 | **Agents** | Deploy new agents, monitor running ones, view logs, assign skills, adjust configuration. |
 | **Secrets** | Encrypted storage for API keys and tokens. You store a secret here once; agents access it by name without seeing the raw value. |
 | **Tasks** | Schedule recurring jobs for your agents — daily summaries, memory cleanup, data imports. Built-in presets for common patterns. |
-| **Import** | Drag and drop files to embed into an agent's memory. Supported formats: `.txt`, `.md`, `.pdf`, `.html`, `.json`, `.csv`. |
+| **Library** | Universal knowledge ingestion — drag-and-drop files (.txt, .md, .pdf, .html, .json, .csv) or add URLs; auto-embeds via subscriptions or manual "Embed files into an agent" into any agent. |
 | **Files** | Real virtual filesystem with your personal workspace and shared folders that agents can read and write to. |
 | **Settings** | System info, storage usage, backup/restore, update taOS, test backend connections, toggle dark/light theme, and per-category toggles for User Memory auto-capture. taOS periodically checks for updates and reports an anonymous install count (a daily aggregate estimate, no identifiers); disable with `TAOS_NO_UPDATE_PING=1` or in Settings. |
 
@@ -436,6 +436,16 @@ If you prefer to do it yourself:
 cp -r ~/tinyagentos/data /your/backup/location/tinyagentos-data-$(date +%Y%m%d)
 ```
 
+### Data directory precedence
+
+taOS resolves the data directory in the following order:
+
+1. `TAOS_DATA_DIR` environment variable
+2. `--data-dir` flag (for the `taos recover-password` CLI)
+3. `<install-dir>/data` default
+
+If both the `TAOS_DATA_DIR` environment variable and an explicit `--data-dir` are set to different paths, taOS refuses to start and prints a clear conflict message. This prevents the server from silently writing state to one directory while a CLI tool reads from another.
+
 ---
 
 ## 9. Getting Help
@@ -459,7 +469,7 @@ When filing a bug, it helps to include:
 
 Once you've got an agent running and responding over Telegram, here are some things worth exploring:
 
-- **Import** — drop in some PDF or text files to give your agent background knowledge
+- **Library** — drop in some PDF or text files to give your agent background knowledge (drag-and-drop or "Embed files into an agent" into any agent)
 - **Tasks** — set up a daily scheduled summary or memory cleanup
 - **Multiple agents** — deploy a second agent with a different framework or model and compare
 - **Image generation** — if you have a supported GPU, install a Stable Diffusion app from the Store and let your agents generate images

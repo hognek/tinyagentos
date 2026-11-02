@@ -16,6 +16,7 @@ from tinyagentos.agent_registry_store import (
     _RESERVED_PREFIXES,
     _row_to_dict,
     _slugify,
+    agent_slug_or_fallback,
     load_or_create_signing_keypair,
     mint_canonical_id,
     mint_registry_token,
@@ -61,16 +62,49 @@ class TestSlugify:
         assert _slugify("agent@v2.0!") == "agent-v2-0"
 
     def test_empty_string(self):
-        assert _slugify("") == "agent"
+        # No sentinel: a constant fallback gave every unslugifiable name the
+        # same slug and collided their identities (agent_slug_or_fallback
+        # supplies a per-name one where a slug is mandatory).
+        assert _slugify("") == ""
 
     def test_only_special_chars(self):
-        assert _slugify("!@#$%") == "agent"
+        assert _slugify("!@#$%") == ""
+
+    def test_non_latin_script_transliterates(self):
+        assert _slugify("我的代理") == "wo-de-dai-li"
+        assert _slugify("Агент Иванов") == "agent-ivanov"
 
     def test_leading_trailing_dashes(self):
         assert _slugify("  hello  ") == "hello"
 
     def test_multiple_spaces(self):
         assert _slugify("a  b  c") == "a-b-c"
+
+
+class TestAgentSlugOrFallback:
+    def test_returns_the_slug_when_there_is_one(self):
+        assert agent_slug_or_fallback("My Agent") == "my-agent"
+
+    def test_falls_back_for_an_unslugifiable_name(self):
+        assert agent_slug_or_fallback("🚀").startswith("agent-")
+
+    def test_the_fallback_is_deterministic(self):
+        assert agent_slug_or_fallback("🚀") == agent_slug_or_fallback("🚀")
+
+    def test_two_unslugifiable_names_do_not_share_a_fallback(self):
+        assert agent_slug_or_fallback("🚀") != agent_slug_or_fallback("🎉")
+
+    def test_fallback_digest_is_wide_enough_to_resist_collision(self):
+        """CodeRabbit finding on #2798: a 32-bit (4-byte) digest lets two
+        different unslugifiable names collide into the same "agent-<digest>"
+        fallback slug. get_by_slug() resolves a slug to "the oldest matching
+        record", so a collision would silently point a DM channel (or
+        anything else resolved by slug) at the wrong agent. 8 bytes (16 hex
+        chars) makes that collision space large enough to be unreachable in
+        practice.
+        """
+        digest = agent_slug_or_fallback("🚀").removeprefix("agent-")
+        assert len(digest) == 16
 
 
 class TestMintCanonicalId:
@@ -244,6 +278,27 @@ class TestTokenMinting:
         with pytest.raises(ValueError):
             verify_registry_token("one", pub)
 
+    def test_verify_non_dict_payload_raises(self, signing_keypair):
+        """RED-FIRST: a token whose payload JSON decodes to a non-dict
+        (e.g. a JSON list) must raise ValueError mentioning the field name,
+        not silently return the non-dict value."""
+        from cryptography.hazmat.primitives.serialization import load_pem_private_key
+
+        priv, pub = signing_keypair
+        private_key = load_pem_private_key(priv, password=None)
+
+        header = _b64url_encode(
+            json.dumps({"alg": "EdDSA", "typ": "JWT"}, separators=(",", ":")).encode()
+        )
+        # Payload is a JSON array, NOT a dict
+        payload = _b64url_encode(json.dumps([1, 2, 3]).encode())
+        signing_input = f"{header}.{payload}".encode()
+        signature = _b64url_encode(private_key.sign(signing_input))
+        token = f"{header}.{payload}.{signature}"
+
+        with pytest.raises(ValueError, match="payload"):
+            verify_registry_token(token, pub)
+
     def test_token_has_jti(self, signing_keypair):
         priv, pub = signing_keypair
         token = mint_registry_token("agent-006", priv)
@@ -283,6 +338,165 @@ class TestSigningKeypair:
         load_or_create_signing_keypair(d)
         pem_file = d / "agent_registry_signing.pem"
         assert pem_file.exists()
+
+
+class TestSigningKeypairConcurrentRace:
+    """RED test: concurrent calls must always get the same non-empty key.
+
+    The current load_or_create_signing_keypair has a race condition where two
+    concurrent processes can both see the key file as absent, then one creates
+    it with O_EXCL while the other waits. The second process then reads the
+    empty file (created but not yet written to) and gets an empty key, breaking
+    boot.
+    """
+
+    def test_concurrent_threads_always_get_same_nonempty_key(self, tmp_path):
+        import threading
+        from pathlib import Path
+
+        key_path = tmp_path / "keys"
+        results: list[tuple[bytes, bytes]] = []
+        errors: list[BaseException] = []
+
+        def call_loader():
+            try:
+                priv, pub = load_or_create_signing_keypair(key_path)
+                results.append((priv, pub))
+            except Exception as e:
+                errors.append(e)
+
+        # Run 50 concurrent threads
+        threads = []
+        for _ in range(50):
+            t = threading.Thread(target=call_loader)
+            threads.append(t)
+            t.start()
+
+        for t in threads:
+            t.join()
+
+        # Fail if any errors occurred
+        assert (
+            len(errors) == 0
+        ), f"Unexpected errors during concurrent load: {errors}"
+
+        # All must have gotten a non-empty key
+        assert len(results) == 50, f"Expected 50 results, got {len(results)}"
+
+        first_priv = results[0][0]
+        # Every result must have the same non-empty private key
+        for i, (priv, pub) in enumerate(results):
+            assert priv == first_priv, (
+                f"Result {i} has different private key"
+            )
+            assert len(priv) > 0, f"Result {i} has empty private key"
+            assert b"PRIVATE" in priv, f"Result {i} private key is malformed"
+
+        # Verify file mode is 0o600
+        pem_file = key_path / "agent_registry_signing.pem"
+        assert pem_file.exists(), "Key file was never created"
+        mode = pem_file.stat().st_mode & 0o777
+        assert mode == 0o600, f"Key file mode is {oct(mode)}, expected 0o600"
+
+    def test_deterministic_race_reader_sees_empty_file_before_write(
+        self, tmp_path, monkeypatch
+    ):
+        """Deterministic variant of the R2-28 keypair race (the 50-thread test
+        above only catches it ~1 in 10 runs).
+
+        Forces the exact interleaving the bug requires: the writer has created
+        the key file (so it exists on disk) but has NOT yet written its bytes,
+        and a concurrent reader observes that empty file.
+
+        A controllable seam patches the file-CREATION step -- os.open on the
+        signing-key path -- to create an empty file, release the reader, and
+        only return so the writer can then populate the file. Against the pre-fix
+        load_or_create_signing_keypair (no FileLock; os.open creates the file
+        before os.write populates it) the reader observes b"" and
+        load_pem_private_key raises, so the test fails EVERY run. Against the
+        fixed code the FileLock serializes the reader behind the writer, so the
+        reader never sees the empty file and the test passes EVERY run.
+
+        The seam is deliberately narrow: it only intercepts an os.open whose
+        target path ends in the signing-key filename. The FileLock's *.lock fd,
+        atomic_write_bytes' temp file, and the sqlite store db all use different
+        paths and flow through untouched, so on the fixed code the seam is a pure
+        no-op and only the FileLock enforces safety.
+        """
+        import os
+        import threading
+
+        key_path = tmp_path / "keys"
+        results: list[tuple[str, bytes, bytes]] = []
+        errors: list[BaseException] = []
+
+        pem_name = "agent_registry_signing.pem"
+        # reader_may_go is set by the seam right after the writer creates the
+        # empty file (pre-fix path), releasing the reader to observe it. On the
+        # fixed code the seam never fires, so the writer sets reader_may_go in
+        # its own finally -- by then atomic_write_bytes has persisted real bytes.
+        reader_may_go = threading.Event()
+        # reader_done is set by the reader once it has attempted its load; the
+        # seam waits on it so the writer does not write over the reader's
+        # observation.
+        reader_done = threading.Event()
+        real_os_open = os.open
+
+        def seam_os_open(path, *args, **kwargs):
+            if isinstance(path, str) and path.endswith(pem_name):
+                fd = real_os_open(path, *args, **kwargs)
+                reader_may_go.set()
+                reader_done.wait(timeout=30)
+                return fd
+            return real_os_open(path, *args, **kwargs)
+
+        monkeypatch.setattr(os, "open", seam_os_open)
+
+        def writer():
+            try:
+                priv, pub = load_or_create_signing_keypair(key_path)
+                results.append(("writer", priv, pub))
+            except Exception as e:
+                errors.append(("writer", e))
+            finally:
+                reader_may_go.set()
+
+        def reader():
+            reader_may_go.wait(timeout=30)
+            try:
+                priv, pub = load_or_create_signing_keypair(key_path)
+                results.append(("reader", priv, pub))
+            except Exception as e:
+                errors.append(("reader", e))
+            finally:
+                reader_done.set()
+
+        w = threading.Thread(target=writer)
+        r = threading.Thread(target=reader)
+        w.start()
+        r.start()
+        w.join(timeout=60)
+        r.join(timeout=60)
+
+        assert not w.is_alive(), "writer thread did not finish"
+        assert not r.is_alive(), "reader thread did not finish"
+
+        # The race: a concurrent reader must never observe an empty/partial key.
+        assert not errors, f"expected no errors, got: {errors!r}"
+
+        by_role = {role: (priv, pub) for role, priv, pub in results}
+        assert set(by_role) == {"writer", "reader"}, f"incomplete results: {results!r}"
+
+        writer_priv = by_role["writer"][0]
+        reader_priv = by_role["reader"][0]
+        assert writer_priv == reader_priv, "reader observed a different key than writer"
+        assert b"PRIVATE" in writer_priv, "writer private key is malformed"
+        assert b"PRIVATE" in reader_priv, "reader private key is malformed"
+
+        pem_file = key_path / pem_name
+        assert pem_file.exists(), "key file was never created"
+        mode = pem_file.stat().st_mode & 0o777
+        assert mode == 0o600, f"key file mode is {oct(mode)}, expected 0o600"
 
 
 # ---------------------------------------------------------------------------
@@ -357,10 +571,72 @@ class TestRegister:
         assert r1["canonical_id"] != r2["canonical_id"]
 
     @pytest.mark.asyncio
+    async def test_concurrent_register_same_second_gets_suffix(self, store):
+        import asyncio
+        from unittest.mock import patch
+
+        with patch(
+            "tinyagentos.agent_registry_store.mint_canonical_id",
+            lambda slug, ts: f"{slug}-20261005-120000",
+        ):
+            rows = await asyncio.gather(
+                *[
+                    store.register(framework="openclaw", display_name="Racer")
+                    for _ in range(5)
+                ]
+            )
+        assert len(rows) == 5
+        canonical_ids = {r["canonical_id"] for r in rows}
+        assert len(canonical_ids) == 5
+        assert "racer-20261005-120000" in canonical_ids
+
+    @pytest.mark.asyncio
     async def test_not_initialized_raises(self, tmp_path):
         s = AgentRegistryStore(tmp_path / "not_init.db")
         with pytest.raises(RuntimeError, match="not initialised"):
             await s.register(framework="openclaw")
+
+    @pytest.mark.asyncio
+    async def test_collision_rollback_does_not_drop_concurrent_write(self, store):
+        """Concurrent register() calls with the same slug must not lose rows
+        via a shared-transaction rollback from a collision."""
+        import asyncio
+        from unittest.mock import patch
+
+        existing = await store.register(framework="openclaw", display_name="Existing")
+
+        with patch(
+            "tinyagentos.agent_registry_store.mint_canonical_id",
+            lambda slug, ts: f"{slug}-20261005-120000",
+        ):
+            results = await asyncio.gather(
+                *[
+                    store.register(framework="openclaw", display_name="Collision")
+                    for _ in range(50)
+                ],
+                *[
+                    store.update(existing["canonical_id"], display_name=f"Updated-{i}")
+                    for i in range(50)
+                ],
+                return_exceptions=True,
+            )
+
+        register_results = results[:50]
+        update_results = results[50:]
+
+        for r in register_results:
+            assert isinstance(r, dict), f"register raised or returned non-dict: {r}"
+            assert "canonical_id" in r
+
+        canonical_ids = {r["canonical_id"] for r in register_results}
+        assert len(canonical_ids) == 50, (
+            f"Expected 50 distinct canonical_ids, got {len(canonical_ids)}"
+        )
+
+        all_rows = await store.list_all()
+        assert len(all_rows) == 51
+
+        assert all(isinstance(r, dict) for r in update_results)
 
 
 # ---------------------------------------------------------------------------
@@ -647,6 +923,21 @@ class TestListRevoked:
         assert revoked[0]["revoked_at"] is not None
 
     @pytest.mark.asyncio
+    async def test_revoked_feed_scoped_to_agent_identities_only(self, store):
+        """Guard: the revocation feed covers agent identities only.
+
+        Decided 2026-08-13. Human credential withdrawal lives in the
+        session/auth layer, not this feed. Each entry must have exactly
+        canonical_id and revoked_at.
+        """
+        r1 = await store.register(framework="openclaw", display_name="Boundary")
+        await store.revoke(r1["canonical_id"])
+        revoked = await store.list_revoked()
+        assert len(revoked) == 1
+        assert revoked[0]["canonical_id"] == r1["canonical_id"]
+        assert set(revoked[0].keys()) == {"canonical_id", "revoked_at"}
+
+    @pytest.mark.asyncio
     async def test_not_initialized_raises(self, tmp_path):
         s = AgentRegistryStore(tmp_path / "not_init.db")
         with pytest.raises(RuntimeError, match="not initialised"):
@@ -875,24 +1166,51 @@ class TestRevoke:
         assert updated["status"] == "revoked"
 
     @pytest.mark.asyncio
-    async def test_revoke_nonexistent_returns_none(self, store):
-        result = await store.revoke("no-such-20260101-000000")
-        assert result is None
+    async def test_revoke_nonexistent_raises_key_error(self, store):
+        with pytest.raises(KeyError):
+            await store.revoke("no-such-20260101-000000")
 
     @pytest.mark.asyncio
-    async def test_revoke_idempotent(self, store):
+    async def test_revoke_idempotent_raises_on_second_call(self, store):
         row = await store.register(framework="openclaw", display_name="Idem")
         first = await store.revoke(row["canonical_id"])
-        second = await store.revoke(row["canonical_id"])
-        assert first["revoked_at"] == second["revoked_at"]
+        assert first["revoked_at"] is not None
         assert first["status"] == "revoked"
-        assert second["status"] == "revoked"
+        with pytest.raises(ValueError, match="invalid lifecycle transition"):
+            await store.revoke(row["canonical_id"])
 
     @pytest.mark.asyncio
     async def test_not_initialized_raises(self, tmp_path):
         s = AgentRegistryStore(tmp_path / "not_init.db")
         with pytest.raises(RuntimeError, match="not initialised"):
             await s.revoke("anything")
+
+    @pytest.mark.asyncio
+    async def test_revoke_from_illegal_state_raises_value_error(self, store):
+        """RED-FIRST: revoke from an already-revoked (terminal) state must raise
+        the same ValueError every other illegal transition raises, not silently
+        return the record."""
+        row = await store.register(framework="openclaw", display_name="Terminal")
+        await store.set_status(row["canonical_id"], "revoked")
+        with pytest.raises(ValueError, match="invalid lifecycle transition"):
+            await store.revoke(row["canonical_id"])
+
+
+# --------------------------------------------------------------------------
+# AgentRegistryStore: update handle collision
+# --------------------------------------------------------------------------
+
+
+class TestUpdateHandleCollision:
+    @pytest.mark.asyncio
+    async def test_update_handle_collision_raises_value_error(self, store):
+        """RED-FIRST: updating a handle to one another active agent owns must
+        raise ValueError mentioning the handle, not leak a raw sqlite
+        IntegrityError."""
+        a1 = await store.register(framework="openclaw", display_name="A1", handle="@alpha")
+        await store.register(framework="openclaw", display_name="A2", handle="@beta")
+        with pytest.raises(ValueError, match="already owned"):
+            await store.update(a1["canonical_id"], handle="@beta")
 
 
 # ---------------------------------------------------------------------------
@@ -1354,3 +1672,279 @@ async def test_get_by_slug_rejects_glob_metacharacters(store):
     assert await store.get_by_slug("alpha?") is None
     assert await store.get_by_slug("") is None
     assert await store.get_by_slug("Alpha") is None
+
+
+# ---------------------------------------------------------------------------
+# Migration v5: token_min_iat — existing-DB pathway
+# ---------------------------------------------------------------------------
+
+
+class TestMigrationV5ExistingDB:
+    """Verify the guarded ALTER works on a DB created *before* token_min_iat existed."""
+
+    @pytest.mark.asyncio
+    async def test_existing_db_gains_column_and_tokens_still_work(self, tmp_path, signing_keypair):
+        """Build the pre-change agent_registry schema by hand, insert a row,
+        then init the store.  The row must gain token_min_iat = 0 and old
+        tokens must still authenticate — a fresh-schema test would pass
+        vacuously because the column is already in SCHEMA.
+        """
+        import sqlite3
+
+        db_path = tmp_path / "pre_v5.db"
+        priv, pub = signing_keypair
+
+        # --- Build the pre-v5 schema by hand (no token_min_iat column) ---
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("""
+            CREATE TABLE agent_registry (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                canonical_id    TEXT    NOT NULL UNIQUE,
+                display_name    TEXT    NOT NULL DEFAULT '',
+                framework       TEXT    NOT NULL DEFAULT '',
+                user_id         TEXT    NOT NULL DEFAULT '',
+                origin          TEXT    NOT NULL DEFAULT 'taos-deployed',
+                handle          TEXT    NOT NULL DEFAULT '',
+                role            TEXT,
+                title           TEXT,
+                reports_to      TEXT,
+                capabilities    TEXT    NOT NULL DEFAULT '[]',
+                created_ts      TEXT    NOT NULL,
+                revoked_at      TEXT,
+                status          TEXT    NOT NULL DEFAULT 'active'
+            );
+        """)
+        # Insert a pre-existing row
+        conn.execute(
+            "INSERT INTO agent_registry "
+            "(canonical_id, display_name, framework, user_id, origin, "
+            "capabilities, created_ts, status) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "pre-v5-agent-20260101-000000",
+                "Pre V5 Agent",
+                "test",
+                "user-1",
+                "taos-deployed",
+                "[]",
+                "2026-01-01T00:00:00",
+                "active",
+            ),
+        )
+        conn.commit()
+        conn.close()
+
+        # --- Now init the store — this runs _migration_v5_add_token_min_iat ---
+        store = AgentRegistryStore(db_path)
+        await store.init()
+
+        # The pre-existing row should have gained token_min_iat = 0
+        row = await store.get("pre-v5-agent-20260101-000000")
+        assert row is not None
+        assert row["token_min_iat"] == 0
+        assert row["display_name"] == "Pre V5 Agent"
+
+        # Old tokens should still authenticate (token_min_iat=0 means no cutoff)
+        token = mint_registry_token(
+            "pre-v5-agent-20260101-000000", priv,
+            user_id="user-1", framework="test",
+        )
+        payload = verify_registry_token(token, pub)
+        assert payload["sub"] == "pre-v5-agent-20260101-000000"
+
+        await store.close()
+
+
+# ---------------------------------------------------------------------------
+# token_min_iat — per-identity token rotation
+# ---------------------------------------------------------------------------
+
+
+class TestBumpTokenMinIat:
+    @pytest.mark.asyncio
+    async def test_bump_sets_cutoff(self, store):
+        """bump_token_min_iat persists the cutoff and the new token_min_iat is
+        readable on the record."""
+        row = await store.register(framework="test", display_name="test-agent")
+        cid = row["canonical_id"]
+
+        ts = 1700000000
+        updated = await store.bump_token_min_iat(cid, ts)
+        assert updated is not None
+        assert updated["token_min_iat"] == ts
+
+        reread = await store.get(cid)
+        assert reread["token_min_iat"] == ts
+
+    @pytest.mark.asyncio
+    async def test_default_zero_on_new_registration(self, store):
+        """Freshly registered agents have token_min_iat = 0 so all tokens
+        are valid (migration-safe default)."""
+        row = await store.register(framework="test", display_name="test-agent")
+        assert row["token_min_iat"] == 0
+
+    @pytest.mark.asyncio
+    async def test_bump_advances_strictly_even_for_a_stale_ts(self, store):
+        """Successive bumps never share a cutoff, whatever ``ts`` is passed.
+
+        The update is a single ``MAX(token_min_iat + 1, ?)``: two rotations that
+        read the same stored cutoff and both computed a target from it (or a
+        caller passing a stale/smaller ts) must still land on DIFFERENT values.
+        A shared cutoff is the dangerous case -- a rotation's replacement would
+        be born already superseded (``iat == token_min_iat`` is accepted, so the
+        previous token survives too).
+        """
+        row = await store.register(framework="test", display_name="test-agent")
+        cid = row["canonical_id"]
+
+        first = await store.bump_token_min_iat(cid, 1000)
+        assert first["token_min_iat"] == 1000
+
+        # A smaller/stale ts still advances by one rather than rewriting 1000.
+        second = await store.bump_token_min_iat(cid, 500)
+        assert second["token_min_iat"] == 1001
+
+        # And a ts equal to the stored value advances too.
+        third = await store.bump_token_min_iat(cid, 1001)
+        assert third["token_min_iat"] == 1002
+
+    @pytest.mark.asyncio
+    async def test_bump_nonexistent_returns_none(self, store):
+        """bump_token_min_iat on an unknown canonical_id returns None."""
+        result = await store.bump_token_min_iat("no-such-agent-20260101-000000", 1700000000)
+        assert result is None
+
+
+# ---------------------------------------------------------------------------
+# AgentRegistryStore: adopt (account-device-sync S1)
+# ---------------------------------------------------------------------------
+
+
+class TestAdopt:
+    @pytest.mark.asyncio
+    async def test_adopt_keeps_canonical_id_byte_for_byte(self, store):
+        row = await store.adopt(
+            canonical_id="alpha-20260101-120000-0a",
+            framework="openclaw",
+            created_ts="2026-01-01T12:00:00+00:00",
+            display_name="Alpha",
+            user_id="user-1",
+        )
+        assert row["canonical_id"] == "alpha-20260101-120000-0a"
+        assert row["created_ts"] == "2026-01-01T12:00:00+00:00"
+        fetched = await store.get("alpha-20260101-120000-0a")
+        assert fetched is not None
+        assert fetched["canonical_id"] == "alpha-20260101-120000-0a"
+        assert fetched["created_ts"] == "2026-01-01T12:00:00+00:00"
+
+    @pytest.mark.asyncio
+    async def test_adopt_is_idempotent_for_same_agent(self, store):
+        first = await store.adopt(
+            canonical_id="alpha-20260101-120000-0a",
+            framework="openclaw",
+            created_ts="2026-01-01T12:00:00+00:00",
+            handle="@alpha",
+        )
+        second = await store.adopt(
+            canonical_id="alpha-20260101-120000-0a",
+            framework="openclaw",
+            created_ts="2026-01-01T12:00:00+00:00",
+            handle="@alpha",
+        )
+        assert first["canonical_id"] == second["canonical_id"]
+        rows = await store.list_all()
+        assert len(rows) == 1
+
+    @pytest.mark.asyncio
+    async def test_adopt_refuses_collision_with_different_agent(self, store):
+        original = await store.register(
+            framework="openclaw",
+            display_name="Original",
+            handle="@original",
+        )
+        cid = original["canonical_id"]
+        with pytest.raises(ValueError, match="already belongs to a different agent"):
+            await store.adopt(
+                canonical_id=cid,
+                framework="openclaw",
+                created_ts="2026-01-01T12:00:00+00:00",
+                handle="@different",
+            )
+        unchanged = await store.get(cid)
+        assert unchanged is not None
+        assert unchanged["handle"] == "@original"
+        assert unchanged["framework"] == "openclaw"
+        assert len(await store.list_all()) == 1
+
+    @pytest.mark.asyncio
+    async def test_adopt_refuses_handle_held_by_other_active_agent(self, store):
+        await store.register(
+            framework="openclaw",
+            display_name="Owner",
+            handle="@shared",
+        )
+        with pytest.raises(ValueError, match="handle.*@shared.*already owned"):
+            await store.adopt(
+                canonical_id="beta-20260101-120000-0b",
+                framework="openclaw",
+                created_ts="2026-01-01T12:00:00+00:00",
+                handle="@shared",
+            )
+
+    @pytest.mark.asyncio
+    async def test_adopt_refuses_malformed_id(self, store):
+        for bad in ("alpha", "Alpha-20260101-120000", "alpha-2026-120000"):
+            with pytest.raises(ValueError, match="malformed canonical_id"):
+                await store.adopt(
+                    canonical_id=bad,
+                    framework="openclaw",
+                    created_ts="2026-01-01T12:00:00+00:00",
+                )
+
+    @pytest.mark.asyncio
+    async def test_adopt_reserved_prefix_refused_unless_allowed(self, store):
+        with pytest.raises(ValueError, match="reserved prefix"):
+            await store.adopt(
+                canonical_id="taos-agent-20260101-120000",
+                framework="taos-internal",
+                created_ts="2026-01-01T12:00:00+00:00",
+            )
+        row = await store.adopt(
+            canonical_id="taos-agent-20260101-120000",
+            framework="taos-internal",
+            created_ts="2026-01-01T12:00:00+00:00",
+            allow_reserved=True,
+        )
+        assert row["canonical_id"] == "taos-agent-20260101-120000"
+
+    @pytest.mark.asyncio
+    async def test_register_mint_path_unchanged_after_adopt(self, store):
+        await store.adopt(
+            canonical_id="alpha-20260101-120000-0a",
+            framework="openclaw",
+            created_ts="2026-01-01T12:00:00+00:00",
+        )
+        row = await store.register(framework="openclaw", display_name="Minted")
+        assert row["canonical_id"].startswith("minted-")
+        assert len(row["canonical_id"].rsplit("-", 2)[-2]) == 8
+        assert len(row["canonical_id"].rsplit("-", 2)[-1]) == 6
+
+    @pytest.mark.asyncio
+    async def test_adopt_not_initialized_raises(self, tmp_path):
+        s = AgentRegistryStore(tmp_path / "not_init.db")
+        with pytest.raises(RuntimeError, match="not initialised"):
+            await s.adopt(
+                canonical_id="alpha-20260101-120000-0a",
+                framework="openclaw",
+                created_ts="2026-01-01T12:00:00+00:00",
+            )
+
+    @pytest.mark.asyncio
+    async def test_adopt_invalid_status_raises(self, store):
+        with pytest.raises(ValueError, match="unknown status"):
+            await store.adopt(
+                canonical_id="alpha-20260101-120000-0a",
+                framework="openclaw",
+                created_ts="2026-01-01T12:00:00+00:00",
+                status="bogus",
+            )

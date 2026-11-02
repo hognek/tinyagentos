@@ -1,0 +1,503 @@
+"""Tests for scripts/check_all_skip.py."""
+from __future__ import annotations
+
+import importlib.util
+import sys
+from pathlib import Path
+from unittest.mock import patch
+
+import pytest
+
+_SCRIPT = (
+    Path(__file__).resolve().parent.parent.parent / ".github" / "scripts" / "check_all_skip.py"
+)
+
+
+def _load_module():
+    spec = importlib.util.spec_from_file_location("check_all_skip", _SCRIPT)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["check_all_skip"] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+@pytest.fixture(scope="module")
+def check_mod():
+    return _load_module()
+
+
+class TestCountDefinedTests:
+    def test_counts_module_level_test_functions(self, check_mod, tmp_path: Path) -> None:
+        test_file = tmp_path / "test_foo.py"
+        test_file.write_text(
+            "def test_a():\n    assert True\n"
+            "def test_b():\n    assert True\n"
+        )
+        assert check_mod._count_defined_tests(str(test_file)) == 2
+
+    def test_counts_test_methods_in_test_class(self, check_mod, tmp_path: Path) -> None:
+        test_file = tmp_path / "test_foo.py"
+        test_file.write_text(
+            "class TestSomething:\n"
+            "    def test_a(self):\n"
+            "        assert True\n"
+            "    def test_b(self):\n"
+            "        assert True\n"
+        )
+        assert check_mod._count_defined_tests(str(test_file)) == 2
+
+    def test_counts_async_test_functions(self, check_mod, tmp_path: Path) -> None:
+        test_file = tmp_path / "test_foo.py"
+        test_file.write_text(
+            "async def test_a():\n    assert True\n"
+            "async def test_b():\n    assert True\n"
+        )
+        assert check_mod._count_defined_tests(str(test_file)) == 2
+
+    def test_ignores_non_test_functions(self, check_mod, tmp_path: Path) -> None:
+        test_file = tmp_path / "test_foo.py"
+        test_file.write_text(
+            "def helper():\n    pass\n"
+            "def test_a():\n    assert True\n"
+        )
+        assert check_mod._count_defined_tests(str(test_file)) == 1
+
+    def test_missing_file_returns_zero(self, check_mod, tmp_path: Path) -> None:
+        assert check_mod._count_defined_tests(str(tmp_path / "nonexistent.py")) == 0
+
+    def test_syntax_error_returns_zero(self, check_mod, tmp_path: Path) -> None:
+        test_file = tmp_path / "test_bad.py"
+        test_file.write_text("def test_a(:\n    pass\n")
+        assert check_mod._count_defined_tests(str(test_file)) == 0
+
+    def test_no_tests_returns_zero(self, check_mod, tmp_path: Path) -> None:
+        test_file = tmp_path / "test_foo.py"
+        test_file.write_text("x = 1\n")
+        assert check_mod._count_defined_tests(str(test_file)) == 0
+
+
+class TestMainZeroCollectedWithDefinedTests:
+    """0 outcomes for a file with defined tests must be a violation."""
+
+    def test_zero_collected_with_defined_tests_is_not_clean(
+        self, check_mod, tmp_path: Path, capsys: pytest.CaptureFixture
+    ) -> None:
+        test_file = tmp_path / "test_zero_collected.py"
+        test_file.write_text(
+            "class TestSomething:\n"
+            "    def __init__(self):\n"
+            "        pass\n"
+            "    def test_a(self):\n"
+            "        assert True\n"
+            "    def test_b(self):\n"
+            "        assert True\n"
+        )
+        results = {
+            str(test_file): {
+                "total": 0,
+                "skipped": 0,
+                "passed": 0,
+                "failed": 0,
+                "errors": 0,
+                "returncode": 5,
+                "tail": "",
+                "import_guards": [],
+                "defined_tests": check_mod._count_defined_tests(str(test_file)),
+            }
+        }
+        with patch.object(check_mod, "resolve_base_ref", return_value="origin/dev"):
+            with patch.object(check_mod, "get_test_outcomes", return_value=results):
+                with patch.object(check_mod, "find_changed_test_files", return_value=[str(test_file)]):
+                    with patch.object(check_mod, "get_pr_body", return_value=""):
+                        with patch.object(check_mod.os, "environ", {"BASE_REF": "origin/dev"}):
+                            rc = check_mod.main()
+        captured = capsys.readouterr()
+        assert rc == 1
+        assert "collection yielded 0 of 2 defined tests" in captured.out
+
+    def test_zero_collected_without_defined_tests_stays_clean(
+        self, check_mod, tmp_path: Path, capsys: pytest.CaptureFixture
+    ) -> None:
+        test_file = tmp_path / "test_helper_only.py"
+        test_file.write_text("x = 1\n")
+        results = {
+            str(test_file): {
+                "total": 0,
+                "skipped": 0,
+                "passed": 0,
+                "failed": 0,
+                "errors": 0,
+                "returncode": 5,
+                "tail": "",
+                "import_guards": [],
+                "defined_tests": 0,
+            }
+        }
+        with patch.object(check_mod, "resolve_base_ref", return_value="origin/dev"):
+            with patch.object(check_mod, "get_test_outcomes", return_value=results):
+                with patch.object(check_mod, "find_changed_test_files", return_value=[str(test_file)]):
+                    with patch.object(check_mod, "get_pr_body", return_value=""):
+                        with patch.object(check_mod.os, "environ", {"BASE_REF": "origin/dev"}):
+                            rc = check_mod.main()
+        captured = capsys.readouterr()
+        assert rc == 0
+        assert "has 0 test outcomes, skipping check" in captured.out
+
+
+    def test_zero_collected_summary_names_violation(
+        self, check_mod, tmp_path: Path, capsys: pytest.CaptureFixture
+    ) -> None:
+        test_file = tmp_path / "test_zc.py"
+        test_file.write_text(
+            "class TestSomething:\n"
+            "    def __init__(self):\n"
+            "        pass\n"
+            "    def test_a(self):\n"
+            "        assert True\n"
+            "    def test_b(self):\n"
+            "        assert True\n"
+        )
+        results = {
+            str(test_file): {
+                "total": 0,
+                "skipped": 0,
+                "passed": 0,
+                "failed": 0,
+                "errors": 0,
+                "returncode": 5,
+                "tail": "",
+                "import_guards": [],
+                "defined_tests": check_mod._count_defined_tests(str(test_file)),
+            }
+        }
+        with patch.object(check_mod, "resolve_base_ref", return_value="origin/dev"):
+            with patch.object(check_mod, "get_test_outcomes", return_value=results):
+                with patch.object(check_mod, "find_changed_test_files", return_value=[str(test_file)]):
+                    with patch.object(check_mod, "get_pr_body", return_value=""):
+                        with patch.object(check_mod.os, "environ", {"BASE_REF": "origin/dev"}):
+                            rc = check_mod.main()
+        captured = capsys.readouterr()
+        assert rc == 1
+        assert "collection yielded 0 of 2 defined tests" in captured.out
+        assert "yielded no collected tests" in captured.out
+
+    def test_waived_all_skip_not_counted_in_error_line(
+        self, check_mod, tmp_path: Path, capsys: pytest.CaptureFixture
+    ) -> None:
+        """A WAIVED all-skip file did not fail — the ::error line must not count it."""
+        zc_file = tmp_path / "test_zc.py"
+        zc_file.write_text("def test_a():\n    assert True\n")
+        waived_file = tmp_path / "test_waived.py"
+        waived_file.write_text("def test_b():\n    assert True\n")
+        results = {
+            str(zc_file): {
+                "total": 0, "skipped": 0, "passed": 0, "failed": 0,
+                "errors": 0, "returncode": 5, "tail": "",
+                "import_guards": [],
+                "defined_tests": check_mod._count_defined_tests(str(zc_file)),
+            },
+            str(waived_file): {
+                "total": 2, "skipped": 2, "passed": 0, "failed": 0,
+                "errors": 0, "returncode": 0, "tail": "",
+                "import_guards": ["pytest.importorskip"],
+                "defined_tests": 2,
+            },
+        }
+        pr_body = "Tests-Skipped-Intentionally: test_waived.py, landing ahead of code\n"
+        with patch.object(check_mod, "resolve_base_ref", return_value="origin/dev"):
+            with patch.object(check_mod, "get_test_outcomes", return_value=results):
+                with patch.object(check_mod, "find_changed_test_files", return_value=[str(zc_file), str(waived_file)]):
+                    with patch.object(check_mod, "get_pr_body", return_value=pr_body):
+                        with patch.object(check_mod.os, "environ", {"BASE_REF": "origin/dev"}):
+                            rc = check_mod.main()
+        captured = capsys.readouterr()
+        assert rc == 1
+        assert "1 file(s) yielded no collected tests" in captured.out
+        assert "have all tests skipping" not in captured.out
+
+
+class TestMainAllSkipStillFails:
+    def test_all_skips_is_violation(self, check_mod, capsys: pytest.CaptureFixture) -> None:
+        results = {
+            "tests/test_foo.py": {
+                "total": 3,
+                "skipped": 3,
+                "passed": 0,
+                "failed": 0,
+                "errors": 0,
+                "returncode": 0,
+                "tail": "",
+                "import_guards": [],
+                "defined_tests": 3,
+            }
+        }
+        with patch.object(check_mod, "resolve_base_ref", return_value="origin/dev"):
+            with patch.object(check_mod, "get_test_outcomes", return_value=results):
+                with patch.object(check_mod, "find_changed_test_files", return_value=["tests/test_foo.py"]):
+                    with patch.object(check_mod, "get_pr_body", return_value=""):
+                        with patch.object(check_mod.os, "environ", {"BASE_REF": "origin/dev"}):
+                            rc = check_mod.main()
+        assert rc == 1
+        captured = capsys.readouterr()
+        assert "all 3 of 3 tests skip" in captured.out
+
+    def test_all_skips_waived_by_escape_hatch(
+        self, check_mod, capsys: pytest.CaptureFixture
+    ) -> None:
+        results = {
+            "tests/test_foo.py": {
+                "total": 3,
+                "skipped": 3,
+                "passed": 0,
+                "failed": 0,
+                "errors": 0,
+                "returncode": 0,
+                "tail": "",
+                "import_guards": [],
+                "defined_tests": 3,
+            }
+        }
+        pr_body = "Tests-Skipped-Intentionally: test_foo.py, landing ahead of code\n"
+        with patch.object(check_mod, "resolve_base_ref", return_value="origin/dev"):
+            with patch.object(check_mod, "get_test_outcomes", return_value=results):
+                with patch.object(check_mod, "find_changed_test_files", return_value=["tests/test_foo.py"]):
+                    with patch.object(check_mod, "get_pr_body", return_value=pr_body):
+                        with patch.object(check_mod.os, "environ", {"BASE_REF": "origin/dev"}):
+                            rc = check_mod.main()
+        assert rc == 0
+        captured = capsys.readouterr()
+        assert "WAIVED" in captured.out
+
+
+class TestHasEscapeHatchBasenameMatch:
+    """has_escape_hatch must accept both bare basename and full path in the trailer."""
+
+    def test_full_path_trailer_accepted(self, check_mod) -> None:
+        assert check_mod.has_escape_hatch(
+            "Tests-Skipped-Intentionally: tests/taosnet/test_torrent_downloader_taosnet.py, why",
+            "tests/taosnet/test_torrent_downloader_taosnet.py",
+        ) is True
+
+    def test_bak_suffix_still_rejected(self, check_mod) -> None:
+        assert check_mod.has_escape_hatch(
+            "Tests-Skipped-Intentionally: test_x.py.bak, why",
+            "test_x.py",
+        ) is False
+
+
+class TestMainPartialSkipsPass:
+    def test_partial_skips_pass(self, check_mod, capsys: pytest.CaptureFixture) -> None:
+        results = {
+            "tests/test_foo.py": {
+                "total": 5,
+                "skipped": 2,
+                "passed": 3,
+                "failed": 0,
+                "errors": 0,
+                "returncode": 0,
+                "tail": "",
+                "import_guards": [],
+                "defined_tests": 5,
+            }
+        }
+        with patch.object(check_mod, "resolve_base_ref", return_value="origin/dev"):
+            with patch.object(check_mod, "get_test_outcomes", return_value=results):
+                with patch.object(check_mod, "find_changed_test_files", return_value=["tests/test_foo.py"]):
+                    with patch.object(check_mod, "get_pr_body", return_value=""):
+                        with patch.object(check_mod.os, "environ", {"BASE_REF": "origin/dev"}):
+                            rc = check_mod.main()
+        assert rc == 0
+        captured = capsys.readouterr()
+        assert "2/5 tests skip" in captured.out
+
+
+class TestErrorsCountedAndReported:
+    def test_errors_parsed_from_stdout(
+        self, check_mod, tmp_path: Path
+    ) -> None:
+        test_file = tmp_path / "test_errors.py"
+        test_file.write_text(
+            "def test_a():\n    assert True\n"
+            "def test_b():\n    assert True\n"
+            "def test_c():\n    assert True\n"
+        )
+        fake_proc = type("FakeProc", (), {})()
+        fake_proc.returncode = 1
+        fake_proc.stdout = (
+            "ERROR tests/test_errors.py::test_a - RuntimeError: boom\n"
+            "ERROR tests/test_errors.py::test_b - RuntimeError: boom\n"
+            "ERROR tests/test_errors.py::test_c - RuntimeError: boom\n"
+            "3 errors in 0.10s\n"
+        )
+        fake_proc.stderr = ""
+
+        with patch.object(check_mod.subprocess, "run", return_value=fake_proc):
+            results = check_mod.get_test_outcomes([str(test_file)])
+
+        info = results[str(test_file)]
+        assert info["errors"] == 3
+        assert info["total"] == 3
+
+    def test_error_file_fails_without_collection_yielded_message(
+        self, check_mod, tmp_path: Path, capsys: pytest.CaptureFixture
+    ) -> None:
+        test_file = tmp_path / "test_errors.py"
+        test_file.write_text(
+            "def test_a():\n    assert True\n"
+            "def test_b():\n    assert True\n"
+            "def test_c():\n    assert True\n"
+        )
+        results = {
+            str(test_file): {
+                "total": 3,
+                "skipped": 0,
+                "passed": 0,
+                "failed": 0,
+                "errors": 3,
+                "returncode": 1,
+                "tail": "ERROR tests/test_errors.py::test_a - RuntimeError: boom\n",
+                "import_guards": [],
+                "defined_tests": 3,
+            }
+        }
+        with patch.object(check_mod, "resolve_base_ref", return_value="origin/dev"):
+            with patch.object(check_mod, "get_test_outcomes", return_value=results):
+                with patch.object(check_mod, "find_changed_test_files", return_value=[str(test_file)]):
+                    with patch.object(check_mod, "get_pr_body", return_value=""):
+                        with patch.object(check_mod.os, "environ", {"BASE_REF": "origin/dev"}):
+                            rc = check_mod.main()
+        captured = capsys.readouterr()
+        assert rc == 1
+        assert "collection yielded" not in captured.out
+        assert "boom" in captured.out
+
+    def test_rc5_no_tests_ran_still_reports_collection_message(
+        self, check_mod, tmp_path: Path, capsys: pytest.CaptureFixture
+    ) -> None:
+        test_file = tmp_path / "test_empty.py"
+        test_file.write_text(
+            "def test_a():\n    assert True\n"
+        )
+        results = {
+            str(test_file): {
+                "total": 0,
+                "skipped": 0,
+                "passed": 0,
+                "failed": 0,
+                "errors": 0,
+                "returncode": 5,
+                "tail": "no tests ran\n",
+                "import_guards": [],
+                "defined_tests": 1,
+            }
+        }
+        with patch.object(check_mod, "resolve_base_ref", return_value="origin/dev"):
+            with patch.object(check_mod, "get_test_outcomes", return_value=results):
+                with patch.object(check_mod, "find_changed_test_files", return_value=[str(test_file)]):
+                    with patch.object(check_mod, "get_pr_body", return_value=""):
+                        with patch.object(check_mod.os, "environ", {"BASE_REF": "origin/dev"}):
+                            rc = check_mod.main()
+        captured = capsys.readouterr()
+        assert rc == 1
+        assert "collection yielded 0 of 1 defined tests" in captured.out
+
+
+class TestFailureReasonOutput:
+    """The script must write failure_reason to GITHUB_OUTPUT so the workflow can choose the right comment."""
+
+    def test_collection_error_writes_reason_and_no_waiver(
+        self, check_mod, tmp_path: Path, capsys: pytest.CaptureFixture
+    ) -> None:
+        github_output = tmp_path / "github_output.txt"
+        test_file = tmp_path / "test_crash.py"
+        test_file.write_text(
+            "def test_a():\n    assert True\n"
+        )
+        with patch.object(check_mod, "resolve_base_ref", return_value="origin/dev"):
+            with patch.object(
+                check_mod,
+                "get_test_outcomes",
+                side_effect=check_mod.CollectionError(str(test_file)),
+            ):
+                with patch.object(check_mod, "find_changed_test_files", return_value=[str(test_file)]):
+                    with patch.object(check_mod, "get_pr_body", return_value=""):
+                        env = {"BASE_REF": "origin/dev", "GITHUB_OUTPUT": str(github_output)}
+                        with patch.object(check_mod.os, "environ", env):
+                            rc = check_mod.main()
+        captured = capsys.readouterr()
+        assert rc == 1
+        output_text = github_output.read_text()
+        assert "failure_reason=collection_error" in output_text
+
+    def test_all_skip_writes_reason_and_contains_waiver(
+        self, check_mod, tmp_path: Path, capsys: pytest.CaptureFixture
+    ) -> None:
+        github_output = tmp_path / "github_output.txt"
+        results = {
+            "tests/test_foo.py": {
+                "total": 3,
+                "skipped": 3,
+                "passed": 0,
+                "failed": 0,
+                "errors": 0,
+                "returncode": 0,
+                "tail": "",
+                "import_guards": [],
+                "defined_tests": 3,
+            }
+        }
+        with patch.object(check_mod, "resolve_base_ref", return_value="origin/dev"):
+            with patch.object(check_mod, "get_test_outcomes", return_value=results):
+                with patch.object(check_mod, "find_changed_test_files", return_value=["tests/test_foo.py"]):
+                    with patch.object(check_mod, "get_pr_body", return_value=""):
+                        env = {"BASE_REF": "origin/dev", "GITHUB_OUTPUT": str(github_output)}
+                        with patch.object(check_mod.os, "environ", env):
+                            rc = check_mod.main()
+        captured = capsys.readouterr()
+        assert rc == 1
+        output_text = github_output.read_text()
+        assert "failure_reason=all_skip" in output_text
+
+    def test_collection_error_and_all_skip_produce_different_reasons(
+        self, check_mod, tmp_path: Path
+    ) -> None:
+        collection_output = tmp_path / "collection_output.txt"
+        allskip_output = tmp_path / "allskip_output.txt"
+
+        test_file = tmp_path / "test_crash.py"
+        test_file.write_text("def test_a():\n    assert True\n")
+
+        collection_results = {}  # not used, side_effect raises
+        allskip_results = {
+            "tests/test_foo.py": {
+                "total": 3, "skipped": 3, "passed": 0, "failed": 0,
+                "errors": 0, "returncode": 0, "tail": "",
+                "import_guards": [], "defined_tests": 3,
+            }
+        }
+
+        with patch.object(check_mod, "resolve_base_ref", return_value="origin/dev"):
+            with patch.object(
+                check_mod,
+                "get_test_outcomes",
+                side_effect=check_mod.CollectionError(str(test_file)),
+            ):
+                with patch.object(check_mod, "find_changed_test_files", return_value=[str(test_file)]):
+                    with patch.object(check_mod, "get_pr_body", return_value=""):
+                        env = {"BASE_REF": "origin/dev", "GITHUB_OUTPUT": str(collection_output)}
+                        with patch.object(check_mod.os, "environ", env):
+                            check_mod.main()
+
+        with patch.object(check_mod, "resolve_base_ref", return_value="origin/dev"):
+            with patch.object(check_mod, "get_test_outcomes", return_value=allskip_results):
+                with patch.object(check_mod, "find_changed_test_files", return_value=["tests/test_foo.py"]):
+                    with patch.object(check_mod, "get_pr_body", return_value=""):
+                        env = {"BASE_REF": "origin/dev", "GITHUB_OUTPUT": str(allskip_output)}
+                        with patch.object(check_mod.os, "environ", env):
+                            check_mod.main()
+
+        collection_reason = collection_output.read_text()
+        allskip_reason = allskip_output.read_text()
+        assert collection_reason != allskip_reason
+        assert "failure_reason=collection_error" in collection_reason
+        assert "failure_reason=all_skip" in allskip_reason

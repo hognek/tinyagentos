@@ -3,7 +3,9 @@
 POST /api/trace — any taOS-owned caller records an event. agent_name
 picks the per-agent, per-hour bucket in the home-folder mount.
 
-GET /api/agents/{name}/trace — librarian reads structured history.
+GET /api/agents/{name}/trace: librarian reads structured history. Audit
+rows (SERVER_ONLY_KINDS) are returned only to the user whose ``user_id``
+they carry.
 GET /api/agents/{name}/otel-spans — OTel span store (Phase 1 foundation).
 
 POST /api/lifecycle/notify — LiteLLM callback resets keep-alive timer.
@@ -16,7 +18,8 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from tinyagentos.trace_store import SCHEMA_VERSION, VALID_KINDS
+from tinyagentos.trace_store import SCHEMA_VERSION, SERVER_ONLY_KINDS, VALID_KINDS
+from tinyagentos.otel.span_store import _safe_slug
 
 logger = logging.getLogger(__name__)
 
@@ -49,9 +52,15 @@ async def post_trace(request: Request, body: TraceIn):
         return JSONResponse({"error": "trace registry not configured"}, status_code=503)
     if body.kind not in VALID_KINDS:
         return JSONResponse({"error": f"unknown kind {body.kind!r}"}, status_code=400)
-    store = await registry.get(body.agent_name)
+    if body.kind in SERVER_ONLY_KINDS:
+        return JSONResponse({"error": f"kind {body.kind!r} is written by taOS only"}, status_code=400)
+    agent_name = getattr(request.state, "agent_name", None) or body.agent_name
+    safe_slug = _safe_slug(agent_name)
+    if not agent_name or safe_slug == "_system":
+        return JSONResponse({"error": f"invalid agent_name {agent_name!r}"}, status_code=400)
+    store = await registry.get(safe_slug)
     env = await store.record(body.kind, **body.model_dump(exclude={"agent_name", "kind"}))
-    return {"id": env["id"], "agent_name": body.agent_name, "schema_version": SCHEMA_VERSION}
+    return {"id": env["id"], "agent_name": safe_slug, "schema_version": SCHEMA_VERSION}
 
 
 @router.get("/api/agents/{name}/trace")
@@ -68,12 +77,25 @@ async def list_agent_trace(
     registry = getattr(request.app.state, "trace_registry", None)
     if registry is None:
         return JSONResponse({"error": "trace registry not configured"}, status_code=503)
-    store = await registry.get(name)
+    safe_slug = _safe_slug(name)
+    if not name or safe_slug == "_system":
+        return JSONResponse({"error": f"invalid agent_name {name!r}"}, status_code=400)
+    store = await registry.get(safe_slug)
+    audit_only = kind in SERVER_ONLY_KINDS
     events = await store.list(
         kind=kind, channel_id=channel_id, trace_id=trace_id,
-        since=since, until=until, limit=limit,
+        since=since, until=until,
+        # Audit rows are filtered per user below; read the widest window so
+        # other accounts' rows do not crowd the caller's own out of the slice.
+        limit=1000 if audit_only else limit,
     )
-    return {"agent_name": name, "schema_version": SCHEMA_VERSION, "events": events}
+    uid = getattr(request.state, "user_id", None)
+    events = [
+        e for e in events
+        if e.get("kind") not in SERVER_ONLY_KINDS
+        or (uid and (e.get("payload") or {}).get("user_id") == uid)
+    ][: max(1, min(limit, 1000))]
+    return {"agent_name": safe_slug, "schema_version": SCHEMA_VERSION, "events": events}
 
 
 @router.get("/api/agents/{name}/otel-spans")

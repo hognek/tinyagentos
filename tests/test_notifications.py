@@ -1,3 +1,4 @@
+import asyncio
 import time
 
 import aiosqlite
@@ -5,6 +6,9 @@ import pytest
 import pytest_asyncio
 
 from tinyagentos.notifications import NotificationStore
+
+
+TIMESTAMP_KINDS = ["same_second", "pre_existing_1s_earlier"]
 
 
 @pytest_asyncio.fixture
@@ -17,6 +21,17 @@ async def notif_store(tmp_path):
 
 @pytest.mark.asyncio
 class TestNotificationStore:
+    @staticmethod
+    async def _add_with_timestamp(store, title, message, *, timestamp=None):
+        if timestamp is None:
+            await store.add(title, message)
+        else:
+            await store._db.execute(
+                "INSERT INTO notifications (timestamp, level, title, message, source, read, archived, data, user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (timestamp, "info", title, message, "system", 0, 0, None, None),
+            )
+            await store._db.commit()
+
     async def test_add_and_list(self, notif_store):
         await notif_store.add("Test title", "Test message", level="info", source="test")
         items = await notif_store.list()
@@ -33,14 +48,23 @@ class TestNotificationStore:
         await notif_store.add("B", "b")
         assert await notif_store.unread_count() == 2
 
-    async def test_mark_read(self, notif_store):
-        await notif_store.add("A", "a")
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("timestamp_kind", TIMESTAMP_KINDS)
+    async def test_mark_read(self, notif_store, timestamp_kind):
+        ts = int(time.time())
+        pre_ts = ts - 1 if timestamp_kind == "pre_existing_1s_earlier" else ts
+        await self._add_with_timestamp(notif_store, "A", "a", timestamp=ts if timestamp_kind == "same_second" else None)
+        await self._add_with_timestamp(notif_store, "B", "b", timestamp=pre_ts if timestamp_kind == "pre_existing_1s_earlier" else None)
         items = await notif_store.list()
-        notif_id = items[0]["id"]
+        matches = [i for i in items if i["title"] == "B"]
+        assert len(matches) == 1, f"Expected exactly 1 row with title 'B', got {len(matches)}"
+        notif_id = matches[0]["id"]
         await notif_store.mark_read(notif_id)
-        assert await notif_store.unread_count() == 0
+        assert await notif_store.unread_count() == 1
         items = await notif_store.list()
-        assert items[0]["read"] is True
+        b_matches = [i for i in items if i["title"] == "B"]
+        assert len(b_matches) == 1
+        assert b_matches[0]["read"] is True
 
     async def test_mark_all_read(self, notif_store):
         await notif_store.add("A", "a")
@@ -80,38 +104,60 @@ class TestNotificationStore:
         history = await notif_store.list_archived()
         assert [h["title"] for h in history] == ["OldDismissed"]
 
-    async def test_list_unread_only(self, notif_store):
-        await notif_store.add("A", "a")
-        await notif_store.add("B", "b")
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("timestamp_kind", TIMESTAMP_KINDS)
+    async def test_list_unread_only(self, notif_store, timestamp_kind):
+        ts = int(time.time())
+        pre_ts = ts - 1 if timestamp_kind == "pre_existing_1s_earlier" else ts
+        await self._add_with_timestamp(notif_store, "A", "a", timestamp=ts if timestamp_kind == "same_second" else None)
+        await self._add_with_timestamp(notif_store, "B", "b", timestamp=pre_ts if timestamp_kind == "pre_existing_1s_earlier" else None)
         items = await notif_store.list()
-        await notif_store.mark_read(items[0]["id"])
+        b_matches = [i for i in items if i["title"] == "B"]
+        assert len(b_matches) == 1
+        b_id = b_matches[0]["id"]
+        await notif_store.mark_read(b_id)
         unread = await notif_store.list(unread_only=True)
         assert len(unread) == 1
+        assert unread[0]["title"] == "A"
 
-    async def test_archive_hides_from_active_list(self, notif_store):
-        await notif_store.add("A", "a")
-        await notif_store.add("B", "b")
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("timestamp_kind", TIMESTAMP_KINDS)
+    async def test_archive_hides_from_active_list(self, notif_store, timestamp_kind):
+        ts = int(time.time())
+        pre_ts = ts - 1 if timestamp_kind == "pre_existing_1s_earlier" else ts
+        await self._add_with_timestamp(notif_store, "A", "a", timestamp=ts if timestamp_kind == "same_second" else None)
+        await self._add_with_timestamp(notif_store, "B", "b", timestamp=pre_ts if timestamp_kind == "pre_existing_1s_earlier" else None)
         items = await notif_store.list()
-        await notif_store.archive(items[0]["id"])
+        b_matches = [i for i in items if i["title"] == "B"]
+        assert len(b_matches) == 1
+        b_id = b_matches[0]["id"]
+        await notif_store.archive(b_id)
         active = await notif_store.list()
         assert len(active) == 1
-        assert items[0]["id"] not in [i["id"] for i in active]
+        assert b_id not in [i["id"] for i in active]
 
     async def test_archived_appears_in_history(self, notif_store):
         await notif_store.add("A", "a")
         items = await notif_store.list()
-        await notif_store.archive(items[0]["id"])
+        a_id = next(i["id"] for i in items if i["title"] == "A")
+        await notif_store.archive(a_id)
         history = await notif_store.list_archived()
         assert len(history) == 1
-        assert history[0]["id"] == items[0]["id"]
+        assert history[0]["id"] == a_id
 
-    async def test_archive_excluded_from_unread_count(self, notif_store):
-        await notif_store.add("A", "a")
-        await notif_store.add("B", "b")
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("timestamp_kind", TIMESTAMP_KINDS)
+    async def test_archive_excluded_from_unread_count(self, notif_store, timestamp_kind):
+        ts = int(time.time())
+        pre_ts = ts - 1 if timestamp_kind == "pre_existing_1s_earlier" else ts
+        await self._add_with_timestamp(notif_store, "A", "a", timestamp=ts if timestamp_kind == "same_second" else None)
+        await self._add_with_timestamp(notif_store, "B", "b", timestamp=pre_ts if timestamp_kind == "pre_existing_1s_earlier" else None)
         assert await notif_store.unread_count() == 2
         items = await notif_store.list()
-        await notif_store.archive(items[0]["id"])
-        # Dismissed notification no longer counts toward the badge.
+        b_matches = [i for i in items if i["title"] == "B"]
+        assert len(b_matches) == 1
+        b_id = b_matches[0]["id"]
+        await notif_store.archive(b_id)
         assert await notif_store.unread_count() == 1
 
     async def test_list_limit(self, notif_store):
@@ -153,6 +199,160 @@ class TestNotificationStore:
         # Idempotent: archiving again matches nothing.
         assert await notif_store.archive_by_source_ref("auth_requests", "req-1") == 0
 
+    async def test_pending_grant_stays_on_top_past_the_limit(self, notif_store):
+        """Pinned grant requests appear first and do not count against limit."""
+        user_id = "test-user"
+        # Add one pinned grant request (older timestamp)
+        base_ts = int(time.time()) - 1000
+        await notif_store._db.execute(
+            "INSERT INTO notifications (timestamp, level, title, message, source, read, archived, data, user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (base_ts, "info", "Grant Request", "agent wants access", "auth_requests", 0, 0, '{"request_id": "req-1"}', user_id),
+        )
+        await notif_store._db.commit()
+        # Add 25 newer non-pinned notifications
+        for i in range(25):
+            ts = base_ts + i + 1
+            await notif_store._db.execute(
+                "INSERT INTO notifications (timestamp, level, title, message, source, read, archived, data, user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (ts, "info", f"Task {i}", f"task {i} closed", "task.closed", 0, 0, None, user_id),
+            )
+        await notif_store._db.commit()
+        items = await notif_store.list(user_id=user_id, limit=20)
+        # Grant request should be at index 0 with pinned=True
+        assert len(items) == 21  # 1 pinned + 20 regular (limit)
+        assert items[0]["source"] == "auth_requests"
+        assert items[0]["pinned"] is True
+        # Next 20 should be task.closed, newest first, pinned=False
+        for i in range(1, 21):
+            assert items[i]["source"] == "task.closed"
+            assert items[i]["pinned"] is False
+
+    async def test_read_grant_still_pinned(self, notif_store):
+        """Reading a grant request does not unpin it."""
+        user_id = "test-user"
+        base_ts = int(time.time()) - 1000
+        await notif_store._db.execute(
+            "INSERT INTO notifications (timestamp, level, title, message, source, read, archived, data, user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (base_ts, "info", "Grant Request", "agent wants access", "auth_requests", 1, 0, '{"request_id": "req-1"}', user_id),
+        )
+        await notif_store._db.commit()
+        # Add 25 newer non-pinned notifications
+        for i in range(25):
+            ts = base_ts + i + 1
+            await notif_store._db.execute(
+                "INSERT INTO notifications (timestamp, level, title, message, source, read, archived, data, user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (ts, "info", f"Task {i}", f"task {i} closed", "task.closed", 0, 0, None, user_id),
+            )
+        await notif_store._db.commit()
+        items = await notif_store.list(user_id=user_id, limit=20)
+        assert len(items) == 21
+        assert items[0]["source"] == "auth_requests"
+        assert items[0]["pinned"] is True
+        assert items[0]["read"] is True
+
+    async def test_archived_grant_not_pinned(self, notif_store):
+        """Archived grant requests are not pinned and do not appear in active list."""
+        user_id = "test-user"
+        base_ts = int(time.time()) - 1000
+        await notif_store._db.execute(
+            "INSERT INTO notifications (timestamp, level, title, message, source, read, archived, data, user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (base_ts, "info", "Grant Request", "agent wants access", "auth_requests", 0, 1, '{"request_id": "req-1"}', user_id),
+        )
+        await notif_store._db.commit()
+        # Add 5 newer non-pinned notifications
+        for i in range(5):
+            ts = base_ts + i + 1
+            await notif_store._db.execute(
+                "INSERT INTO notifications (timestamp, level, title, message, source, read, archived, data, user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (ts, "info", f"Task {i}", f"task {i} closed", "task.closed", 0, 0, None, user_id),
+            )
+        await notif_store._db.commit()
+        items = await notif_store.list(user_id=user_id, limit=20)
+        # Archived grant should not appear
+        assert len(items) == 5
+        for item in items:
+            assert item["source"] == "task.closed"
+            assert item["pinned"] is False
+
+    async def test_agent_scope_request_also_pinned(self, notif_store):
+        """agent_scope_requests source is also pinned like auth_requests."""
+        user_id = "test-user"
+        base_ts = int(time.time()) - 1000
+        await notif_store._db.execute(
+            "INSERT INTO notifications (timestamp, level, title, message, source, read, archived, data, user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (base_ts, "info", "Scope Request", "agent wants more scopes", "agent_scope_requests", 0, 0, '{"request_id": "req-1"}', user_id),
+        )
+        await notif_store._db.commit()
+        # Add 25 newer non-pinned notifications
+        for i in range(25):
+            ts = base_ts + i + 1
+            await notif_store._db.execute(
+                "INSERT INTO notifications (timestamp, level, title, message, source, read, archived, data, user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (ts, "info", f"Task {i}", f"task {i} closed", "task.closed", 0, 0, None, user_id),
+            )
+        await notif_store._db.commit()
+        items = await notif_store.list(user_id=user_id, limit=20)
+        assert len(items) == 21
+        assert items[0]["source"] == "agent_scope_requests"
+        assert items[0]["pinned"] is True
+        for i in range(1, 21):
+            assert items[i]["source"] == "task.closed"
+            assert items[i]["pinned"] is False
+
+    async def test_broadcast_grant_archived_by_user_not_pinned(self, notif_store):
+        """Broadcast grant request archived by user should not appear pinned."""
+        user_id = "test-user"
+        base_ts = int(time.time()) - 1000
+        # Insert a broadcast grant request (user_id = NULL)
+        await notif_store._db.execute(
+            "INSERT INTO notifications (timestamp, level, title, message, source, read, archived, data, user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (base_ts, "info", "Grant Request", "agent wants access", "auth_requests", 0, 0, '{"request_id": "req-1"}', None),
+        )
+        await notif_store._db.commit()
+        # Get the notification ID
+        cursor = await notif_store._db.execute(
+            "SELECT id FROM notifications WHERE source = 'auth_requests' AND data LIKE '%req-1%'"
+        )
+        row = await cursor.fetchone()
+        notif_id = row[0]
+        # Archive it for this specific user via notification_user_state
+        await notif_store._db.execute(
+            "INSERT INTO notification_user_state (notification_id, user_id, archived_at) VALUES (?, ?, ?)",
+            (notif_id, user_id, int(time.time())),
+        )
+        await notif_store._db.commit()
+        # Add 5 newer non-pinned notifications
+        for i in range(5):
+            ts = base_ts + i + 1
+            await notif_store._db.execute(
+                "INSERT INTO notifications (timestamp, level, title, message, source, read, archived, data, user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (ts, "info", f"Task {i}", f"task {i} closed", "task.closed", 0, 0, None, user_id),
+            )
+        await notif_store._db.commit()
+        items = await notif_store.list(user_id=user_id, limit=20)
+        # The broadcast grant should NOT appear (archived by this user)
+        assert len(items) == 5
+        for item in items:
+            assert item["source"] == "task.closed"
+            assert item["pinned"] is False
+        # But for a different user, it should still appear as pinned
+        other_user = "other-user"
+        items_other = await notif_store.list(user_id=other_user, limit=20)
+        assert len(items_other) == 1  # 1 pinned (no regular notifications for other_user)
+        assert items_other[0]["source"] == "auth_requests"
+        assert items_other[0]["pinned"] is True
+
+    async def test_null_source_row_still_listed(self, notif_store):
+        """A NULL-source row must survive the pinned-source exclusion (NOT IN yields NULL)."""
+        user_id = "test-user"
+        await notif_store._db.execute(
+            "INSERT INTO notifications (timestamp, level, title, message, source, read, archived, data, user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (int(time.time()), "info", "Legacy", "no source", None, 0, 0, None, user_id),
+        )
+        await notif_store._db.commit()
+        items = await notif_store.list(user_id=user_id, limit=20)
+        assert [i["title"] for i in items] == ["Legacy"]
+        assert items[0]["pinned"] is False
 
 @pytest.mark.asyncio
 async def test_data_column_migration_on_legacy_db(tmp_path):
@@ -208,7 +408,10 @@ async def test_notification_api_mark_read(client):
     notif_id = items[0]["id"]
     resp = await client.post(f"/api/notifications/{notif_id}/read")
     assert resp.status_code == 200
-    assert await store.unread_count() == 0
+    user_id = client._transport.app.state.auth.find_user("admin")["id"]
+    assert await store.unread_count(user_id=user_id) == 0
+    items = await store.list(user_id=user_id)
+    assert items[0]["read"] is True
 
 
 @pytest.mark.asyncio
@@ -229,8 +432,9 @@ async def test_notification_api_archive(client):
     resp = await client.post(f"/api/notifications/{notif_id}/archive")
     assert resp.status_code == 200
     # Gone from the active feed, present in history.
-    assert (await store.list()) == []
-    history = await store.list_archived()
+    user_id = client._transport.app.state.auth.find_user("admin")["id"]
+    assert await store.list(user_id=user_id) == []
+    history = await store.list_archived(user_id=user_id)
     assert len(history) == 1
     assert history[0]["id"] == notif_id
 
@@ -245,3 +449,95 @@ async def test_notification_api_archived_history(client):
     assert resp.status_code == 200
     data = resp.json()
     assert [d["title"] for d in data] == ["Kept"]
+
+
+@pytest.mark.asyncio
+async def test_muted_event_type_is_not_dispatched(tmp_path):
+    store = NotificationStore(tmp_path / "notif.db")
+    await store.init()
+    try:
+        await store.set_event_muted("task.claimed", True)
+
+        seen_push: list[dict] = []
+        seen_emit: list[dict] = []
+
+        async def push_sender(row: dict) -> None:
+            seen_push.append(row)
+
+        async def emitter(row: dict) -> None:
+            seen_emit.append(row)
+
+        store.set_push_sender(push_sender)
+        store.set_event_emitter(emitter)
+
+        await store.add(
+            "Task claimed",
+            "task-42 claimed by worker-1",
+            level="info",
+            source="task.claimed",
+        )
+        await asyncio.sleep(0)
+
+        assert await store.list() == []
+        assert seen_push == []
+        assert seen_emit == []
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_unmuted_event_type_is_dispatched(tmp_path):
+    store = NotificationStore(tmp_path / "notif.db")
+    await store.init()
+    try:
+        seen_push: list[dict] = []
+
+        async def push_sender(row: dict) -> None:
+            seen_push.append(row)
+
+        store.set_push_sender(push_sender)
+
+        await store.add(
+            "Task closed",
+            "task-42 closed",
+            level="info",
+            source="task.closed",
+        )
+        await asyncio.sleep(0)
+
+        items = await store.list()
+        assert len(items) == 1
+        assert items[0]["title"] == "Task closed"
+        assert len(seen_push) == 1
+        assert seen_push[0]["title"] == "Task closed"
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_default_on_event_type_delivered_without_prefs(tmp_path):
+    store = NotificationStore(tmp_path / "notif.db")
+    await store.init()
+    try:
+        seen_push: list[dict] = []
+
+        async def push_sender(row: dict) -> None:
+            seen_push.append(row)
+
+        store.set_push_sender(push_sender)
+
+        await store.add(
+            "Task claimed",
+            "task-42 claimed by worker-1",
+            level="info",
+            source="task.claimed",
+        )
+        await asyncio.sleep(0)
+
+        items = await store.list()
+        assert len(items) == 1
+        assert items[0]["title"] == "Task claimed"
+        assert len(seen_push) == 1
+        assert seen_push[0]["title"] == "Task claimed"
+    finally:
+        await store.close()

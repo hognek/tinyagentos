@@ -1,24 +1,45 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import sys
 from dataclasses import asdict
+from datetime import datetime, timezone
 from pathlib import Path
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse
 
+from tinyagentos.auth_context import require_admin
 from tinyagentos.cluster import backend_services
 from tinyagentos.restart_orchestrator import write_pending_restart, read_pending_restart
 
 logger = logging.getLogger(__name__)
 
+# Restart/shutdown triggers are gated per handler (admin or host local token,
+# see tinyagentos.auth_context.require_admin) rather than at router level:
+# prepare-shutdown must also accept the loopback stop hook, and the status read
+# stays open.
 router = APIRouter()
 
+# Seconds to wait for `launchctl bootstrap` of the one-shot reload helper
+# before killing it and falling through to the execv fallback.
+LAUNCHCTL_BOOTSTRAP_TIMEOUT = 15
 
-@router.post("/api/system/prepare-shutdown")
+
+def _require_admin_or_loopback(request: Request) -> None:
+    """Gate for the shutdown drain: the loopback systemd stop hook (no session,
+    ``via == "loopback"`` stamped by AuthMiddleware) or an admin/local-token
+    caller. A remote non-admin member session drains every agent otherwise.
+    """
+    if getattr(request.state, "via", None) == "loopback":
+        return
+    require_admin(request)
+
+
+@router.post("/api/system/prepare-shutdown", dependencies=[Depends(_require_admin_or_loopback)])
 async def prepare_shutdown(request: Request):
     """Gracefully prepare all agents for shutdown. Used by systemd stop hook."""
     orchestrator = getattr(request.app.state, "orchestrator", None)
@@ -28,9 +49,9 @@ async def prepare_shutdown(request: Request):
     return {"status": "ready", "report": report}
 
 
-@router.post("/api/system/restart/prepare")
+@router.post("/api/system/restart/prepare", dependencies=[Depends(require_admin)])
 async def prepare_restart(request: Request):
-    """Restart just the controller process.
+    """Restart just the controller process. Admin or host local token only.
 
     Agents and LiteLLM run independently and stay up across a controller
     restart, so there's nothing to drain — the restart is a ~5s uvicorn
@@ -114,6 +135,54 @@ async def _do_restart(app_state) -> None:
     if os.path.exists("/.dockerenv"):
         os._exit(0)
 
+    # 2b. Darwin launchd helper bootstrap
+    if sys.platform == "darwin":
+        from tinyagentos.launchd_migration import (
+            clear_pending_launchd_reload,
+            HELPER_PLIST_PATH,
+            read_pending_launchd_reload,
+        )
+        if read_pending_launchd_reload():
+            proc = None
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "launchctl",
+                    "bootstrap",
+                    f"gui/{os.getuid()}",
+                    str(HELPER_PLIST_PATH),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                # launchctl can hang (a stuck launchd job, a wedged
+                # launchd.lock). Without a timeout the execv fallback below is
+                # never reached and the restart silently stalls.
+                await asyncio.wait_for(
+                    proc.communicate(), timeout=LAUNCHCTL_BOOTSTRAP_TIMEOUT
+                )
+                if proc.returncode == 0:
+                    clear_pending_launchd_reload()
+                    os._exit(0)
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "launchd helper bootstrap timed out after %ss, killing pid",
+                    LAUNCHCTL_BOOTSTRAP_TIMEOUT,
+                )
+                if proc is not None:
+                    try:
+                        proc.kill()
+                        await proc.wait()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            if notif:
+                await notif.add(
+                    title="Launchd reload helper failed",
+                    message="New launch settings will apply after the next login.",
+                    level="warning",
+                    source="system.lifecycle",
+                )
+
     # 3. execv (no service manager — replace ourselves in-place)
     try:
         os.execv(sys.executable, [sys.executable] + sys.argv)
@@ -169,22 +238,7 @@ async def _managed_ai_units(request: Request) -> list[tuple[str, str | None]]:
     return [c for c in checks if c is not None]
 
 
-def _is_admin_or_local_token(request: Request) -> bool:
-    """True if the caller is an admin session or presented the host local token.
-
-    Restarting host services is privileged (it runs ``systemctl restart``), so
-    a plain non-admin user session must never reach it. ``AuthMiddleware`` sets
-    both signals on ``request.state`` (see
-    ``tinyagentos/routes/skill_exec.py::_is_admin_or_local_token`` for the full
-    rationale). The ``system`` router is not gated at the router level, so this
-    handler guards itself.
-    """
-    if getattr(request.state, "is_admin", False):
-        return True
-    return getattr(request.state, "via", None) == "local_token"
-
-
-@router.post("/api/system/ai-stack/restart")
+@router.post("/api/system/ai-stack/restart", dependencies=[Depends(require_admin)])
 async def restart_ai_stack(request: Request):
     """Restart the local AI inference stack -- issue #1743.
 
@@ -198,9 +252,6 @@ async def restart_ai_stack(request: Request):
     partial recovery still reports what was restarted. Units are restarted
     concurrently so worst-case latency is one unit's timeout, not their sum.
     """
-    if not _is_admin_or_local_token(request):
-        return JSONResponse({"error": "forbidden"}, status_code=403)
-
     targets = await _managed_ai_units(request)
     if not targets:
         return {
@@ -259,3 +310,212 @@ async def restart_status(request: Request):
     if orchestrator is None:
         return JSONResponse({"error": "orchestrator not available"}, status_code=503)
     return orchestrator.get_status()
+
+
+# --- Session mode (phone/kiosk devices only) --------------------------------
+#
+# On a handset running taOS as its shell (postmarketOS + Plasma Mobile), the
+# device can be in one of two graphical sessions:
+#   * "kiosk"  — taos-kiosk.service: a Wayland compositor running taOS
+#                full-screen, so the phone looks like it boots into taOS;
+#   * "plasma" — plasma-mobile.service: the stock KDE phone shell.
+# The two units Conflict with each other, so switching is ONE `systemctl start`
+# and systemd stops the other side for us.
+#
+# Privilege comes from a polkit rule scoped to exactly these two units (see
+# taOSmobile pmos/kiosk/etc/50-taos-session.rules), NOT from sudo — the controller
+# runs as the unprivileged `taos` user and must not be able to manage arbitrary
+# system services just to offer a UI toggle.
+#
+# AVAILABILITY IS THE DEVICE GATE. A taOS handset has BOTH taos-kiosk.service
+# (the taOS shell) AND plasma-mobile.service (the Plasma Mobile fallback). A
+# desk runs the kiosk unit only, so `available: false` there and the frontend
+# hides the app rather than shipping a button that cannot work. This is
+# deliberately a capability probe, not a hardcoded device list.
+
+_SESSION_UNITS = {"kiosk": "taos-kiosk.service", "plasma": "plasma-mobile.service"}
+
+
+async def _systemctl(*args: str) -> tuple[int, str]:
+    """Run systemctl and return (rc, combined output). Never raises."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "systemctl", *args,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+        )
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=20)
+        return proc.returncode or 0, (out or b"").decode(errors="replace").strip()
+    except FileNotFoundError:
+        return 127, "systemctl not found"
+    except asyncio.TimeoutError:
+        return 124, "systemctl timed out"
+    except Exception as exc:  # noqa: BLE001
+        return 1, str(exc)
+
+
+async def _session_mode_state() -> dict:
+    kiosk_rc, kiosk_state = await _systemctl("is-active", _SESSION_UNITS["kiosk"])
+    # `is-active` exits non-zero for inactive units, so the OUTPUT is the signal
+    # and rc is not. An unknown unit reports "inactive" too, so availability is
+    # probed separately with `cat`, which fails only when the unit is absent.
+    kiosk_cat_rc, _ = await _systemctl("cat", _SESSION_UNITS["kiosk"])
+    plasma_cat_rc, _ = await _systemctl("cat", _SESSION_UNITS["plasma"])
+    available = kiosk_cat_rc == 0 and plasma_cat_rc == 0
+    _, plasma_state = await _systemctl("is-active", _SESSION_UNITS["plasma"])
+    if kiosk_state == "active":
+        current = "kiosk"
+    elif plasma_state == "active":
+        current = "plasma"
+    else:
+        current = "unknown"
+    return {
+        "available": available,
+        "current": current,
+        "kiosk": kiosk_state,
+        "plasma": plasma_state,
+    }
+
+
+@router.get("/api/system/session-mode")
+async def get_session_mode():
+    """Report which graphical session is running, and whether this device can
+    switch at all. Open to any authenticated caller: it is a read of local
+    service state that the UI needs before deciding to render the control."""
+    return await _session_mode_state()
+
+
+@router.get("/api/system/local-desktop", dependencies=[Depends(require_admin)])
+async def get_local_desktop():
+    """Report the local desktop state: available, enabled, and active based on
+    taos-kiosk.service systemd unit state.
+
+    Reads via `systemctl cat`, `systemctl is-enabled`, and `systemctl is-active`.
+    Admin only.  Unit absent => all false (is-enabled/is-active are NOT called).
+    """
+    # availability: unit must exist (cat succeeds)
+    cat_rc, _ = await _systemctl("cat", "taos-kiosk.service")
+    if cat_rc != 0:
+        return {"available": False, "enabled": False, "active": False}
+
+    # enabled: is-enabled output must be exactly "enabled"
+    en_rc, en_out = await _systemctl("is-enabled", "taos-kiosk.service")
+    enabled = en_rc == 0 and en_out.strip() == "enabled"
+
+    # active: is-active output must be exactly "active"
+    ac_rc, ac_out = await _systemctl("is-active", "taos-kiosk.service")
+    active = ac_rc == 0 and ac_out.strip() == "active"
+
+    return {"available": True, "enabled": enabled, "active": active}
+
+
+@router.post("/api/system/session-mode", dependencies=[Depends(require_admin)])
+async def set_session_mode(request: Request):
+    """Switch the device between the taOS kiosk and Plasma Mobile.
+
+    Admin only — this replaces what is on the user's screen.
+    """
+    body = await request.json() if await request.body() else {}
+    mode = (body or {}).get("mode", "")
+    if mode not in _SESSION_UNITS:
+        return JSONResponse(
+            {"error": f"mode must be one of {sorted(_SESSION_UNITS)}"}, status_code=400,
+        )
+    state = await _session_mode_state()
+    if not state["available"]:
+        return JSONResponse(
+            {"error": "this device has no taOS kiosk session installed"}, status_code=404,
+        )
+    # Starting the target stops the other: the units Conflict. Doing it as two
+    # jobs (stop-then-start) would leave a window with NO session on screen.
+    rc, out = await _systemctl("start", _SESSION_UNITS[mode])
+    if rc != 0:
+        logger.warning("session-mode switch to %s failed rc=%s: %s", mode, rc, out)
+        return JSONResponse(
+            {"error": "switch failed", "detail": out or f"rc={rc}"}, status_code=500,
+        )
+    return {"ok": True, "mode": mode}
+
+
+# --- Device location (phone/kiosk devices only) ------------------------------
+#
+# On a taOS handset, taos-locationd (taOSmobile pmos/kiosk/bin/taos-locationd)
+# keeps the modem's GNSS engine on and atomically rewrites
+# /run/taos-location/location.json with the latest fix. The directory is a
+# systemd RuntimeDirectory (root:taos 0750), so it exists only while the daemon
+# runs: that is the device gate, a single stat with no modem call, so every
+# other host answers immediately with available=false. The file itself is
+# absent until the first fix ever.
+#
+# The fix is PERSONAL DATA. It is read from the runtime file only, never
+# cached, and never logged at any level. A file that is unreadable, oversized
+# or malformed is reported as "no fix", never as a server error.
+
+_LOCATION_DIR = Path("/run/taos-location")
+_LOCATION_FILE = _LOCATION_DIR / "location.json"
+_LOCATION_MAX_AGE_S = 1800
+_LOCATION_MAX_BYTES = 4096
+_LOCATION_FUTURE_SKEW_S = 60
+
+
+def _is_number(value) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _read_location_fix(now: datetime) -> tuple[dict | None, int | None]:
+    """Return (fix, age_s) from the runtime file, (None, None) when unusable."""
+    try:
+        with _LOCATION_FILE.open("rb") as fh:
+            raw = fh.read(_LOCATION_MAX_BYTES + 1)
+    except OSError:
+        return None, None
+    if len(raw) > _LOCATION_MAX_BYTES:
+        return None, None
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return None, None
+    if not isinstance(data, dict):
+        return None, None
+    lat, lon, acc = data.get("lat"), data.get("lon"), data.get("accuracy_m")
+    if not (_is_number(lat) and -90 <= lat <= 90 and _is_number(lon) and -180 <= lon <= 180):
+        return None, None
+    if acc is not None and not _is_number(acc):
+        return None, None
+    fix_utc = data.get("fix_utc")
+    if not isinstance(fix_utc, str):
+        return None, None
+    try:
+        taken = datetime.fromisoformat(fix_utc.replace("Z", "+00:00"))
+    except ValueError:
+        return None, None
+    if taken.tzinfo is None:
+        return None, None
+    age = (now - taken).total_seconds()
+    if age < -_LOCATION_FUTURE_SKEW_S:
+        return None, None
+    age_s = max(0, int(age))
+    fix = {
+        "lat": lat,
+        "lon": lon,
+        "accuracy_m": acc,
+        "fix_utc": fix_utc,
+        "source": data.get("source") if isinstance(data.get("source"), str) else None,
+    }
+    return fix, age_s
+
+
+def _location_state(now: datetime | None = None) -> dict:
+    if not _LOCATION_DIR.is_dir():
+        return {"available": False, "fix": None, "age_s": None}
+    fix, age_s = _read_location_fix(now or datetime.now(timezone.utc))
+    if fix is not None and age_s > _LOCATION_MAX_AGE_S:
+        fix = None
+    return {"available": True, "fix": fix, "age_s": age_s}
+
+
+@router.get("/api/system/location")
+async def get_location():
+    """Latest GPS fix of this device, if it has a location daemon. Open to any
+    signed-in user, like session-mode: the UI needs it to default the weather
+    location. Never exposed to the agent API, never logged."""
+    return _location_state()

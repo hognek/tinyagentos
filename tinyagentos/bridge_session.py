@@ -24,6 +24,7 @@ import json
 import logging
 import time
 import uuid
+from collections import OrderedDict
 from types import SimpleNamespace
 from typing import Any, AsyncIterator
 
@@ -54,6 +55,8 @@ _DISCONNECT = object()
 
 TICK_INTERVAL = 15  # seconds between keepalive ticks
 
+_FINAL_ID_SEEN_CAP = 256  # per-agent bound for seen final reply ids
+
 
 def _now_iso() -> str:
     from datetime import datetime, timezone
@@ -62,6 +65,25 @@ def _now_iso() -> str:
 
 def _new_id() -> str:
     return uuid.uuid4().hex
+
+
+def _extract_decision_id(result: Any) -> str | None:
+    """Extract decision_id from a request_decision tool_result.
+
+    The result may arrive as a dict (``{"ok": True, "decision_id": "...", ...}``)
+    or as a JSON string (openclaw serialises non-trivial payloads).  Any other
+    shape or a missing key returns None.
+    """
+    if isinstance(result, str):
+        try:
+            result = json.loads(result)
+        except (json.JSONDecodeError, TypeError):
+            return None
+    if isinstance(result, dict):
+        did = result.get("decision_id")
+        if isinstance(did, str) and did:
+            return did
+    return None
 
 
 class _AgentSession:
@@ -76,6 +98,10 @@ class _AgentSession:
         self._pending_msg_ids: dict[str, str] = {}
         # Maps trace_id -> hops_since_user from the triggering user_message event.
         self.pending_hops: dict[str, int] = {}
+        # Bounded seen set of final reply ids (keeps newest 256 per agent).
+        self._seen_final_ids: OrderedDict[str, None] = OrderedDict()
+        # Set of trace_ids for which mark_seen has been called (idempotent guard).
+        self._seen_trace_ids: set[str] = set()
 
     def accumulate_delta(self, trace_id: str, content: str) -> None:
         if trace_id not in self._delta_buffers:
@@ -93,6 +119,15 @@ class _AgentSession:
 
     def pop_pending_msg(self, trace_id: str) -> str | None:
         return self._pending_msg_ids.pop(trace_id, None)
+
+    def is_final_id_seen(self, reply_id: str) -> bool:
+        return reply_id in self._seen_final_ids
+
+    def mark_final_id_seen(self, reply_id: str) -> None:
+        """Record a final reply id as seen, evicting the oldest past the cap."""
+        self._seen_final_ids[reply_id] = None
+        if len(self._seen_final_ids) > _FINAL_ID_SEEN_CAP:
+            self._seen_final_ids.popitem(last=False)
 
 
 class BridgeSessionRegistry:
@@ -123,6 +158,10 @@ class BridgeSessionRegistry:
         self._sessions: dict[str, _AgentSession] = {}
         self._lock = asyncio.Lock()
         self._router = None
+        # Durable outbox for guest (registry agent) sessions, wired by app.py.
+        # _is_guest(slug) is True when no config agent has that name.
+        self._guest_outbox = None
+        self._is_guest = None
 
     def _get_or_create(self, slug: str) -> _AgentSession:
         if slug not in self._sessions:
@@ -147,10 +186,15 @@ class BridgeSessionRegistry:
         trace_id = msg.get("trace_id") or msg.get("id")
         if trace_id is not None:
             session.pending_hops[trace_id] = int(msg.get("hops_since_user") or 0)
-        await session.queue.put({
-            "event": "user_message",
-            "data": msg,
-        })
+        # Store data as JSON string so subscribe can read id without re-encoding
+        event: dict = {"event": "user_message", "data": json.dumps(msg)}
+        outbox = self._guest_outbox
+        if outbox is not None and self._is_guest is not None and self._is_guest(slug):
+            try:
+                event["outbox_id"] = await outbox.append(slug, msg)
+            except Exception:
+                logger.exception("bridge_session: guest outbox append failed for %s", slug)
+        await session.queue.put(event)
 
         # Record a message_in trace event so the transcript captures both
         # sides in order. Envelope payload follows ENVELOPE_V1_SCHEMA's
@@ -222,11 +266,55 @@ class BridgeSessionRegistry:
                 if item is _DISCONNECT:
                     break
                 event_type = item.get("event", "message")
-                data = json.dumps(item.get("data", {}))
-                yield f"event: {event_type}\ndata: {data}\n\n"
+                
+                # Stamp delivered when a user_message is actually yielded to the agent
+                # (not when it was enqueued). The local `data` there is already the JSON string.
+                if event_type == "user_message":
+                    await self.mark_user_message_delivered(slug, item.get("data", "{}"))
+                
+                # user_message data is already a JSON string; tick data is a dict
+                data = item.get("data", "{}")
+                if not isinstance(data, str):
+                    data = json.dumps(data)
+                id_line = f"id: {item['outbox_id']}\n" if item.get("outbox_id") else ""
+                yield f"{id_line}event: {event_type}\ndata: {data}\n\n"
         finally:
             if tick_task is not None:
                 tick_task.cancel()
+
+    async def mark_user_message_delivered(self, slug: str, payload) -> None:
+        """Stamp the chat message as delivered and broadcast a receipt.
+
+        Called when a user_message event is yielded to the agent (both from
+        live subscribe and from outbox replay). The payload may be a dict or
+        a JSON string; both are accepted.
+        """
+        if not self._chat_messages:
+            return
+        try:
+            if isinstance(payload, str):
+                item_data = json.loads(payload)
+            else:
+                item_data = payload
+            msg_id = item_data.get("id")
+            if not msg_id:
+                return
+            receipt_row = await self._chat_messages.mark_delivered(msg_id, slug)
+            if receipt_row and self._chat_hub:
+                # Need channel_id to broadcast; get it from the message
+                msg = await self._chat_messages.get_message(msg_id)
+                if msg and msg.get("channel_id"):
+                    await self._chat_hub.broadcast(msg["channel_id"], {
+                        "type": "receipt",
+                        "seq": self._chat_hub.next_seq(),
+                        "message_id": receipt_row["message_id"],
+                        "agent_id": receipt_row["reader_id"],
+                        "reader_type": receipt_row["reader_type"],
+                        "delivered_at": receipt_row["delivered_at"],
+                        "seen_at": receipt_row["seen_at"],
+                    })
+        except Exception:
+            logger.exception("bridge_session: mark_delivered failed for %s", slug)
 
     async def record_reply(self, slug: str, body: dict) -> None:
         """Process a reply POST from openclaw.
@@ -262,6 +350,28 @@ class BridgeSessionRegistry:
             session = self._get_or_create(slug)
 
         if kind == "delta":
+            # Stamp seen on first delta for this trace_id
+            if trace_id not in session._seen_trace_ids and self._chat_messages:
+                try:
+                    msg = await self._chat_messages.get_message(trace_id)
+                    if msg:
+                        receipt_row = await self._chat_messages.mark_seen(trace_id, slug)
+                        if receipt_row and self._chat_hub:
+                            channel_id = msg.get("channel_id")
+                            if channel_id:
+                                await self._chat_hub.broadcast(channel_id, {
+                                    "type": "receipt",
+                                    "seq": self._chat_hub.next_seq(),
+                                    "message_id": receipt_row["message_id"],
+                                    "agent_id": receipt_row["reader_id"],
+                                    "reader_type": receipt_row["reader_type"],
+                                    "delivered_at": receipt_row["delivered_at"],
+                                    "seen_at": receipt_row["seen_at"],
+                                })
+                        session._seen_trace_ids.add(trace_id)
+                except Exception:
+                    logger.exception("bridge_session: mark_seen failed for %s", slug)
+            
             session.accumulate_delta(trace_id, content)
             # Ensure a streaming placeholder chat message exists.
             pending_msg_id = session._pending_msg_ids.get(trace_id)
@@ -300,10 +410,74 @@ class BridgeSessionRegistry:
                     })
 
         elif kind == "final":
+            # Stamp seen on first final for this trace_id (if no delta came before)
+            if trace_id not in session._seen_trace_ids and self._chat_messages:
+                try:
+                    msg = await self._chat_messages.get_message(trace_id)
+                    if msg:
+                        receipt_row = await self._chat_messages.mark_seen(trace_id, slug)
+                        if receipt_row and self._chat_hub:
+                            channel_id = msg.get("channel_id")
+                            if channel_id:
+                                await self._chat_hub.broadcast(channel_id, {
+                                    "type": "receipt",
+                                    "seq": self._chat_hub.next_seq(),
+                                    "message_id": receipt_row["message_id"],
+                                    "agent_id": receipt_row["reader_id"],
+                                    "reader_type": receipt_row["reader_type"],
+                                    "delivered_at": receipt_row["delivered_at"],
+                                    "seen_at": receipt_row["seen_at"],
+                                })
+                        session._seen_trace_ids.add(trace_id)
+                except Exception:
+                    logger.exception("bridge_session: mark_seen failed for %s", slug)
+
+            reply_id = body.get("id")
+            if not isinstance(reply_id, str) or not reply_id:
+                reply_id = None
+            if reply_id is not None and session.is_final_id_seen(reply_id):
+                logger.debug(
+                    "bridge_session: duplicate final reply id %s for agent %s, skipping",
+                    reply_id, slug,
+                )
+                return
             accumulated = session.flush_delta(trace_id)
             final_content = content or accumulated
             pending_msg_id = session.pop_pending_msg(trace_id)
             channel_id = body.get("channel_id") or await self._resolve_channel(slug)
+
+            # --- Begin: content_blocks handling ---
+            raw_blocks = body.get("content_blocks")
+            validated_blocks = None
+            if raw_blocks is not None:
+                if isinstance(raw_blocks, list):
+                    # Validate each block
+                    allowed_kinds = {"text", "thinking", "tool_call", "status", "question", "decision"}
+                    valid_blocks = []
+                    for block in raw_blocks:
+                        if isinstance(block, dict) and block.get("kind") in allowed_kinds:
+                            valid_blocks.append(block)
+                        else:
+                            logger.warning(
+                                "bridge_session: invalid content block kind in final reply for agent %s: %s",
+                                slug,
+                                block.get("kind") if isinstance(block, dict) else type(block),
+                            )
+                            # Invalidate the entire list if any block is invalid
+                            valid_blocks = None
+                            break
+                    if valid_blocks is not None:
+                        # Apply cap
+                        if len(valid_blocks) > 50:
+                            valid_blocks = valid_blocks[:50]
+                        validated_blocks = valid_blocks
+                else:
+                    logger.warning(
+                        "bridge_session: content_blocks is not a list in final reply for agent %s: %s",
+                        slug,
+                        type(raw_blocks),
+                    )
+            # --- End: content_blocks handling ---
 
             # Write trace event.
             if self._trace_registry:
@@ -321,15 +495,25 @@ class BridgeSessionRegistry:
                     # Edit the streaming placeholder to final content.
                     await self._chat_messages.edit_message(pending_msg_id, final_content)
                     await self._chat_messages.update_state(pending_msg_id, "complete")
+                    # Update content_blocks if we have validated blocks
+                    if validated_blocks is not None:
+                        merged = await self._chat_messages.extend_content_blocks(pending_msg_id, validated_blocks)
+                        validated_blocks_for_broadcast = merged
+                    else:
+                        validated_blocks_for_broadcast = None
                     session.pending_hops.pop(trace_id, None)
                     if self._chat_hub:
-                        await self._chat_hub.broadcast(channel_id, {
+                        # Broadcast message_edit with content and optionally content_blocks
+                        broadcast_payload = {
                             "type": "message_edit",
                             "seq": self._chat_hub.next_seq(),
                             "message_id": pending_msg_id,
                             "content": final_content,
                             "edited_at": time.time(),
-                        })
+                        }
+                        if validated_blocks is not None:
+                            broadcast_payload["content_blocks"] = validated_blocks_for_broadcast
+                        await self._chat_hub.broadcast(channel_id, broadcast_payload)
                         await self._chat_hub.broadcast(channel_id, {
                             "type": "message_state",
                             "seq": self._chat_hub.next_seq(),
@@ -346,6 +530,7 @@ class BridgeSessionRegistry:
                         author_type="agent",
                         content=final_content,
                         state="complete",
+                        content_blocks=validated_blocks,  # passes None or list, which send_message handles
                         metadata={"trace_id": trace_id, "openclaw_msg_id": msg_id, "hops_since_user": _final_hops},
                     )
                     await self._chat_channels.update_last_message_at(channel_id)
@@ -356,6 +541,8 @@ class BridgeSessionRegistry:
                             **new_msg,
                         })
                     persisted = new_msg
+                if reply_id is not None:
+                    session.mark_final_id_seen(reply_id)
 
             # Re-dispatch so other agents in the channel see this reply.
             router = self._router
@@ -427,6 +614,34 @@ class BridgeSessionRegistry:
                     )
                 except Exception:
                     logger.exception("archive dual-write failed (tool_result)")
+
+            # Attach a read-only decision content block to the in-flight chat
+            # message when the agent raises a decision via the request_decision
+            # tool. The block references only the decision id so the frontend
+            # can fetch the full decision and render it inline (read-only).
+            if tool_name == "request_decision":
+                decision_id = _extract_decision_id(body.get("result"))
+                if decision_id and self._chat_messages and self._chat_hub:
+                    msg_id = session._pending_msg_ids.get(trace_id)
+                    if msg_id:
+                        try:
+                            blocks = await self._chat_messages.append_content_block(
+                                msg_id,
+                                {"kind": "decision", "decision_id": decision_id},
+                            )
+                            if blocks and channel_id:
+                                await self._chat_hub.broadcast(channel_id, {
+                                    "type": "message_edit",
+                                    "seq": self._chat_hub.next_seq(),
+                                    "message_id": msg_id,
+                                    "content_blocks": blocks,
+                                })
+                        except Exception:
+                            logger.exception(
+                                "bridge_session: failed to attach decision block "
+                                "for decision %s on message %s",
+                                decision_id, msg_id,
+                            )
 
         elif kind == "error":
             error_text = body.get("error") or ""

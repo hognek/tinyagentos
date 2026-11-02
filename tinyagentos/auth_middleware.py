@@ -1,17 +1,116 @@
 from __future__ import annotations
 
 import ipaddress
+import json
+import logging
+import logging.handlers
 import re
-import time
+from datetime import UTC, datetime
+from pathlib import Path
 
-from fastapi import Request
+from fastapi import HTTPException, Request
 from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.responses import RedirectResponse
+from starlette.responses import HTMLResponse, RedirectResponse
 
+from tinyagentos.agent_token_auth import (
+    _enforce_rotation_cutoff, _get_grants_store, _get_keypair, _get_store,
+    _grant_unexpired, check_agent_identity,
+)
+from tinyagentos.auth import AuthStoreCorruptError
+from tinyagentos.device_scopes import (
+    AGENTS_READ, CHAT_SEND, DECISIONS_ANSWER, FILES_UPLOAD, LIBRARY_INGEST,
+    PUSH_REGISTER, VOICE_STT, VOICE_TTS, effective_scopes,
+)
 from tinyagentos.device_store import DEVICE_TOKEN_PREFIX
+from tinyagentos.rate_limit import MovingWindowLimiter
 
-EXEMPT_PATHS = {"/auth/login", "/auth/setup", "/auth/status", "/auth/me", "/auth/complete", "/auth/lock", "/api/health", "/api/version", "/setup", "/setup/complete", "/redeem", "/api/desktop/browser/push/vapid-public-key", "/api/desktop/browser/proxy-config", "/sw.js", "/desktop", "/desktop/index.html", "/chat-pwa", "/app.html", "/manifest", "/api/agents/registry/pubkey", "/api/share/destinations"}
+logger = logging.getLogger(__name__)
+
+
+class _RaisingRotatingFileHandler(logging.handlers.RotatingFileHandler):
+    def handleError(self, record):
+        raise
+
+
+def _get_agent_token_routes_logger(data_dir: Path) -> logging.Logger:
+    """Return the module-level logger for agent token route recording.
+
+    The logger writes JSON lines to {data_dir}/logs/agent-token-routes.jsonl
+    with a RotatingFileHandler (maxBytes=5MB, backupCount=3). The handler is
+    attached once, propagate=False so logs don't bubble to root.
+    """
+    log_logger = logging.getLogger("taos.agent_token_routes")
+    log_logger.propagate = False
+    log_logger.setLevel(logging.INFO)
+
+    log_dir = data_dir / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / "agent-token-routes.jsonl"
+
+    # Attach handler only once if not already attached to this path
+    for handler in log_logger.handlers:
+        if isinstance(handler, logging.handlers.RotatingFileHandler):
+            if handler.baseFilename == str(log_path):
+                return log_logger
+    # Remove any existing handlers before attaching new one
+    for handler in log_logger.handlers[:]:
+        log_logger.removeHandler(handler)
+        handler.close()
+
+    handler = _RaisingRotatingFileHandler(
+        log_path, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
+    )
+    # JSON line formatter: just the message (we format as JSON in the caller)
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    log_logger.addHandler(handler)
+
+    return log_logger
+
+
+async def _call_and_record_bound_agent(
+    request: Request, call_next, auth_mgr, bound_agent: str
+):
+    """Call the next handler and record the bound-agent local-token route.
+
+    Sets request.state.agent_name, calls call_next, writes the same JSON log
+    line as the non-exempt local-token path (inside the same try/except), and
+    returns the response.
+    """
+    request.state.agent_name = bound_agent
+    response = await call_next(request)
+    # Record the bound-agent local-token request (LOG ONLY)
+    try:
+        route_obj = request.scope.get("route")
+        route_template = getattr(route_obj, "path", None) or "<unmatched>"
+        log_entry = {
+            "ts": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+            "method": request.method,
+            "route": route_template,
+            "agent": bound_agent,
+            "status": response.status_code,
+        }
+        log_logger = _get_agent_token_routes_logger(auth_mgr.data_dir)
+        log_logger.info(json.dumps(log_entry, separators=(",", ":")))
+    except Exception:
+        # Warning must never raise into the request either
+        try:
+            logger.warning("Failed to record agent token route", exc_info=True)
+        except Exception:
+            pass
+    return response
+
+
+# /auth/pin-login is session-exempt for the same reason as /auth/login: it is
+# how a session is obtained, so requiring one would be circular. It is NOT
+# unguarded -- the route refuses any request that is not from the device's own
+# console (see auth.is_console_origin) and throttles per user on top of that.
+# /auth/swipe-unlock is exempt on the same argument and guarded harder: console
+# only, single-account only, and only for an owner who chose "swipe" with their
+# password. See routes.auth.swipe_unlock.
+# Note /auth/pin (set/clear a PIN) is deliberately absent from this set: those
+# require a live session and must stay gated here.
+EXEMPT_PATHS = {"/auth/login", "/auth/pin-login", "/auth/swipe-unlock", "/auth/osk.js", "/auth/pin-panel.js", "/auth/lock-screen.js", "/auth/lock-widgets", "/auth/lock-weather", "/auth/lock-notifications", "/auth/lock-stats", "/auth/lock-panels", "/auth/lock-events", "/auth/lock-power-menu", "/auth/lock-screen-off", "/auth/lock-screen-on", "/auth/lock-brightness", "/auth/lock-torch", "/auth/lock-volume", "/auth/lock-volume-key", "/auth/lock-charge", "/auth/lock-radios", "/auth/lock-usb", "/auth/lock-power-action", "/auth/lock-app", "/auth/device-agent/heartbeat", "/auth/device-agent/message", "/auth/lock-call", "/auth/lock-call/ring", "/auth/lock-call/reset", "/auth/lock-call/action", "/auth/lock-call/dismiss", "/auth/setup", "/auth/status", "/auth/me", "/auth/complete", "/auth/lock", "/api/health", "/api/version", "/setup", "/setup/complete", "/redeem", "/api/desktop/browser/push/vapid-public-key", "/api/desktop/browser/proxy-config", "/sw.js", "/desktop", "/desktop/index.html", "/chat-pwa", "/app.html", "/manifest", "/api/agents/registry/pubkey", "/api/share/destinations"}
 
 # Registry feed endpoints accept EITHER an admin session OR a registry JWT.
 # When a Bearer token is present for these paths the request bypasses the
@@ -30,9 +129,31 @@ _A2A_BUS_READ_PATHS = frozenset({
 })
 # Authenticated A2A bus WRITE path: an agent may POST here with its own registry
 # JWT (scope a2a_send, verified by the route, which forces the bus `from` to the
-# agent's own handle so it posts as itself instead of the owner's account).
+# agent's own registry canonical_id -- the identity its token proves -- and
+# forwards that token to the bus so the bus can verify the sender).
 _A2A_BUS_WRITE_PATHS = frozenset({
     "/api/a2a/bus/send",
+})
+# Self-only chat session routes: an agent drains its own chat events and posts
+# its own replies with its registry JWT (scope chat_session, verified by the
+# route, which derives the session slug from the token and never from the body).
+_AGENT_CHAT_SESSION_PATHS = frozenset({
+    "/api/agents/self/chat/events",
+    "/api/agents/self/chat/reply",
+})
+# A2A GPU lease coordination (taOS #893). Read (CHECK) needs a2a_receive; the
+# mutating actions (CLAIM/RELEASE/REQUEST/RENEW) need a2a_send. The route
+# resolves the acting identity from the token itself and forces the bus `from`
+# to the identity the token proves, so an agent can only claim/release for
+# itself. Same passthrough contract as the bus paths above.
+_A2A_GPU_READ_PATHS = frozenset({
+    "/api/a2a/gpu/check",
+})
+_A2A_GPU_WRITE_PATHS = frozenset({
+    "/api/a2a/gpu/claim",
+    "/api/a2a/gpu/release",
+    "/api/a2a/gpu/request",
+    "/api/a2a/gpu/renew",
 })
 # Observatory routes an agent may reach with its own registry JWT (scope
 # observatory_control). The route verifies the JWT + grant itself; the
@@ -43,11 +164,61 @@ _OBSERVATORY_PATHS = frozenset({
     "/api/observatory/throttle",
     "/api/observatory/approval-mode",
     "/api/observatory/fleet",
+    "/api/observatory/wake-budget",
 })
+# Container provisioning request: an agent may POST its own registry JWT
+# (identity verified by check_agent_identity in the route; no scope grant
+# required since any active agent may request its own container). The route
+# resolves the canonical_id from the token and never trusts a body field for
+# identity, so a token cannot bill another agent's quota.
+_CONTAINER_REQUEST_PATHS = frozenset({
+    "/api/containers/requests",
+    "/api/container-requests",
+})
+# Agent provisioning actions on a specific request: provision or destroy.
+_CONTAINER_REQUEST_ACTION_ROUTES = (
+    ("POST", re.compile(r"^/api/containers/requests/[^/]+/provision$")),
+    ("POST", re.compile(r"^/api/containers/requests/[^/]+/destroy$")),
+)
+# Agent self-serve quota lookup.
+_AGENT_CONTAINER_QUOTA_ROUTE = ("GET", re.compile(r"^/api/agents/containers/quota$"))
+# Memory routes: agent tokens may reach these if they have the memory_read scope.
+_MEMORY_ROUTES = (
+    ("GET", re.compile(r"^/api/memory/browse$")),
+    ("POST", re.compile(r"^/api/memory/search$")),
+    ("POST", re.compile(r"^/api/memory/remember$")),
+    ("GET", re.compile(r"^/api/memory/collections/[^/]+$")),
+    ("DELETE", re.compile(r"^/api/memory/chunk/[^/]+$")),
+)
 # Every path that accepts a registry JWT in place of the admin session.  The
 # passthrough is allowlisted to exactly these paths -- a registry JWT must never
 # authenticate any other route (no skeleton key).
-_AGENT_TOKEN_PATHS = _REGISTRY_FEED_PATHS | _A2A_BUS_READ_PATHS | _A2A_BUS_WRITE_PATHS | _OBSERVATORY_PATHS
+# Agent self-serve routes: /api/agents/me/models (GET) and /api/agents/me/model (POST)
+# accept a LiteLLM/Bearer key for agent self-service.
+# Desktop control endpoints (command, screenshot, layout) for the system taOS Agent.
+# Skill-exec endpoints for the system taOS Agent (scope system_agent_exec).
+# NOTE: /api/dispatcher/config is deliberately NOT here. Config CRUD is
+# session-only and refuses agents outright, so nothing there verifies a JWT or a
+# scope grant; listing it would only hand a bare Bearer (valid, stale or
+# garbage) the auth gate and shadow the caller's own session cookie.
+_AGENT_TOKEN_PATHS = (
+    _REGISTRY_FEED_PATHS
+    | _A2A_BUS_READ_PATHS
+    | _A2A_BUS_WRITE_PATHS
+    | _AGENT_CHAT_SESSION_PATHS
+    | _A2A_GPU_READ_PATHS
+    | _A2A_GPU_WRITE_PATHS
+    | _OBSERVATORY_PATHS
+    | _CONTAINER_REQUEST_PATHS
+    | frozenset({
+        "/api/agents/me/models",
+        "/api/agents/me/model",
+        "/api/desktop/command",
+        "/api/desktop/screenshot",
+        "/api/desktop/layout",
+        "/api/desktop/panel-shot",
+    })
+)
 
 # Project kanban routes an agent may reach with its own registry JWT (scope
 # project_tasks, verified + project-bound by the route).  These are DYNAMIC
@@ -63,6 +234,11 @@ _AGENT_TOKEN_PATHS = _REGISTRY_FEED_PATHS | _A2A_BUS_READ_PATHS | _A2A_BUS_WRITE
 _SEG = r"[^/]+"
 _AGENT_TASK_ROUTES = (
     ("GET", re.compile(rf"^/api/projects/{_SEG}/tasks$")),
+    # Cross-project kanban aggregate (READ ONLY): a static path (no project
+    # segment) that returns every board the token holds a project_tasks grant
+    # for. Reaching the handler is not authorization -- it verifies the JWT +
+    # per-project grant via _authorize_task_actor for every candidate project.
+    ("GET", re.compile(r"^/api/projects/tasks/aggregate$")),
     # Task CREATION, gated by the SEPARATE project_tasks_create scope (not
     # project_tasks, which stays read + lifecycle + comments per Invariant 2+5).
     # Reaching the handler is not authorisation: it then verifies the JWT, the
@@ -73,6 +249,14 @@ _AGENT_TASK_ROUTES = (
     ("GET", re.compile(rf"^/api/projects/tasks/{_SEG}/context$")),
     ("GET", re.compile(rf"^/api/projects/{_SEG}/tasks/{_SEG}/comments$")),
     ("POST", re.compile(rf"^/api/projects/{_SEG}/tasks/{_SEG}/comments$")),
+    # Task checklist items (list + create), gated in the handler
+    # (_authorize_task_actor): POST (create) requires project_tasks_create,
+    # GET (list) takes the default project_tasks grant. Reaching the handler is
+    # not authorisation: it then verifies the JWT, the project binding, and the
+    # scope. There is no archive route, so nothing beyond list + create is
+    # listed here.
+    ("GET", re.compile(rf"^/api/projects/{_SEG}/tasks/{_SEG}/checklist-items$")),
+    ("POST", re.compile(rf"^/api/projects/{_SEG}/tasks/{_SEG}/checklist-items$")),
     ("POST", re.compile(rf"^/api/projects/{_SEG}/tasks/{_SEG}/(claim|release|close|reopen)$")),
     # PATCH (free task-field mutation) was intentionally NOT here: it is broader
     # than the "read + lifecycle + comments" the project_tasks scope documents.
@@ -86,6 +270,10 @@ _AGENT_TASK_ROUTES = (
     # a plain project_tasks worker is refused. Toggles only the "claimable"
     # label, so it does not widen the scope into free field edits (cf. PATCH).
     ("POST", re.compile(rf"^/api/projects/{_SEG}/tasks/{_SEG}/claimable$")),
+    # Un-quarantine curation: same LEAD-only gate as claimable above
+    # (_authorize_project_lead). Returns a quarantined card to the open pool
+    # and clears its strikes (see StrikeStore / unquarantine_task).
+    ("POST", re.compile(rf"^/api/projects/{_SEG}/tasks/{_SEG}/unquarantine$")),
 )
 
 # Project doc-review stamp store routes an agent may reach with its own registry
@@ -101,6 +289,32 @@ _AGENT_DOC_REVIEW_ROUTES = (
     ("GET", re.compile(rf"^/api/projects/{_SEG}/doc-review/(.+)$")),
     ("PUT", re.compile(rf"^/api/projects/{_SEG}/doc-review/(.+)$")),
 )
+
+# Project lists routes an agent may reach with its own registry JWT
+# (scope project_lists, verified + project-bound by the route).  These
+# are DYNAMIC paths (/api/projects/{pid}/lists...), so a (method,
+# compiled-regex) allowlist is used instead.  The token only reaches the
+# handler, which then verifies the JWT + grant + project binding; nothing
+# else is reachable by the token.
+_AGENT_LISTS_ROUTES = (
+    ("GET", re.compile(rf"^/api/projects/{_SEG}/lists$")),
+    ("POST", re.compile(rf"^/api/projects/{_SEG}/lists$")),
+    ("GET", re.compile(rf"^/api/projects/{_SEG}/lists/{_SEG}$")),
+    ("PATCH", re.compile(rf"^/api/projects/{_SEG}/lists/{_SEG}$")),
+    ("DELETE", re.compile(rf"^/api/projects/{_SEG}/lists/{_SEG}$")),
+    ("POST", re.compile(rf"^/api/projects/{_SEG}/lists/{_SEG}/entries$")),
+    ("GET", re.compile(rf"^/api/projects/{_SEG}/lists/{_SEG}/entries$")),
+    ("PATCH", re.compile(rf"^/api/projects/{_SEG}/lists/{_SEG}/entries/{_SEG}$")),
+    ("DELETE", re.compile(rf"^/api/projects/{_SEG}/lists/{_SEG}/entries/{_SEG}$")),
+    ("POST", re.compile(rf"^/api/projects/{_SEG}/lists/{_SEG}/entries/reorder$")),
+)
+
+
+def _is_agent_lists_path(method: str, path: str) -> bool:
+    """True only for the exact subset of list routes a project_lists token may
+    reach.  Strict method + anchored-regex match; everything else is excluded."""
+    return any(m == method and rx.match(path) for m, rx in _AGENT_LISTS_ROUTES)
+
 
 # Project notes store routes an agent may reach with its own registry JWT
 # (scope project_notes, verified + project-bound by the route).  The token only
@@ -131,20 +345,35 @@ _AGENT_CANVAS_ROUTES = (
     ("POST", re.compile(rf"^/api/projects/{_SEG}/canvas/elements$")),
     ("PATCH", re.compile(rf"^/api/projects/{_SEG}/canvas/elements/{_SEG}$")),
     ("DELETE", re.compile(rf"^/api/projects/{_SEG}/canvas/elements/{_SEG}$")),
+    ("GET", re.compile(rf"^/api/projects/{_SEG}/canvas/elements/{_SEG}/original$")),
     ("GET", re.compile(rf"^/api/projects/{_SEG}/canvas/snapshot\.png$")),
     ("GET", re.compile(rf"^/api/projects/{_SEG}/canvas/snapshot\.tldr$")),
     ("GET", re.compile(rf"^/api/projects/{_SEG}/canvas/stream$")),
     ("GET", re.compile(rf"^/api/projects/{_SEG}/canvas/watch-projection$")),
+    ("GET", re.compile(rf"^/api/projects/{_SEG}/canvas/legacy$")),
 )
 
 # Decisions route an agent may reach with its own registry JWT (scope
-# decisions_write). Create, answer (mirror), read-own, and list-own.  The route
-# verifies the JWT + grant + project binding.
+# decisions_write). Create, answer (mirror), read-own, list-own, and withdraw-own
+# (tsk-5dulr5).  The route verifies the JWT + grant + project binding.
 _AGENT_DECISIONS_ROUTES = (
     ("POST", re.compile(r"^/api/decisions$")),
     ("POST", re.compile(r"^/api/decisions/[^/]+/answer/agent$")),
     ("GET", re.compile(r"^/api/decisions/[^/]+/agent$")),
     ("GET", re.compile(r"^/api/decisions/agent$")),
+    ("POST", re.compile(r"^/api/decisions/[^/]+/withdraw$")),
+    # tsk-f75p3z: the plain list. With a registry JWT the route returns ONLY
+    # the agent's own decisions (same set as /api/decisions/agent).
+    ("GET", re.compile(r"^/api/decisions$")),
+)
+
+# Notification routes an agent may reach with its own registry JWT (scope
+# notifications_write). POST creates; GET (tsk-f75p3z) lists ONLY the
+# notifications that agent posted.  The route verifies the JWT + grant (+
+# project binding on POST).  Count, mark-read and archive stay session-only.
+_AGENT_NOTIFICATIONS_ROUTES = (
+    ("POST", re.compile(r"^/api/notifications$")),
+    ("GET", re.compile(r"^/api/notifications$")),
 )
 
 # Device-bearer self-service paths (lock-screen push-token rotation plus
@@ -157,18 +386,81 @@ _AGENT_DECISIONS_ROUTES = (
 # calls still work: the session-cookie check runs when no Bearer header is
 # present, so GET/POST without a Bearer reach the guard normally.
 _DEVICE_BEARER_PATHS = (
-    ("PATCH", re.compile(r"^/api/devices/[^/]+/push-token$")),
-    ("GET", re.compile(r"^/api/decisions$")),
-    ("GET", re.compile(r"^/api/decisions/[^/]+$")),
-    ("GET", re.compile(r"^/api/decisions/[^/]+/history$")),
-    ("POST", re.compile(r"^/api/decisions/[^/]+/answer$")),
+    ("PATCH", re.compile(r"^/api/devices/[^/]+/push-token$"), PUSH_REGISTER),
+    ("GET", re.compile(r"^/api/decisions$"), AGENTS_READ),
+    ("GET", re.compile(r"^/api/decisions/[^/]+$"), AGENTS_READ),
+    ("GET", re.compile(r"^/api/decisions/[^/]+/history$"), AGENTS_READ),
+    ("POST", re.compile(r"^/api/decisions/[^/]+/answer$"), DECISIONS_ANSWER),
+    ("POST", re.compile(r"^/api/library/ingest$"), LIBRARY_INGEST),
+    ("POST", re.compile(rf"^/api/projects/{_SEG}/files/upload$"), FILES_UPLOAD),
+    ("POST", re.compile(r"^/api/chat/messages$"), CHAT_SEND),
+    # S6 / S6b: device voice. Device-bearer only; the routes name their own
+    # scope via device_scope(), this entry is what lets the Bearer past the gate.
+    ("POST", re.compile(r"^/api/device/v1/voice$"), VOICE_STT),
+    ("POST", re.compile(r"^/api/device/v1/voice/tts$"), VOICE_TTS),
+    # S2b: device state (agents read). Device-bearer only; the route names its
+    # own scope via device_scope(), this entry is what lets the Bearer past.
+    ("GET", re.compile(r"^/api/device/v1/state$"), AGENTS_READ),
+    # P0 S3: device events SSE (agents read). Device-bearer only; the route names
+    # its own scope via device_scope(), this entry is what lets the Bearer past.
+    ("GET", re.compile(r"^/api/device/v1/events$"), AGENTS_READ),
+    # S2b/S3: device avatar (agents read). Device-bearer only; the route names
+    # its own scope via device_scope(), this entry lets the Bearer past.
+    ("GET", re.compile(r"^/api/device/v1/agents/[^/]+/avatar$"), AGENTS_READ),
+)
+
+# Device-bearer routes that are NOT in _DEVICE_BEARER_PATHS because they sit in
+# EXEMPT_PATHS (the auth gate must not change for them) but still authenticate
+# the device themselves via require_device. Kept in a separate table so the
+# gate behaviour is untouched; device_scope_for consults both.
+# Classification of share destinations is provisional: it lists the library and
+# the owner's project/DM write targets, so it is gated on the same scope as the
+# library ingest it feeds. Fail closed: a device without library:ingest (e.g.
+# embedded) is refused rather than shown the destinations.
+_DEVICE_EXEMPT_SCOPED_PATHS = (
+    ("GET", re.compile(r"^/api/share/destinations$"), LIBRARY_INGEST),
 )
 
 
 def _is_device_bearer_path(method: str, path: str) -> bool:
     """True only for the exact device-bearer self-service routes. Strict
     method + anchored-regex match; everything else stays session-only."""
-    return any(m == method and rx.match(path) for m, rx in _DEVICE_BEARER_PATHS)
+    return any(m == method and rx.match(path) for m, rx, _scope in _DEVICE_BEARER_PATHS)
+
+
+def device_scope_for(method: str, path: str) -> str | None:
+    """The scope a device bearer needs for this method + path, or None when
+    the path is unclassified (callers must treat None as a refusal)."""
+    for m, rx, scope in _DEVICE_BEARER_PATHS + _DEVICE_EXEMPT_SCOPED_PATHS:
+        if m == method and rx.match(path):
+            return scope
+    return None
+
+
+def _any_route_matches(method: str, path: str, routes, *, match_method: bool = True) -> bool:
+    """Return True if any registered route matches the given method + path.
+
+    FastAPI path parameters (``{pid}``) are treated as ``[^/]+`` for the
+    purpose of existence checking; ``:path`` parameters (``{name:path}``)
+    are treated as ``.+`` so slash-bearing values match.
+    """
+    for route in routes:
+        route_methods = getattr(route, "methods", None)
+        route_path = getattr(route, "path", None)
+        if route_path is None:
+            continue
+        if match_method and route_methods is not None and method.upper() not in {m.upper() for m in route_methods}:
+            continue
+        parts = route_path.split("/")
+        pattern = "^" + "/".join(
+            re.escape(p) if not (p.startswith("{") and p.endswith("}"))
+            else ".+" if p.endswith(":path}")
+            else "[^/]+"
+            for p in parts
+        ) + "$"
+        if re.match(pattern, path):
+            return True
+    return False
 
 # Project-files routes a files_read / files_write token may reach. Reads
 # (list/watch/get/trash-list/stats) require a files_read grant; writes
@@ -188,13 +480,29 @@ _AGENT_FILES_ROUTES = (
     ("GET", re.compile(rf"^/api/projects/{_SEG}/stats$")),
 )
 
-# Scope-request CREATE an agent may reach with its own registry JWT to ask for
-# MORE scopes on its own identity. Only the create endpoint; the approve/deny
-# subactions have extra path segments and are NOT matched here, so they stay
-# owner/admin session-only. The route verifies the JWT identity == the path
-# canonical_id (an agent may only self-request).
+# Scope-request CREATE + READ an agent may reach with its own registry JWT: it
+# may ask for MORE scopes on its own identity and read back what it asked for.
+# The approve/deny subactions are POST-only with an extra trailing segment
+# (/approve, /deny) that no pattern here matches, so deciding a request stays
+# owner/admin session-only — an agent can never self-approve. The GET-by-id
+# pattern would otherwise also match those two paths, so it is anchored to GET.
+# The routes verify the JWT identity == the path canonical_id (an agent may
+# only see its OWN requests).
 _AGENT_SCOPE_REQUEST_ROUTES = (
     ("POST", re.compile(rf"^/api/agents/registry/{_SEG}/scope-requests$")),
+    ("GET", re.compile(rf"^/api/agents/registry/{_SEG}/scope-requests$")),
+    ("GET", re.compile(rf"^/api/agents/registry/{_SEG}/scope-requests/{_SEG}$")),
+)
+
+# Credential rotation an agent may reach with its own registry JWT: an agent
+# that suspects its token is stale or leaked can rotate ITSELF without waiting
+# for a human. The route verifies the JWT identity == the path canonical_id (so
+# an agent may only rotate its own credential) and enforces the same rotation
+# cutoff as every other identity path, so a token that is already superseded
+# cannot use this to outlive its supersession. Owner/admin sessions reach the
+# same route through the normal session gate.
+_AGENT_ROTATE_ROUTES = (
+    ("POST", re.compile(rf"^/api/agents/registry/{_SEG}/rotate-tokens$")),
 )
 
 
@@ -218,8 +526,18 @@ def _is_agent_decisions_path(method: str, path: str) -> bool:
       - POST /api/decisions/{id}/answer/agent -> decisions_write (mirror)
       - GET  /api/decisions/{id}/agent        -> decisions_write (read own)
       - GET  /api/decisions/agent             -> decisions_write (list own)
+      - POST /api/decisions/{id}/withdraw     -> decisions_write (withdraw own)
+      - GET  /api/decisions                   -> decisions_write (list own)
     The route verifies the JWT + grant + project binding."""
     return any(m == method and rx.match(path) for m, rx in _AGENT_DECISIONS_ROUTES)
+
+
+def _is_agent_notifications_path(method: str, path: str) -> bool:
+    """True only for POST /api/notifications (create) and GET
+    /api/notifications (list own), which a notifications_write token may
+    reach.  Count, mark-read and archive stay session-only.  The route
+    verifies the JWT + grant (+ project binding on POST)."""
+    return any(m == method and rx.match(path) for m, rx in _AGENT_NOTIFICATIONS_ROUTES)
 
 
 def _is_agent_files_path(method: str, path: str) -> bool:
@@ -229,12 +547,81 @@ def _is_agent_files_path(method: str, path: str) -> bool:
     return any(m == method and rx.match(path) for m, rx in _AGENT_FILES_ROUTES)
 
 
+def _is_memory_path(method: str, path: str) -> bool:
+    """True only for the memory routes a memory_read token may reach.
+    The route verifies the JWT + scope grant."""
+    return any(m == method and rx.match(path) for m, rx in _MEMORY_ROUTES)
+
+
 def _is_agent_scope_request_path(method: str, path: str) -> bool:
-    """True only for POST /api/agents/registry/{cid}/scope-requests, which an
-    agent may reach with its own registry JWT to self-request more scopes. The
-    route verifies the JWT identity == canonical_id; approve/deny are excluded
-    (extra path segments) and stay owner/admin session-only."""
+    """True only for the scope-request create (POST) and read (GET list +
+    GET by id) routes, which an agent may reach with its own registry JWT to
+    self-request more scopes and to see the state of what it requested. The
+    routes verify the JWT identity == canonical_id; approve/deny are excluded
+    (POST with an extra trailing segment) and stay owner/admin session-only."""
     return any(m == method and rx.match(path) for m, rx in _AGENT_SCOPE_REQUEST_ROUTES)
+
+
+# Sign-in broker (tsk-diqs7d): an agent creates a request, polls it and hands
+# over its token with its own registry JWT. The /code route is reachable too so
+# an agent JWT gets the route's own 403 (user session only) instead of a 401.
+_AGENT_AUTH_BROKER_ROUTES = (
+    ("POST", re.compile(r"^/api/auth-broker/requests$")),
+    ("GET", re.compile(rf"^/api/auth-broker/requests/{_SEG}$")),
+    ("POST", re.compile(rf"^/api/auth-broker/requests/{_SEG}/(code|token)$")),
+)
+
+
+def _is_agent_auth_broker_path(method: str, path: str) -> bool:
+    """True only for the sign-in broker routes; each route verifies the caller."""
+    return any(m == method and rx.match(path) for m, rx in _AGENT_AUTH_BROKER_ROUTES)
+
+
+def _is_agent_rotate_path(method: str, path: str) -> bool:
+    """True only for POST /api/agents/registry/{id}/rotate-tokens, which an
+    agent may reach with its own registry JWT to rotate its OWN credential. The
+    route verifies the JWT identity == canonical_id."""
+    return any(m == method and rx.match(path) for m, rx in _AGENT_ROTATE_ROUTES)
+
+
+def _is_container_request_action_path(method: str, path: str) -> bool:
+    """True only for POST /api/containers/requests/{id}/provision|destroy."""
+    return any(m == method and rx.match(path) for m, rx in _CONTAINER_REQUEST_ACTION_ROUTES)
+
+
+def _is_agent_container_quota_path(method: str, path: str) -> bool:
+    """True only for GET /api/agents/containers/quota."""
+    m, rx = _AGENT_CONTAINER_QUOTA_ROUTE
+    return m == method and rx.match(path)
+
+
+# Skill-exec routes for the system taOS Agent (scope system_agent_exec).
+# These are dynamic paths: /api/skill-exec/{skill_id}/call and /api/skill-exec/tools.
+_AGENT_SKILL_EXEC_ROUTES = (
+    ("GET", re.compile(r"^/api/skill-exec/tools$")),
+    ("POST", re.compile(r"^/api/skill-exec/[^/]+/call$")),
+)
+
+
+def _is_agent_skill_exec_path(method: str, path: str) -> bool:
+    """True only for the skill-exec routes a system_agent_exec token may reach."""
+    return any(m == method and rx.match(path) for m, rx in _AGENT_SKILL_EXEC_ROUTES)
+
+
+# Deployed-agent runtime routes reachable with a taos-deployed registry JWT.
+_AGENT_DEPLOYED_RUNTIME_ROUTES = (
+    ("GET", re.compile(r"^/api/openclaw/bootstrap$")),
+    ("GET", re.compile(rf"^/api/openclaw/sessions/{_SEG}/events$")),
+    ("POST", re.compile(rf"^/api/openclaw/sessions/{_SEG}/reply$")),
+    ("POST", re.compile(rf"^/api/chat/channels/{_SEG}/thinking$")),
+    ("POST", re.compile(r"^/api/trace$")),
+)
+
+
+def _is_agent_deployed_runtime_path(method: str, path: str) -> bool:
+    """True only for routes a deployed agent runtime may reach with its own
+    taos-deployed registry JWT."""
+    return any(m == method and rx.match(path) for m, rx in _AGENT_DEPLOYED_RUNTIME_ROUTES)
 # Bundle assets and the SPA shell HTML must be reachable without auth so:
 #   1. The browser can install and cache the shell for offline / PWA use.
 #   2. After a backend restart the cached shell loads immediately without
@@ -253,7 +640,17 @@ def _is_agent_scope_request_path(method: str, path: str) -> bool:
 # wrapping a WS upgrade can cause connection-level issues in some Starlette
 # versions, so /ws/ remains exempt at the middleware layer; the per-endpoint
 # check is the authoritative guard for all WebSocket endpoints.
-EXEMPT_PREFIXES = ("/static/", "/desktop/", "/chat-pwa/", "/ws/", "/shortcut/", "/api/peer/")
+# The lock screen renders BEFORE sign-in, so every URL it fetches has to be
+# reachable without a session or the screen half-loads with no visible error.
+# The /auth/lock-* prefixes are the lock screen's per-agent paths: two reads
+# (portrait, conversation) and ONE WRITE -- lock-send, which relays what was
+# typed to a physical device agent. All three are console-gated in the route
+# itself, which is where that check belongs, and lock-send additionally
+# refuses unless its own demo flag is on and the board is currently live.
+EXEMPT_PREFIXES = (
+    "/static/", "/desktop/", "/chat-pwa/", "/ws/", "/shortcut/", "/api/peer/",
+    "/auth/lock-avatar/", "/auth/lock-thread/", "/auth/lock-send/",
+)
 
 # Consent-loop status-poll paths are unauthenticated (the opaque request_id is
 # the capability), but the sub-action paths (/approve, /deny) require admin
@@ -283,6 +680,59 @@ _CLUSTER_HEARTBEAT = "/api/cluster/heartbeat"
 _INVITE_REDEEM = "/api/projects/invites/redeem"
 _INVITE_INFO_PREFIX = "/i/"
 
+# Agent-model OpenAI-compatible surface (routes/agent_model_api.py): the
+# consent key IS the credential and the ROUTE enforces it — it never resolves
+# a model without a valid key and answers 401 in an OpenAI error envelope
+# otherwise (proven by tests/test_routes_agent_model_api.py). The middleware
+# exempts EXACTLY the two mounted routes, method-sensitive; every other /v1
+# path stays session-gated so the exemption cannot become a skeleton key.
+_AGENT_MODEL_MODELS = "/v1/models"
+_AGENT_MODEL_CHAT = "/v1/chat/completions"
+
+# In-process LLM gateway (tinyagentos/llm_gateway). Exactly five method+path
+# pairs are EXEMPT (models, chat completions, embeddings, audio transcriptions, audio speech), like the Agent-as-a-Model pair above: a scoped gateway key
+# (or the host local token, or a signed-in session) IS the credential and the
+# route's ``gateway_caller`` dependency enforces it, answering an OpenAI-shaped
+# 401 otherwise. Every other /api/llm path or method stays gated here.
+_LLM_GATEWAY_MODELS = "/api/llm/v1/models"
+_LLM_GATEWAY_CHAT = "/api/llm/v1/chat/completions"
+_LLM_GATEWAY_EMBEDDINGS = "/api/llm/v1/embeddings"  # LiteLLM removal stage 2a
+_LLM_GATEWAY_TRANSCRIPTIONS = "/api/llm/v1/audio/transcriptions"  # local speech-to-text
+_LLM_GATEWAY_SPEECH = "/api/llm/v1/audio/speech"  # local text-to-speech
+# The gated rest of /api/llm/ still gets an OpenAI-shaped 401: an OpenAI
+# client reads error.message from an object, and the plain
+# {"error": "Authentication required"} string there surfaces as a crash in
+# the client, not as "bad credentials".
+_LLM_GATEWAY_PREFIX = "/api/llm/"
+
+# Screencast media (routes/cast.py): a TV fetches the cast media URL ITSELF and
+# carries no session, cookie or bearer. The cast token in the URL IS the
+# credential and the ROUTE enforces it (401 unknown/expired/revoked, 403 wrong
+# view or device), proven by tests/test_cast_tokens.py. Exactly one prefix,
+# GET/HEAD only; every other method and every /api/cast path stays gated.
+_CAST_MEDIA_PREFIX = "/cast/media/"
+# Exempt paths whose ROUTE owns its credential check (taOS #3790 follow-up to
+# #3227). The exempt-GET bearer promotion in _dispatch must NOT pre-authenticate
+# these: their handlers resolve the presented credential themselves and
+# deliberately refuse anything that is not their own key type -- the LLM gateway
+# 401s a local token (even the host's own) as a non-key credential, and
+# tests/test_llm_gateway*.py pin that refusal. Promoting would set
+# request.state.is_admin and short-circuit the route's check. The agent-model
+# surface (/v1/models) is credential-owned too, but its dependency reads only the
+# consent key and ignores is_admin, so it needs no exclusion here.
+_CREDENTIAL_OWNED_EXEMPT_PATHS = frozenset({_LLM_GATEWAY_MODELS})
+
+
+def _unauthenticated(path: str, body: dict) -> JSONResponse:
+    if path.startswith(_LLM_GATEWAY_PREFIX):
+        return JSONResponse(
+            {"error": {"message": "missing or invalid credentials",
+                       "type": "invalid_request_error", "param": None,
+                       "code": "invalid_api_key"}},
+            status_code=401,
+        )
+    return JSONResponse(body, status_code=401)
+
 # Local-only shutdown drain: the systemd ExecStop hook (taos-graceful-stop)
 # POSTs this from localhost with no session cookie and no token, so it was
 # getting 401 and the in-app drain never ran. We exempt it ONLY for loopback
@@ -311,34 +761,51 @@ def _is_loopback_client(request: Request) -> bool:
         return False
 
 
+def _is_browser_cross_site(request: Request) -> bool:
+    """True if the request is from a browser and targets a cross-site origin.
+
+    Stop hook is curl and sends neither header; a browser always sends Origin on
+    a cross-origin POST.
+    """
+    origin = request.headers.get("origin")
+    if origin:
+        return True
+    sec_fetch_site = request.headers.get("sec-fetch-site")
+    if sec_fetch_site and sec_fetch_site != "none":
+        return True
+    return False
+
+
 # ---------------------------------------------------------------------------
-# Per-IP fixed-window rate limiter (shared by unauthenticated proof-of-
-# possession endpoints: cluster pairing manual-claim and project-invite redeem).
+# Per-IP moving-window rate limiter for the unauthenticated project-invite
+# redeem. The cluster pairing manual-claim runs the same 20-per-10s cap from
+# its own instance of the shared limiter (see routes/cluster.py), so the two
+# endpoints share one implementation instead of two copies kept in step by a
+# comment.
 # ---------------------------------------------------------------------------
 _INVITE_RATE_WINDOW_SECS = 10.0
 _INVITE_RATE_MAX_PER_WINDOW = 20
-# ip -> (window_start_ts, count). In-memory is sufficient: the controller is a
-# single process and the cap only needs to bound a brute-force burst.
-_rate_limit_hits: dict[str, tuple[float, int]] = {}
+_invite_limiter = MovingWindowLimiter(
+    _INVITE_RATE_MAX_PER_WINDOW, _INVITE_RATE_WINDOW_SECS
+)
+# ip -> the request timestamps still inside its window. Aliased here so tests
+# and an operator can reset a window; the limiter mutates it in place.
+_rate_limit_hits = _invite_limiter.hits
 
 
-def rate_limit_ok(key: str, *, window_secs: float = _INVITE_RATE_WINDOW_SECS,
-                  max_per_window: int = _INVITE_RATE_MAX_PER_WINDOW) -> bool:
-    """Fixed-window per-key limiter. Returns False when the key has exceeded
-    ``max_per_window`` requests in the current window. The pairing
-    ``_manual_claim_rate_ok`` helper in cluster.py uses the identical contract;
-    this shared copy keeps the cluster and invite paths from drifting and lets
-    both pass the same ``20 per 10s`` cap the design specifies.
+def rate_limit_ok(key: str) -> bool:
+    """Moving-window per-key limiter for the invite-redeem endpoint.
 
-    Mirrors ``_manual_claim_rate_ok`` exactly so behaviour is identical.
+    Returns False when the key has already made ``_INVITE_RATE_MAX_PER_WINDOW``
+    requests inside the last ``_INVITE_RATE_WINDOW_SECS``. Pair a False with
+    ``rate_limit_retry_after`` so the 429 carries ``Retry-After``.
     """
-    now = time.time()
-    window_start, count = _rate_limit_hits.get(key, (now, 0))
-    if now - window_start >= window_secs:
-        window_start, count = now, 0
-    count += 1
-    _rate_limit_hits[key] = (window_start, count)
-    return count <= max_per_window
+    return _invite_limiter.check(key)
+
+
+def rate_limit_retry_after(key: str) -> int:
+    """Seconds until ``key`` regains capacity, for the 429's ``Retry-After``."""
+    return _invite_limiter.retry_after(key)
 
 
 def _is_exempt(method: str, path: str) -> bool:
@@ -402,11 +869,65 @@ def _is_exempt(method: str, path: str) -> bool:
     # logged-out admin is not exposed, but the invite id form is exempt.
     if method == "GET" and path.startswith(_INVITE_INFO_PREFIX) and "/" not in path[len(_INVITE_INFO_PREFIX):]:
         return True
+    # Agent-model surface — consent-key auth lives in the route (see the
+    # constants block above). Exact paths only; /v1/anything-else stays gated.
+    if method == "GET" and path == _AGENT_MODEL_MODELS:
+        return True
+    if method == "POST" and path == _AGENT_MODEL_CHAT:
+        return True
+    # LLM gateway -- scoped-key auth lives in the route dependency (see the
+    # constants block above). Exact paths only.
+    if method == "GET" and path == _LLM_GATEWAY_MODELS:
+        return True
+    if method == "POST" and path == _LLM_GATEWAY_CHAT:
+        return True
+    if method == "POST" and path == _LLM_GATEWAY_EMBEDDINGS:
+        return True
+    if method == "POST" and path == _LLM_GATEWAY_TRANSCRIPTIONS:
+        return True
+    if method == "POST" and path == _LLM_GATEWAY_SPEECH:
+        return True
+    # Cast media -- cast-token auth lives in the route (see the constants
+    # block above). Read methods only.
+    if method in ("GET", "HEAD") and path.startswith(_CAST_MEDIA_PREFIX):
+        return True
     return False
 
 
 class AuthMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
+        """Authenticate, or say plainly that we cannot.
+
+        This middleware runs outside Starlette's exception handling, so an
+        AuthStoreCorruptError raised while reading the account store would
+        escape as a bare 500 and the app-level handler would never see it.
+        Catch it here so an unreadable store gets the same honest answer
+        everywhere.
+        """
+        try:
+            return await self._dispatch(request, call_next)
+        except AuthStoreCorruptError:
+            logger.error(
+                "account store unreadable while authenticating %s",
+                request.url.path, exc_info=True,
+            )
+            accept = request.headers.get("accept", "")
+            detail = (
+                "The account store exists but cannot be read. Accounts are not "
+                "lost; restore it from a backup — see "
+                "docs/runbooks/controller-rescue.md."
+            )
+            if "text/html" in accept:
+                return HTMLResponse(
+                    "<h1>Account store unreadable</h1>"
+                    f"<p>{detail}</p>", status_code=503,
+                )
+            return JSONResponse(
+                {"error": "account_store_unreadable", "detail": detail},
+                status_code=503,
+            )
+
+    async def _dispatch(self, request: Request, call_next):
         auth_mgr = request.app.state.auth
         path = request.url.path
 
@@ -414,7 +935,132 @@ class AuthMiddleware(BaseHTTPMiddleware):
         # endpoints, cluster heartbeat). Without this, a cached old client
         # could bypass onboarding by hitting an /api endpoint that the
         # not-configured branch used to allow through unconditionally.
+        #
+        # Exempt paths do not require auth, but if a valid session cookie is
+        # present we preserve the caller's identity so route handlers can serve
+        # a reduced view to unauthenticated callers and the full view to
+        # authenticated admins (e.g. GET /api/cluster/workers).
         if _is_exempt(request.method, path):
+            token = request.cookies.get("taos_session")
+            if token:
+                user_agent = request.headers.get("user-agent", "")
+                user_id = auth_mgr.validate_session(token, user_agent=user_agent)
+                if user_id is not None:
+                    user_record = auth_mgr.get_user_by_id(user_id)
+                    request.state.user_id = user_id
+                    request.state.is_admin = bool(
+                        user_record.get("is_admin") if user_record else False
+                    )
+                    request.state.via = "session"
+                    return await call_next(request)
+            # taOS #3227: on exempt GET paths, a valid bearer token also
+            # authenticates the caller. Headless integrations (local token,
+            # device token, registry JWT) can then get the full view from
+            # routes like GET /api/cluster/workers that serve reduced data
+            # to anonymous callers. An absent or invalid bearer token falls
+            # through to anonymous handling below -- the path stays exempt,
+            # so we never 401 here.
+            #
+            # Skipped on the routes whose handler owns its credential check
+            # (see _CREDENTIAL_OWNED_EXEMPT_PATHS): there the handler must see
+            # the raw request, not a pre-authenticated admin, or its own 401
+            # for a non-key credential never fires.
+            if request.method == "GET" and path not in _CREDENTIAL_OWNED_EXEMPT_PATHS:
+                auth_header = request.headers.get("authorization", "")
+                if auth_header.lower().startswith("bearer "):
+                    presented = auth_header[7:].strip()
+                    if presented and auth_mgr.validate_local_token(presented):
+                        # Local token: same-host trust. Mirrors the non-exempt
+                        # flow -- maps to the primary/admin user, and is NOT
+                        # admin before onboarding, when there is no primary
+                        # user to be admin of.
+                        primary = auth_mgr.get_primary_user()
+                        request.state.user_id = primary["id"] if primary else None
+                        request.state.is_admin = primary is not None
+                        request.state.via = "local_token"
+                        bound_agent = auth_mgr.get_local_token_agent(presented)
+                        if bound_agent:
+                            return await _call_and_record_bound_agent(
+                                request, call_next, auth_mgr, bound_agent
+                            )
+                        return await call_next(request)
+                    if presented.startswith(DEVICE_TOKEN_PREFIX):
+                        try:
+                            device = await request.app.state.device_store.get_by_token(
+                                presented
+                            )
+                        except Exception:
+                            device = None
+                        # This branch bypasses require_device, so the scope
+                        # check it would have applied has to happen here: a
+                        # device token holding no agents:read (e.g. one minted
+                        # for push:register alone) stays anonymous rather than
+                        # reading the full worker list.
+                        if device is not None and AGENTS_READ in effective_scopes(device):
+                            request.state.user_id = None
+                            request.state.is_admin = False
+                            request.state.headless_full_view = True
+                            request.state.via = "device_bearer"
+                            return await call_next(request)
+                    elif presented:
+                        # Registry JWT: valid signature + active agent.
+                        # (Scope checks stay route-level; here we only
+                        # establish that the caller is a known agent.)
+                        try:
+                            from tinyagentos.agent_token_auth import verify_registry_token
+
+                            _private_pem, public_pem = _get_keypair(request)
+                            payload = verify_registry_token(presented, public_pem)
+                            canonical_id = payload.get("sub", "")
+                            if (
+                                canonical_id
+                                and payload.get("principal_type") != "human"
+                            ):
+                                registry = _get_store(request)
+                                record = await registry.get(canonical_id)
+                                if record is not None and record.get("status") == "active":
+                                    _enforce_rotation_cutoff(record, payload)
+                                    # The promotion requires agents:read, the
+                                    # same scope the device-token branch enforces
+                                    # here: a deployed agent minted by deploy
+                                    # carries owner user_id + memory_read only,
+                                    # so its JWT must not read the full worker
+                                    # list. Without the grant it falls through
+                                    # to the anonymous view, never a 401.
+                                    grants = _get_grants_store(request)
+                                    now = datetime.now(UTC)
+                                    has_agents_read = any(
+                                        g.get("scope") == AGENTS_READ
+                                        and _grant_unexpired(g.get("expires_at"), now)
+                                        for g in await grants.list_grants(canonical_id)
+                                    )
+                                    if not has_agents_read:
+                                        # No agents:read grant: fall through to the
+                                        # anonymous view, never a 403. A deployed
+                                        # agent minted by deploy carries owner
+                                        # user_id + memory_read only, so its JWT
+                                        # must not read the full worker list.
+                                        promoted = False
+                                    else:
+                                        promoted = True
+                                    if promoted:
+                                        request.state.user_id = None
+                                        request.state.is_admin = False
+                                        request.state.headless_full_view = True
+                                        request.state.agent_canonical_id = canonical_id
+                                        request.state.via = "registry_jwt"
+                                        return await call_next(request)
+                        except Exception as exc:
+                            # Keep the anonymous fall-through: an invalid
+                            # signature, expired token, rotation failure or
+                            # registry lookup error must not 401 an exempt
+                            # path. Log it (never the token itself) so the
+                            # failures are diagnosable. One line, no traceback.
+                            logger.warning(
+                                "exempt-GET bearer: registry JWT validation failed on %s (%s)",
+                                path,
+                                type(exc).__name__,
+                            )
             request.state.user_id = None
             request.state.is_admin = False
             request.state.via = "exempt"
@@ -427,26 +1073,33 @@ class AuthMiddleware(BaseHTTPMiddleware):
             request.method == "POST"
             and path == _PREPARE_SHUTDOWN
             and _is_loopback_client(request)
+            and not _is_browser_cross_site(request)
         ):
             request.state.user_id = None
             request.state.is_admin = False
             request.state.via = "loopback"
             return await call_next(request)
 
+        auth_header = request.headers.get("authorization", "")
+
+        # --- Credential validation: if a valid credential is presented,
+        # authenticate the user and fall through to routing so unknown
+        # paths resolve to 404 rather than 401.  If the credential is
+        # absent or invalid, we return 401 uniformly (anti-enumeration). ---
+# 1) Local Bearer token (same-host trust via .auth_local_token)
         # Local token (Authorization: Bearer <token>) is accepted as a
         # substitute for the session cookie. The token lives at
         # {data_dir}/.auth_local_token, readable only by the user
         # running taOS, so possession = same-user-on-the-host trust.
         # Used by scripts and the upcoming CLI; the browser SPA keeps
         # using cookies.
-        auth_header = request.headers.get("authorization", "")
         if auth_header.lower().startswith("bearer "):
             presented = auth_header[7:].strip()
             if presented and auth_mgr.validate_local_token(presented):
                 # A valid local token IS valid auth (same-host trust: the
                 # token file is 0600, possession = the host user). It maps to
                 # the primary/admin user when one exists. Before onboarding
-                # there is no primary user yet — the token still passes (it is
+                # there is no primary user yet -- the token still passes (it is
                 # how scripts/CLI operate pre-setup), but with no user_id, so
                 # current_user-gated routes still 401 while middleware-only
                 # routes proceed as before. (Not failing closed here: the
@@ -460,33 +1113,162 @@ class AuthMiddleware(BaseHTTPMiddleware):
                     request.state.user_id = None
                     request.state.is_admin = False
                     request.state.via = "local_token"
+                bound_agent = auth_mgr.get_local_token_agent(presented)
+                if bound_agent:
+                    return await _call_and_record_bound_agent(
+                        request, call_next, auth_mgr, bound_agent
+                    )
                 return await call_next(request)
+# Not a valid local token; fall through to registry JWT check below
 
-        # Agent-token endpoints (registry feeds + A2A bus proxy + project kanban)
-        # accept a registry JWT as an alternative to the admin session.  This
-        # branch sits AFTER the local-token check on purpose: a local token is
-        # admin-equivalent and must keep its admin semantics on these paths
-        # (taOSmd polls the feeds with it today).  Only a Bearer that is NOT the
-        # local token falls through to here; it is PASSED THROUGH and the route
-        # verifies the registry JWT + scope grant (+ project binding for task
-        # routes).  The allowlist -- the exact _AGENT_TOKEN_PATHS plus the
-        # anchored task-route matcher -- is closed so a registry JWT can never
-        # authenticate any other route (no skeleton key).
-        if (
-            path in _AGENT_TOKEN_PATHS
-            or _is_agent_task_path(request.method, path)
-            or _is_agent_doc_review_path(request.method, path)
-            or _is_agent_notes_path(request.method, path)
-            or _is_agent_canvas_path(request.method, path)
-            or _is_agent_decisions_path(request.method, path)
-            or _is_agent_files_path(request.method, path)
-            or _is_agent_scope_request_path(request.method, path)
-        ) and auth_header.lower().startswith("bearer "):
-            request.state.user_id = None
-            request.state.is_admin = False
-            request.state.via = "registry_jwt_candidate"
-            return await call_next(request)
+        # 2) Registry JWT on allowlisted paths (passthrough; route verifies
+        #    JWT + scope grant (+ project binding for task routes).
+        #    The allowlist -- the exact _AGENT_TOKEN_PATHS plus the
+        #    anchored task-route matcher -- is closed so a registry JWT can never
+        #    authenticate any other route (no skeleton key).
+        # We only reach here if auth_header starts with "bearer " and the token
+        # was not a valid local token. Extract the token again for clarity.
+        if auth_header.lower().startswith("bearer "):
+            presented = auth_header[7:].strip()
+            if presented and not presented.startswith(DEVICE_TOKEN_PREFIX):
+                # Deployed-agent runtime paths: verify fully BEFORE the
+                # allowlist check. On ANY miss or exception, let the
+                # request continue down the middleware exactly as on
+                # origin/dev (local token, session cookie, final 401).
+                # Never set registry_jwt_candidate for these paths.
+                if _is_agent_deployed_runtime_path(request.method, path):
+                    try:
+                        from tinyagentos.agent_token_auth import verify_registry_token
+                        _private_pem, public_pem = _get_keypair(request)
+                        payload = verify_registry_token(presented, public_pem)
+                        canonical_id = payload.get("sub", "")
+                        if canonical_id:
+                            registry = _get_store(request)
+                            record = await registry.get(canonical_id)
+                            if record and record.get("status") == "active":
+                                _enforce_rotation_cutoff(record, payload)
+                                if record.get("origin") == "taos-deployed":
+                                    config = getattr(request.app.state, "config", None)
+                                    agent_name = None
+                                    if config is not None:
+                                        agents = getattr(config, "agents", []) or []
+                                        for agent in agents:
+                                            if isinstance(agent, dict) and agent.get("registry_canonical_id") == canonical_id:
+                                                agent_name = agent.get("name")
+                                                break
+                                    if agent_name:
+                                        request.state.user_id = record.get("user_id") or None
+                                        request.state.is_admin = False
+                                        request.state.via = "registry_jwt_deployed_agent"
+                                        request.state.agent_name = agent_name
+                                        return await call_next(request)
+                    except Exception:
+                        # Verification failed; fall through to session/device/401
+                        pass
+                else:
+                    is_allowlisted = (
+                        path in _AGENT_TOKEN_PATHS
+                        or _is_agent_task_path(request.method, path)
+                        or _is_agent_doc_review_path(request.method, path)
+                        or _is_agent_notes_path(request.method, path)
+                        or _is_agent_lists_path(request.method, path)
+                        or _is_agent_canvas_path(request.method, path)
+                        or _is_agent_decisions_path(request.method, path)
+                        or _is_agent_notifications_path(request.method, path)
+                        or _is_agent_files_path(request.method, path)
+                        or _is_agent_scope_request_path(request.method, path)
+                        or _is_agent_rotate_path(request.method, path)
+                        or _is_agent_auth_broker_path(request.method, path)
+                        or _is_container_request_action_path(request.method, path)
+                        or _is_agent_container_quota_path(request.method, path)
+                        or _is_agent_skill_exec_path(request.method, path)
+                        or _is_memory_path(request.method, path)
+                    )
 
+                    if is_allowlisted:
+                        is_desktop_path = path in ("/api/desktop/command", "/api/desktop/screenshot", "/api/desktop/layout", "/api/desktop/panel-shot")
+                        is_skill_exec_path = _is_agent_skill_exec_path(request.method, path)
+
+                        # Verify the token and check if it's the native agent (all allowlisted paths)
+                        # or a deployed agent on skill-exec paths.
+                        try:
+                            from tinyagentos.agent_token_auth import verify_registry_token
+                            from tinyagentos.native_agent_identity import (
+                                NATIVE_AGENT_ORIGIN,
+                            )
+                            _private_pem, public_pem = _get_keypair(request)
+                            payload = verify_registry_token(presented, public_pem)
+                            canonical_id = payload.get("sub", "")
+                            if canonical_id:
+                                registry = _get_store(request)
+                                record = await registry.get(canonical_id)
+                                if record and record.get("status") == "active":
+                                    if record.get("origin") == NATIVE_AGENT_ORIGIN:
+                                        # Native agent: enforce rotation cutoff; if superseded,
+                                        # fall through to registry_jwt_candidate so route returns 403.
+                                        try:
+                                            _enforce_rotation_cutoff(record, payload)
+                                        except HTTPException:
+                                            pass  # fall through to candidate
+                                        else:
+                                            request.state.user_id = record.get("user_id")
+                                            request.state.is_admin = False
+                                            request.state.via = "registry_jwt_native_agent"
+                                            return await call_next(request)
+                                    if record.get("origin") == "taos-deployed" and is_skill_exec_path:
+                                        # Deployed agent on skill-exec: enforce rotation cutoff.
+                                        _enforce_rotation_cutoff(record, payload)
+                                        config = getattr(request.app.state, "config", None)
+                                        agent_name = None
+                                        if config is not None:
+                                            agents = getattr(config, "agents", []) or []
+                                            for agent in agents:
+                                                if isinstance(agent, dict) and agent.get("registry_canonical_id") == canonical_id:
+                                                    agent_name = agent.get("name")
+                                                    break
+                                        if agent_name:
+                                            request.state.user_id = record.get("user_id") or None
+                                            request.state.is_admin = False
+                                            request.state.via = "registry_jwt_deployed_agent"
+                                            request.state.agent_name = agent_name
+                                            return await call_next(request)
+                        except Exception:
+                            # Not the native agent or verification failed; fall through
+                            pass
+
+                        # For desktop paths, only the native agent is authenticated.
+                        # Non-native agents (including deployed agents and superseded native
+                        # agents) are rejected at the middleware layer with 403. For
+                        # skill-exec and other allowlisted paths, non-matching agents get
+                        # registry_jwt_candidate (route will 403).
+                        if is_desktop_path:
+                            return JSONResponse({"detail": "forbidden"}, status_code=403)
+                        else:
+                            request.state.user_id = None
+                            request.state.is_admin = False
+                            request.state.via = "registry_jwt_candidate"
+                            return await call_next(request)
+
+                    else:
+                        # Non-allowlisted path: registry JWTs are not accepted here.
+                        # Fall through to session/device/401.
+                        pass
+
+                    # Defer the 401 until after the session-cookie check below: a
+                    # stale non-device Bearer header on a known route must not
+                    # shadow a valid taos_session (tsk-3hei4g CodeRabbit finding
+                    # #3). The final 401 in section 4 still fires when neither
+                    # credential authenticates the request. Unknown-route handling
+                    # (the 404/401 split for valid registry JWT) is handled
+                    # immediately below so it does not interact with session.
+                    if not _any_route_matches(request.method, path, request.app.routes, match_method=False):
+                        try:
+                            await check_agent_identity(request)
+                            return JSONResponse({"error": "Not Found"}, status_code=404)
+                        except HTTPException:
+                            return _unauthenticated(path, {"error": "Authentication required"})
+
+        # 3) Device-bearer self-service on carded routes
         # Device-bearer self-service: a scoped device token may pass the auth
         # gate on the carded lock-screen routes. The middleware does NOT
         # resolve the device -- it only lets the Bearer through with
@@ -507,19 +1289,16 @@ class AuthMiddleware(BaseHTTPMiddleware):
             request.state.user_id = None
             request.state.is_admin = False
             request.state.via = "device_bearer_candidate"
+            device = None
+            try:
+                device = await request.app.state.device_store.get_by_token(auth_header[7:].strip())
+            except Exception:
+                pass
+            if device is not None:
+                request.state._device = device
             return await call_next(request)
 
-        # First boot: no user yet. Browsers go to the setup page; APIs
-        # hard-fail so a stale cached client knows to refresh.
-        if not auth_mgr.is_configured():
-            accept = request.headers.get("accept", "")
-            if "text/html" in accept:
-                return RedirectResponse("/auth/setup", status_code=303)
-            return JSONResponse(
-                {"error": "onboarding_required", "needs_onboarding": True},
-                status_code=401,
-            )
-
+        # 4) Session cookie
         # Check session cookie
         token = request.cookies.get("taos_session")
         if token:
@@ -534,10 +1313,20 @@ class AuthMiddleware(BaseHTTPMiddleware):
                 request.state.via = "session"
                 return await call_next(request)
 
+        # First boot: no user yet. Browsers go to the setup page; APIs
+        # hard-fail so a stale cached client knows to refresh.
+        if not auth_mgr.is_configured():
+            accept = request.headers.get("accept", "")
+            if "text/html" in accept:
+                return RedirectResponse("/auth/setup", status_code=303)
+            return _unauthenticated(
+                path, {"error": "onboarding_required", "needs_onboarding": True},
+            )
+
         # Redirect to login for browsers, 401 for API calls
         accept = request.headers.get("accept", "")
         if "text/html" in accept:
             next_param = f"?next={path}" if path != "/" else ""
             return RedirectResponse(f"/auth/login{next_param}", status_code=303)
 
-        return JSONResponse({"error": "Authentication required"}, status_code=401)
+        return _unauthenticated(path, {"error": "Authentication required"})

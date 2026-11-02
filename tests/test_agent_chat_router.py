@@ -756,3 +756,110 @@ async def test_manual_non_lead_branch_correct_for_worker():
     manual = enqueued["context"][0]["content"]
     assert "You are NOT a lead" in manual
     assert "You ARE designated lead" not in manual
+
+
+# ---------------------------------------------------------------------------
+# AgentLoop serialization ownership (tsk-icpt4i)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_run_acp_turn_same_agent_serializes_and_drives_both(monkeypatch):
+    """Two concurrent turns for the SAME agent never overlap, and BOTH
+    messages get driven (the queued one via the safe-point drain) with their
+    own trace ids preserved."""
+    import tinyagentos.openclaw_acp_runtime as rt
+
+    active = 0
+    max_concurrent = 0
+    driven: list[tuple[str, str, str]] = []
+
+    async def fake_drive_turn(*, slug, text, trace_id, record_reply):
+        nonlocal active, max_concurrent
+        active += 1
+        max_concurrent = max(max_concurrent, active)
+        await asyncio.sleep(0.02)
+        driven.append((slug, text, trace_id))
+        active -= 1
+
+    monkeypatch.setattr(rt, "drive_turn", fake_drive_turn)
+
+    router = AgentChatRouter(MagicMock())
+    await asyncio.gather(
+        router._run_acp_turn("a1", "m1", "t1", None),
+        router._run_acp_turn("a1", "m2", "t2", None),
+    )
+    assert max_concurrent == 1
+    assert sorted(driven) == [("a1", "m1", "t1"), ("a1", "m2", "t2")]
+
+
+@pytest.mark.asyncio
+async def test_run_acp_turn_different_agents_run_concurrently(monkeypatch):
+    """Turns for DIFFERENT agents are not serialized against each other."""
+    import tinyagentos.openclaw_acp_runtime as rt
+
+    active = 0
+    max_concurrent = 0
+
+    async def fake_drive_turn(*, slug, text, trace_id, record_reply):
+        nonlocal active, max_concurrent
+        active += 1
+        max_concurrent = max(max_concurrent, active)
+        await asyncio.sleep(0.02)
+        active -= 1
+
+    monkeypatch.setattr(rt, "drive_turn", fake_drive_turn)
+
+    router = AgentChatRouter(MagicMock())
+    await asyncio.gather(
+        router._run_acp_turn("a1", "m1", "t1", None),
+        router._run_acp_turn("a2", "m2", "t2", None),
+    )
+    assert max_concurrent == 2
+
+
+@pytest.mark.asyncio
+async def test_run_acp_turn_drive_failure_does_not_wedge_loop(monkeypatch):
+    """drive_turn raising must not skip reach_safe_point: the loop returns
+    to IDLE and a subsequent message is still driven."""
+    from tinyagentos.agent_loop import LoopState
+    import tinyagentos.openclaw_acp_runtime as rt
+
+    calls: list[str] = []
+
+    async def fake_drive_turn(*, slug, text, trace_id, record_reply):
+        calls.append(text)
+        if text == "boom":
+            raise RuntimeError("turn exploded")
+
+    monkeypatch.setattr(rt, "drive_turn", fake_drive_turn)
+
+    router = AgentChatRouter(MagicMock())
+    # Must not raise out of the supervised task path.
+    await router._run_acp_turn("a1", "boom", "t1", None)
+    assert router._agent_loops["a1"].state is LoopState.IDLE
+    await router._run_acp_turn("a1", "again", "t2", None)
+    assert calls == ["boom", "again"]
+
+
+@pytest.mark.asyncio
+async def test_run_acp_turn_queued_message_survives_drive_failure(monkeypatch):
+    """A message queued behind a FAILING turn is still driven at the safe
+    point (the finally-drain invariant)."""
+    import tinyagentos.openclaw_acp_runtime as rt
+
+    driven: list[str] = []
+
+    async def fake_drive_turn(*, slug, text, trace_id, record_reply):
+        await asyncio.sleep(0.02)
+        driven.append(text)
+        if text == "boom":
+            raise RuntimeError("turn exploded")
+
+    monkeypatch.setattr(rt, "drive_turn", fake_drive_turn)
+
+    router = AgentChatRouter(MagicMock())
+    await asyncio.gather(
+        router._run_acp_turn("a1", "boom", "t1", None),
+        router._run_acp_turn("a1", "after", "t2", None),
+    )
+    assert driven == ["boom", "after"]

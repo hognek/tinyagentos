@@ -3,11 +3,12 @@ from __future__ import annotations
 import json
 import logging
 import time
+from enum import StrEnum
+from typing import TYPE_CHECKING, Literal
 
-from typing import TYPE_CHECKING
-
-from tinyagentos.base_store import BaseStore
 from tinyagentos.projects.ids import new_id
+from tinyagentos.projects.strike_store import StrikeStore
+from tinyagentos.projects.tx import ProjectsDBStore
 
 if TYPE_CHECKING:
     from tinyagentos.board_audit import BoardAuditLog
@@ -19,6 +20,12 @@ logger = logging.getLogger(__name__)
 # Ancestor-walk depth cap for get_task_context — mirrors the cycle guard in
 # routes/projects.py's parent-chain check.
 _MAX_ANCESTRY_DEPTH = 50
+
+
+class TaskStatus(StrEnum):
+    OPEN = "open"
+    CLAIMED = "claimed"
+    CLOSED = "closed"
 
 TASK_SCHEMA = """
 CREATE TABLE IF NOT EXISTS project_tasks (
@@ -78,7 +85,29 @@ WHERE t.status = 'open'
       WHERE r.from_task_id = t.id
         AND r.kind = 'blocks'
         AND bt.status NOT IN ('closed', 'cancelled')
+  )
+  AND NOT EXISTS (
+      SELECT 1 FROM json_each(t.labels) je
+      JOIN project_tasks bt
+        ON 'blocked-on:' || bt.id = je.value
+       AND bt.project_id = t.project_id
+      WHERE bt.status NOT IN ('closed', 'cancelled')
   );
+
+CREATE TABLE IF NOT EXISTS task_checklist_items (
+    id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL REFERENCES project_tasks(id),
+    text TEXT NOT NULL DEFAULT '',
+    done INTEGER NOT NULL DEFAULT 0,
+    verified INTEGER NOT NULL DEFAULT 0,
+    reported INTEGER NOT NULL DEFAULT 0,
+    archived INTEGER NOT NULL DEFAULT 0,
+    created_by TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_checklist_task
+  ON task_checklist_items(task_id, archived, done);
 """
 
 _TASK_JSON_FIELDS = ("labels",)
@@ -93,14 +122,24 @@ def _row_to_task(row, description) -> dict:
     return t
 
 
-# Sentinels for update_task's element_id:
-#   _ELEMENT_UNCHANGED -> leave the task's element tag untouched (PATCH omitted)
-#   _ELEMENT_CLEAR     -> explicitly clear the tag to NULL ("none" sentinel)
-_ELEMENT_UNCHANGED: object = object()
-_ELEMENT_CLEAR: object = object()
+def _row_to_checklist_item(row, description) -> dict:
+    keys = [d[0] for d in description]
+    c = dict(zip(keys, row))
+    c["done"] = bool(c.get("done", 0))
+    c["verified"] = bool(c.get("verified", 0))
+    c["reported"] = bool(c.get("reported", 0))
+    c["archived"] = bool(c.get("archived", 0))
+    return c
 
 
-class ProjectTaskStore(BaseStore):
+# Sentinel for update_task's nullable columns (assignee_id, parent_task_id,
+# element_id).  For those three, ``None`` is a VALUE -- "clear this to NULL" --
+# so "the caller did not mention this field" needs a marker of its own.  The
+# non-nullable columns keep the simpler ``None means unchanged`` convention.
+_UNCHANGED: object = object()
+
+
+class ProjectTaskStore(ProjectsDBStore):
     SCHEMA = TASK_SCHEMA
 
     def __init__(
@@ -110,16 +149,34 @@ class ProjectTaskStore(BaseStore):
         broker: "ProjectEventBroker | None" = None,
         audit: "BoardAuditLog | None" = None,
         project_store: "ProjectStore | None" = None,
+        strikes: "StrikeStore | None" = None,
     ) -> None:
         super().__init__(db_path)
         self._broker = broker
         self._audit = audit
         self._project_store = project_store
+        self._strikes = strikes
 
     async def _publish(self, project_id: str, kind: str, payload: dict) -> None:
-        if self._broker is not None:
-            from tinyagentos.projects.events import ProjectEvent
-            await self._broker.publish(project_id, ProjectEvent(kind=kind, payload=payload))
+        """Announce a mutation, once the write behind it has actually landed.
+
+        Every mutation here publishes after its own ``async with self._tx():``
+        block, so normally there is no open transaction and this goes straight
+        out.  A mutation called from inside another one JOINS that transaction
+        instead of nesting, and the join returns without committing -- so the
+        event waits for the outermost commit and is dropped if it rolls back
+        (see ``tx.after_commit``).  Otherwise the broker would replay a
+        transition the database never took.
+        """
+        if self._broker is None:
+            return
+        from tinyagentos.projects.events import ProjectEvent
+        event = ProjectEvent(kind=kind, payload=payload)
+
+        async def _emit() -> None:
+            await self._broker.publish(project_id, event)
+
+        await self._after_commit(_emit)
 
     async def _record_audit(
         self,
@@ -135,20 +192,29 @@ class ProjectTaskStore(BaseStore):
         The audit log lives in its own store; a failure to record must never
         roll back or break the task mutation that already committed. project_id
         is recorded so the project-scoped activity feed never crosses projects.
+        Like ``_publish`` it waits for the outermost commit when this mutation
+        joined an open transaction, so the log cannot keep a transition that
+        rolled back.
         """
         if self._audit is None:
             return
-        try:
-            await self._audit.record(
-                task_id=task_id,
-                event=event,
-                actor=actor,
-                from_status=from_status,
-                to_status=to_status,
-                project_id=project_id,
-            )
-        except Exception:
-            logger.warning("board audit record failed for task %s", task_id, exc_info=True)
+
+        async def _write() -> None:
+            try:
+                await self._audit.record(
+                    task_id=task_id,
+                    event=event,
+                    actor=actor,
+                    from_status=from_status,
+                    to_status=to_status,
+                    project_id=project_id,
+                )
+            except Exception:
+                logger.warning(
+                    "board audit record failed for task %s", task_id, exc_info=True
+                )
+
+        await self._after_commit(_write)
 
     async def _post_init(self) -> None:
         # Additive column for project elements (slice 1 of
@@ -156,11 +222,13 @@ class ProjectTaskStore(BaseStore):
         # before the element tag existed get the column added here; fresh
         # installs already have it from SCHEMA. Swallow the duplicate-column
         # error the same way project_store does.
+        # DDL runs outside tx(): the connection is in autocommit mode, so each
+        # statement commits on its own and the expected duplicate-column error
+        # has no transaction left to leak.
         try:
             await self._db.execute(
                 "ALTER TABLE project_tasks ADD COLUMN element_id TEXT"
             )
-            await self._db.commit()
         except Exception:
             pass
         # Created here (not in SCHEMA) so element_id exists first on the
@@ -170,7 +238,51 @@ class ProjectTaskStore(BaseStore):
             "CREATE INDEX IF NOT EXISTS idx_tasks_element "
             "ON project_tasks(project_id, element_id)"
         )
-        await self._db.commit()
+        # Ready-view migration: re-create ready_tasks so it honours the
+        # ``blocked-on:<id>`` label mechanism (defect tsk-wkah3z). SQLite's
+        # ``CREATE VIEW IF NOT EXISTS`` is a no-op when the view already
+        # exists, so databases created before this change keep the old view
+        # body and silently keep returning tasks whose blocker is still
+        # open. Drop + recreate is safe here: the view is a derived
+        # projection of project_tasks, so a rebuild after the drop picks up
+        # the new WHERE clause with no data movement.
+        async with self._tx():
+            await self._db.execute("DROP VIEW IF EXISTS ready_tasks")
+            await self._db.execute(
+                "CREATE VIEW ready_tasks AS "
+                "SELECT t.* FROM project_tasks t "
+                "WHERE t.status = 'open' "
+                "AND t.claimed_by IS NULL "
+                "AND NOT EXISTS ("
+                "SELECT 1 FROM task_relationships r "
+                "JOIN project_tasks bt ON bt.id = r.to_task_id "
+                "WHERE r.from_task_id = t.id "
+                "AND r.kind = 'blocks' "
+                "AND bt.status NOT IN ('closed', 'cancelled')"
+                ") "
+                "AND NOT EXISTS ("
+                "SELECT 1 FROM json_each(t.labels) je "
+                "JOIN project_tasks bt ON 'blocked-on:' || bt.id = je.value "
+                "AND bt.project_id = t.project_id "
+                "WHERE bt.status NOT IN ('closed', 'cancelled')"
+                ")"
+            )
+        # Add created_by column for checklist items (defect tsk-6xymzj).
+        # Fresh installs already have it from SCHEMA. SQLite cannot ADD COLUMN NOT
+        # NULL without a default, so migrated databases get a NULLABLE column
+        # here; legacy rows stay NULL -- intended.
+        import sqlite3
+        async with self._db.execute("PRAGMA table_info(task_checklist_items)") as cur:
+            columns = await cur.fetchall()
+            column_names = [col[1] for col in columns]
+            if "created_by" not in column_names:
+                try:
+                    await self._db.execute(
+                        "ALTER TABLE task_checklist_items ADD COLUMN created_by TEXT"
+                    )
+                except sqlite3.OperationalError as e:
+                    if "duplicate column" not in str(e):
+                        raise
 
     async def create_task(
         self,
@@ -184,26 +296,27 @@ class ProjectTaskStore(BaseStore):
         parent_task_id: str | None = None,
         element_id: str | None = None,
     ) -> dict:
-        tid = new_id("tsk")
         now = time.time()
-        await self._db.execute(
-            """INSERT INTO project_tasks
-               (id, project_id, parent_task_id, title, body, status, priority, labels,
-                assignee_id, element_id, created_by, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                tid, project_id, parent_task_id, title, body, priority,
-                json.dumps(labels or []), assignee_id, element_id, created_by, now, now,
-            ),
-        )
-        await self._db.commit()
+        async with self._tx():
+            tid = await self._insert_with_retry(
+                """INSERT INTO project_tasks
+                   (id, project_id, parent_task_id, title, body, status, priority, labels,
+                    assignee_id, element_id, created_by, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    new_id("tsk"), project_id, parent_task_id, title, body, priority,
+                    json.dumps(labels or []), assignee_id, element_id, created_by, now, now,
+                ),
+                id_index=0,
+                new_id_fn=lambda: new_id("tsk"),
+            )
         new_task = await self.get_task(tid)
         await self._publish(project_id, "task.created", {"id": new_task["id"], "task": new_task})
         await self._record_audit(tid, "task.created", created_by, None, "open", project_id=project_id)
         return new_task
 
     async def get_task(self, task_id: str) -> dict | None:
-        async with self._db.execute(
+        async with self._read(
             "SELECT * FROM project_tasks WHERE id = ?", (task_id,)
         ) as cur:
             row = await cur.fetchone()
@@ -214,7 +327,7 @@ class ProjectTaskStore(BaseStore):
     async def list_tasks(
         self,
         project_id: str,
-        status: str | None = None,
+        status: TaskStatus | None = None,
         parent_task_id: str | None = None,
         element_id: str | None = None,
     ) -> list[dict]:
@@ -237,7 +350,7 @@ class ProjectTaskStore(BaseStore):
                 conds.append("element_id = ?")
                 params.append(element_id)
         sql = f"SELECT * FROM project_tasks WHERE {' AND '.join(conds)} ORDER BY created_at ASC"
-        async with self._db.execute(sql, params) as cur:
+        async with self._read(sql, params) as cur:
             rows = await cur.fetchall()
             desc = cur.description
         return [_row_to_task(r, desc) for r in rows]
@@ -250,19 +363,27 @@ class ProjectTaskStore(BaseStore):
         body: str | None = None,
         priority: int | None = None,
         labels: list[str] | None = None,
-        status: str | None = None,
-        assignee_id: str | None = None,
-        parent_task_id: str | None = None,
-        element_id: object = _ELEMENT_UNCHANGED,
+        status: TaskStatus | None = None,
+        assignee_id: str | None | object = _UNCHANGED,
+        parent_task_id: str | None | object = _UNCHANGED,
+        element_id: str | None | object = _UNCHANGED,
     ) -> None:
+        # Reject generic status transitions from parked: parked is permanent
+        # and such a transition would clear claim fields and return the task
+        # to the ready pool.  This runs BEFORE `candidates` is built: the
+        # tuple captures the status value by copy, so dropping the local name
+        # afterwards would leave the original status in the candidate list and
+        # the UPDATE would still un-park the task.
+        if status is not None:
+            existing = await self.get_task(task_id)
+            if existing is not None and existing.get("status") == "parked":
+                status = None  # skip the status candidate; allow other fields
         candidates = [
             ("title", title, title),
             ("body", body, body),
             ("priority", priority, priority),
             ("labels", labels, json.dumps(labels) if labels is not None else None),
             ("status", status, status),
-            ("assignee_id", assignee_id, assignee_id),
-            ("parent_task_id", parent_task_id, parent_task_id),
         ]
         sets: list[str] = []
         params: list = []
@@ -272,32 +393,129 @@ class ProjectTaskStore(BaseStore):
                 sets.append(f"{col} = ?")
                 params.append(serialised)
                 patch[col] = raw
-        # element_id is handled separately so None can mean "unchanged" while an
-        # explicit clear sets the tag to NULL.
-        if element_id is not _ELEMENT_UNCHANGED:
-            sets.append("element_id = ?")
-            if element_id is _ELEMENT_CLEAR:
-                params.append(None)
-                patch["element_id"] = None
-            else:
-                params.append(element_id)
-                patch["element_id"] = element_id
+        # The nullable columns are keyed on the _UNCHANGED sentinel instead, so
+        # an explicit None clears them to NULL rather than being read as "field
+        # omitted" (tsk-5xq2mw: a clear that is silently dropped answers the
+        # caller as if it had been written).
+        for col, value in (
+            ("assignee_id", assignee_id),
+            ("parent_task_id", parent_task_id),
+            ("element_id", element_id),
+        ):
+            if value is _UNCHANGED:
+                continue
+            sets.append(f"{col} = ?")
+            params.append(value)
+            patch[col] = value
         if not sets:
             return
+        # A generic edit back to 'open' must also clear the claimer (as the
+        # dedicated to-open transitions do): claim_task requires
+        # claimed_by IS NULL, so a stale claimer leaves the card unclaimable.
+        if status == "open":
+            sets.append("claimed_by = ?"); params.append(None); patch["claimed_by"] = None
+            sets.append("claimed_at = ?"); params.append(None); patch["claimed_at"] = None
         sets.append("updated_at = ?"); params.append(time.time())
         params.append(task_id)
-        await self._db.execute(
-            f"UPDATE project_tasks SET {', '.join(sets)} WHERE id = ?", params
-        )
-        await self._db.commit()
+        where = "id = ?"
+        if status is not None:
+            # Close the read-then-write gap on the parked guard above: if the
+            # task was parked between that read and this write, the status edit
+            # must not land (it was decided against a stale row).
+            where += " AND status != 'parked'"
+        async with self._tx():
+            cursor = await self._db.execute(
+                f"UPDATE project_tasks SET {', '.join(sets)} WHERE {where}", params
+            )
+            changed = cursor.rowcount == 1
+        if not changed:
+            # The guard above refused the edit (the task was parked after the
+            # pre-read), or the id does not exist.  Nothing committed, so there
+            # is nothing to announce: a task.updated here would tell every
+            # consumer to apply a patch the database never took.
+            return
         existing = await self.get_task(task_id)
         if existing is not None:
             await self._publish(existing["project_id"], "task.updated", {"id": task_id, "patch": patch})
 
+    async def assign_if_unassigned(self, task_id: str, assignee: str, actor: str) -> bool:
+        now = time.time()
+        async with self._tx():
+            cursor = await self._db.execute(
+                """UPDATE project_tasks
+                   SET assignee_id = ?, updated_at = ?
+                   WHERE id = ? AND status = 'open'
+                     AND claimed_by IS NULL
+                     AND (assignee_id IS NULL OR lower(trim(assignee_id)) IN ('', '@any', '@all', 'unassigned', 'none'))""",
+                (assignee, now, task_id),
+            )
+            changed = cursor.rowcount == 1
+        if changed:
+            existing = await self.get_task(task_id)
+            if existing is not None:
+                await self._publish(existing["project_id"], "task.updated", {"id": task_id, "patch": {"assignee_id": assignee}})
+            await self._record_audit(
+                task_id, "task.assigned", actor, "open", "open",
+                project_id=existing["project_id"] if existing else "",
+            )
+        return changed
+
+    async def unassign_if(self, task_id: str, expected_assignee: str, actor: str) -> bool:
+        now = time.time()
+        async with self._tx():
+            cursor = await self._db.execute(
+                """UPDATE project_tasks
+                   SET assignee_id = NULL
+                   WHERE id = ? AND assignee_id = ? AND claimed_by IS NULL AND status = 'open'""",
+                (task_id, expected_assignee),
+            )
+            changed = cursor.rowcount == 1
+        if changed:
+            existing = await self.get_task(task_id)
+            if existing is not None:
+                await self._publish(existing["project_id"], "task.updated", {"id": task_id, "patch": {"assignee_id": None}})
+            await self._record_audit(
+                task_id, "task.unassigned", actor, "open", "open",
+                project_id=existing["project_id"] if existing else "",
+            )
+        return changed
+
+    async def count_open_load(self, assignee_ids: list[str]) -> int:
+        if not assignee_ids:
+            return 0
+        placeholders = ",".join("?" for _ in assignee_ids)
+        sql = (
+            f"SELECT COUNT(*) FROM project_tasks "
+            f"WHERE (claimed_by IN ({placeholders}) AND status = 'claimed') "
+            f"OR (assignee_id IN ({placeholders}) AND status = 'open' AND claimed_by IS NULL)"
+        )
+        params = assignee_ids + assignee_ids
+        async with self._read(sql, params) as cur:
+            row = await cur.fetchone()
+        return row[0] if row else 0
+
+    async def count_open_load_by_project(self, assignee_ids: list[str]) -> dict[str, int]:
+        if not assignee_ids:
+            return {}
+        placeholders = ",".join("?" for _ in assignee_ids)
+        sql = (
+            f"SELECT project_id, COUNT(*) FROM project_tasks "
+            f"WHERE (claimed_by IN ({placeholders}) AND status = 'claimed') "
+            f"OR (assignee_id IN ({placeholders}) AND status = 'open' AND claimed_by IS NULL)"
+            f" GROUP BY project_id"
+        )
+        params = assignee_ids + assignee_ids
+        result: dict[str, int] = {}
+        async with self._read(sql, params) as cur:
+            rows = await cur.fetchall()
+            for row in rows:
+                result[row[0]] = row[1]
+        return result
+
     async def held_task(self, claimer_id: str) -> str | None:
         """Return the id of the active ('claimed') task this agent currently
         holds, or None. Used to enforce one active claim per agent."""
-        async with self._db.execute(
+        async with self._read(
             "SELECT id FROM project_tasks WHERE claimed_by = ? AND status = 'claimed' LIMIT 1",
             (claimer_id,),
         ) as cur:
@@ -310,18 +528,18 @@ class ProjectTaskStore(BaseStore):
         # before claiming another. The NOT EXISTS guard makes the one-active-
         # claim rule atomic, so concurrent claims by the same agent can't race
         # past it.
-        cursor = await self._db.execute(
-            """UPDATE project_tasks
-               SET claimed_by = ?, claimed_at = ?, status = 'claimed', updated_at = ?
-               WHERE id = ? AND claimed_by IS NULL AND status = 'open'
-                 AND NOT EXISTS (
-                     SELECT 1 FROM project_tasks held
-                     WHERE held.claimed_by = ? AND held.status = 'claimed'
-                 )""",
-            (claimer_id, now, now, task_id, claimer_id),
-        )
-        await self._db.commit()
-        changed = cursor.rowcount == 1
+        async with self._tx():
+            cursor = await self._db.execute(
+                """UPDATE project_tasks
+                   SET claimed_by = ?, claimed_at = ?, status = 'claimed', updated_at = ?
+                   WHERE id = ? AND claimed_by IS NULL AND status = 'open'
+                     AND NOT EXISTS (
+                         SELECT 1 FROM project_tasks held
+                         WHERE held.claimed_by = ? AND held.status = 'claimed'
+                     )""",
+                (claimer_id, now, now, task_id, claimer_id),
+            )
+            changed = cursor.rowcount == 1
         if changed:
             existing = await self.get_task(task_id)
             if existing is not None:
@@ -332,16 +550,16 @@ class ProjectTaskStore(BaseStore):
             )
         return changed
 
-    async def release_task(self, task_id: str, releaser_id: str) -> bool:
+    async def release_task(self, task_id: str, releaser_id: str, *, strike: bool = True) -> bool:
         now = time.time()
-        cursor = await self._db.execute(
-            """UPDATE project_tasks
-               SET claimed_by = NULL, claimed_at = NULL, status = 'open', updated_at = ?
-               WHERE id = ? AND claimed_by = ? AND status = 'claimed'""",
-            (now, task_id, releaser_id),
-        )
-        await self._db.commit()
-        changed = cursor.rowcount == 1
+        async with self._tx():
+            cursor = await self._db.execute(
+                """UPDATE project_tasks
+                   SET claimed_by = NULL, claimed_at = NULL, status = 'open', updated_at = ?
+                   WHERE id = ? AND claimed_by = ? AND status = 'claimed'""",
+                (now, task_id, releaser_id),
+            )
+            changed = cursor.rowcount == 1
         if changed:
             existing = await self.get_task(task_id)
             if existing is not None:
@@ -354,6 +572,88 @@ class ProjectTaskStore(BaseStore):
                 task_id, "task.released", releaser_id, "claimed", "open",
                 project_id=existing["project_id"] if existing else "",
             )
+            if strike and self._strikes is not None:
+                try:
+                    count = await self._strikes.record_strike(
+                        task_id, "dispatch_failed", actor=releaser_id
+                    )
+                    if count >= StrikeStore.STRIKE_THRESHOLD:
+                        # The conditional UPDATE inside quarantine_task is itself
+                        # the decision: it only fires while the task is still
+                        # open and unclaimed.  A separate pre-read here would
+                        # leave a window in which another worker claims the task
+                        # between the check and the quarantine, and the
+                        # quarantine would then swallow that worker's live claim.
+                        await self.quarantine_task(
+                            task_id, "system", only_if_unclaimed=True
+                        )
+                except Exception:
+                    logger.warning(
+                        "strike recording failed for task %s on release",
+                        task_id,
+                        exc_info=True,
+                    )
+        return changed
+
+    async def park_task(
+        self, task_id: str, actor: str, *, only_if_unclaimed: bool = False
+    ) -> bool:
+        """Permanently park a task.
+
+        A parked task is removed from the ready pool permanently.  Unlike
+        quarantine there is no un-park operation.  Only acts on a task that is
+        not already closed, cancelled, or parked; returns False otherwise.
+
+        ``only_if_unclaimed`` narrows the guard to a task that is still ``open``
+        with no claimer, so a caller that must not steal another worker's live
+        claim can use this update's row count as the parking decision instead of
+        a separate (racy) pre-read.
+        """
+        now = time.time()
+        guard = (
+            "status = 'open' AND claimed_by IS NULL"
+            if only_if_unclaimed
+            else "status NOT IN ('closed', 'cancelled', 'parked')"
+        )
+        # Park and disown in ONE transaction: parked is terminal, so an owner
+        # left on a parked row makes the card look held by an agent that can
+        # never release it, and a failure or cancellation between two separate
+        # transactions would leave exactly that.
+        async with self._tx():
+            # Read the row INSIDE the transaction, before the park: that is the
+            # real pre-park status for the audit row.  The guard admits any row
+            # that is not closed, cancelled or parked -- 'quarantined' included,
+            # and quarantine keeps claimed_by -- so inferring the status from
+            # the claimer would log a quarantined card as 'claimed'.  Under
+            # BEGIN IMMEDIATE this read is not a racy pre-read: no other writer
+            # can change the row between it and the UPDATE below.
+            existing = await self.get_task(task_id)
+            from_status = existing["status"] if existing is not None else None
+            cursor = await self._db.execute(
+                f"""UPDATE project_tasks
+                    SET status = 'parked', updated_at = ?
+                    WHERE id = ? AND {guard}""",
+                (now, task_id),
+            )
+            changed = cursor.rowcount == 1
+            if changed:
+                await self._db.execute(
+                    """UPDATE project_tasks
+                       SET claimed_by = NULL, claimed_at = NULL
+                       WHERE id = ? AND status = 'parked'""",
+                    (task_id,),
+                )
+        if changed:
+            if existing is not None:
+                await self._publish(
+                    existing["project_id"],
+                    "task.parked",
+                    {"id": task_id, "actor": actor},
+                )
+            await self._record_audit(
+                task_id, "task.parked", actor, from_status, "parked",
+                project_id=existing["project_id"] if existing else "",
+            )
         return changed
 
     async def close_task(
@@ -361,20 +661,40 @@ class ProjectTaskStore(BaseStore):
         task_id: str,
         closed_by: str,
         reason: str | None = None,
+        *,
+        force: bool = False,
     ) -> bool:
         now = time.time()
-        cursor = await self._db.execute(
-            """UPDATE project_tasks
-               SET status = 'closed', closed_by = ?, closed_at = ?, close_reason = ?, updated_at = ?
-               WHERE id = ? AND status NOT IN ('closed', 'cancelled')""",
-            (closed_by, now, reason, now, task_id),
-        )
-        await self._db.commit()
-        changed = cursor.rowcount == 1
+        async with self._tx():
+            if force:
+                cursor = await self._db.execute(
+                    """UPDATE project_tasks
+                       SET status = 'closed', closed_by = ?, closed_at = ?, close_reason = ?, updated_at = ?
+                       WHERE id = ? AND status NOT IN ('closed', 'cancelled', 'parked')""",
+                    (closed_by, now, reason, now, task_id),
+                )
+            else:
+                cursor = await self._db.execute(
+                    """UPDATE project_tasks
+                       SET status = 'closed', closed_by = ?, closed_at = ?, close_reason = ?, updated_at = ?
+                       WHERE id = ? AND status NOT IN ('closed', 'cancelled', 'parked')
+                         AND (claimed_by IS NULL OR claimed_by = ?)""",
+                    (closed_by, now, reason, now, task_id, closed_by),
+                )
+            changed = cursor.rowcount == 1
         if changed:
             existing = await self.get_task(task_id)
             if existing is not None:
                 await self._publish(existing["project_id"], "task.closed", {"id": task_id, "closed_by": closed_by})
+            # A closed card can never be re-landed, so any lingering strikes
+            # are stale garbage that would make the dispatch lanes redo landed
+            # work.  Clear them automatically (best-effort; the close itself
+            # has already committed).
+            if self._strikes is not None:
+                try:
+                    await self._strikes.clear_strikes(task_id)
+                except Exception:
+                    logger.warning("clear_strikes failed for task %s on close", task_id, exc_info=True)
             # Derive the pre-close status race-free from the committed row rather
             # than a separate pre-read (which would have a TOCTOU gap). close does
             # not clear claimed_by, so a set claimer means it was 'claimed'.
@@ -388,23 +708,132 @@ class ProjectTaskStore(BaseStore):
     async def reopen_task(self, task_id: str, reopened_by: str) -> bool:
         """Undo a close: a closed task returns to the open pool (claimer stays
         cleared, so a free agent can pick it up again). Only acts on a closed
-        task; returns False otherwise."""
+        task; returns False otherwise.
+
+        A parked task is refused by that same predicate rather than by one of
+        its own: park and close each reject the other's status, so 'parked' and
+        'closed' are mutually exclusive and ``status = 'closed'`` is what keeps
+        a parked card out of the open pool.  An explicit ``AND status !=
+        'parked'`` here would be a dead predicate -- no row can fail it that has
+        not already failed the first -- so it is not written.
+        """
         now = time.time()
-        cursor = await self._db.execute(
-            """UPDATE project_tasks
-               SET status = 'open', closed_by = NULL, closed_at = NULL, close_reason = NULL,
-                   claimed_by = NULL, claimed_at = NULL, updated_at = ?
-               WHERE id = ? AND status = 'closed'""",
-            (now, task_id),
-        )
-        await self._db.commit()
-        changed = cursor.rowcount == 1
+        async with self._tx():
+            cursor = await self._db.execute(
+                """UPDATE project_tasks
+                   SET status = 'open', closed_by = NULL, closed_at = NULL, close_reason = NULL,
+                       claimed_by = NULL, claimed_at = NULL, updated_at = ?
+                   WHERE id = ? AND status = 'closed'""",
+                (now, task_id),
+            )
+            changed = cursor.rowcount == 1
         if changed:
             existing = await self.get_task(task_id)
             if existing is not None:
                 await self._publish(existing["project_id"], "task.reopened", {"id": task_id, "reopened_by": reopened_by})
             await self._record_audit(
                 task_id, "task.reopened", reopened_by, "closed", "open",
+                project_id=existing["project_id"] if existing else "",
+            )
+        return changed
+
+    async def quarantine_task(
+        self, task_id: str, actor: str, *, only_if_unclaimed: bool = False
+    ) -> bool:
+        """Move a task into the ``quarantined`` status.
+
+        A quarantined card is visible on the board (distinct column) but is
+        removed from the ready pool -- the fleet will not pick it up until a
+        lead explicitly un-quarantines it.  Only acts on a task that is not
+        already closed/cancelled; returns False otherwise.
+
+        ``only_if_unclaimed`` narrows the guard to a task that is still ``open``
+        with no claimer, so a caller that must not steal another worker's live
+        claim can use this update's row count as the quarantine decision instead
+        of a separate (racy) pre-read.
+        """
+        now = time.time()
+        guard = (
+            "status = 'open' AND claimed_by IS NULL"
+            if only_if_unclaimed
+            else "status NOT IN ('closed', 'cancelled', 'quarantined')"
+        )
+        async with self._tx():
+            cursor = await self._db.execute(
+                f"""UPDATE project_tasks
+                    SET status = 'quarantined', updated_at = ?
+                    WHERE id = ? AND {guard}""",
+                (now, task_id),
+            )
+            changed = cursor.rowcount == 1
+        if changed:
+            existing = await self.get_task(task_id)
+            if existing is not None:
+                strike_count = (
+                    await self._strikes.count_strikes(task_id)
+                    if self._strikes is not None
+                    else 0
+                )
+                latest_strike = (
+                    await self._strikes.latest(task_id)
+                    if self._strikes is not None
+                    else None
+                )
+                await self._publish(
+                    existing["project_id"],
+                    "task.quarantined",
+                    {
+                        "id": task_id,
+                        "actor": actor,
+                        "strike_count": strike_count,
+                        "latest_strike": latest_strike,
+                    },
+                )
+            # Derive the pre-quarantine status race-free from the committed row
+            # rather than a separate pre-read (which would have a TOCTOU gap).
+            # quarantine does not clear claimed_by, so a set claimer means it was
+            # 'claimed' (cf. close_task's derivation).
+            from_status = "claimed" if existing and existing.get("claimed_by") else "open"
+            await self._record_audit(
+                task_id, "task.quarantined", actor, from_status, "quarantined",
+                project_id=existing["project_id"] if existing else "",
+            )
+        return changed
+
+    async def unquarantine_task(self, task_id: str, actor: str) -> bool:
+        """Return a quarantined task to the open pool and clear its strikes.
+
+        This is the explicit un-quarantine / retry action: the card re-enters
+        the ready pool so the fleet may pick it up again.  Strikes are cleared
+        so a fresh failure count starts from zero, and the claimer clears (as
+        in ``reopen_task``) -- claim_task requires ``claimed_by IS NULL``, so
+        a stale claimer would leave the card open but unclaimable forever.
+        Only acts on a quarantined task; returns False otherwise.
+        """
+        now = time.time()
+        async with self._tx():
+            cursor = await self._db.execute(
+                """UPDATE project_tasks
+                   SET status = 'open', claimed_by = NULL, claimed_at = NULL, updated_at = ?
+                   WHERE id = ? AND status = 'quarantined'""",
+                (now, task_id),
+            )
+            changed = cursor.rowcount == 1
+        if changed:
+            if self._strikes is not None:
+                try:
+                    await self._strikes.clear_strikes(task_id)
+                except Exception:
+                    logger.warning("clear_strikes failed for task %s on unquarantine", task_id, exc_info=True)
+            existing = await self.get_task(task_id)
+            if existing is not None:
+                await self._publish(
+                    existing["project_id"],
+                    "task.unquarantined",
+                    {"id": task_id, "actor": actor},
+                )
+            await self._record_audit(
+                task_id, "task.unquarantined", actor, "quarantined", "open",
                 project_id=existing["project_id"] if existing else "",
             )
         return changed
@@ -423,15 +852,16 @@ class ProjectTaskStore(BaseStore):
             t = await self.get_task(tid)
             if t is None or t["project_id"] != project_id:
                 raise ValueError(f"task not in project: {tid}")
-        rid = new_id("rel")
         now = time.time()
-        await self._db.execute(
-            """INSERT INTO task_relationships
-               (id, project_id, from_task_id, to_task_id, kind, created_by, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (rid, project_id, from_task_id, to_task_id, kind, created_by, now),
-        )
-        await self._db.commit()
+        async with self._tx():
+            rid = await self._insert_with_retry(
+                """INSERT INTO task_relationships
+                   (id, project_id, from_task_id, to_task_id, kind, created_by, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (new_id("rel"), project_id, from_task_id, to_task_id, kind, created_by, now),
+                id_index=0,
+                new_id_fn=lambda: new_id("rel"),
+            )
         await self._publish(project_id, "relationship.added", {"from": from_task_id, "to": to_task_id, "kind": kind})
         return {
             "id": rid, "project_id": project_id, "from_task_id": from_task_id,
@@ -439,20 +869,20 @@ class ProjectTaskStore(BaseStore):
         }
 
     async def remove_relationship(self, relationship_id: str) -> None:
-        await self._db.execute(
-            "DELETE FROM task_relationships WHERE id = ?", (relationship_id,)
-        )
-        await self._db.commit()
+        async with self._tx():
+            await self._db.execute(
+                "DELETE FROM task_relationships WHERE id = ?", (relationship_id,)
+            )
 
     async def list_relationships(
         self,
         task_id: str,
-        direction: str = "from",
+        direction: Literal["from", "to"] = "from",
     ) -> list[dict]:
         if direction not in ("from", "to"):
             raise ValueError(f"invalid direction: {direction}")
         col = "from_task_id" if direction == "from" else "to_task_id"
-        async with self._db.execute(
+        async with self._read(
             f"SELECT * FROM task_relationships WHERE {col} = ? ORDER BY created_at ASC",
             (task_id,),
         ) as cur:
@@ -463,7 +893,11 @@ class ProjectTaskStore(BaseStore):
     async def list_ready_tasks(
         self, project_id: str, limit: int = 50, element_id: str | None = None
     ) -> list[dict]:
-        limit = max(1, min(limit, 200))
+        # Clamp to [1, 500]. The floor stops ``limit=0`` / negative inputs from
+        # being silently widened to ``unbounded`` or the default 50, and the
+        # cap protects the route from a caller asking for an unreasonable
+        # window (defect tsk-wkah3z).
+        limit = max(1, min(limit, 500))
         conds = ["project_id = ?"]
         params: list = [project_id]
         if element_id is not None:
@@ -473,7 +907,7 @@ class ProjectTaskStore(BaseStore):
                 conds.append("element_id = ?")
                 params.append(element_id)
         params.append(limit)
-        async with self._db.execute(
+        async with self._read(
             f"""SELECT * FROM ready_tasks
                 WHERE {' AND '.join(conds)}
                 ORDER BY priority DESC, created_at ASC
@@ -490,7 +924,7 @@ class ProjectTaskStore(BaseStore):
         assignee instead of project - used by the agent heartbeat loop to find
         an idle agent's next task without a per-project scan."""
         limit = max(1, min(limit, 200))
-        async with self._db.execute(
+        async with self._read(
             """SELECT * FROM ready_tasks
                WHERE assignee_id = ?
                ORDER BY priority DESC, created_at ASC
@@ -573,22 +1007,23 @@ class ProjectTaskStore(BaseStore):
         replies_to_comment_id: str | None = None,
     ) -> dict:
         if replies_to_comment_id is not None:
-            async with self._db.execute(
+            async with self._read(
                 "SELECT task_id FROM task_comments WHERE id = ?",
                 (replies_to_comment_id,),
             ) as cur:
                 row = await cur.fetchone()
             if row is None or row[0] != task_id:
                 raise ValueError("replies_to_comment_id not in this task")
-        cid = new_id("cmt")
         now = time.time()
-        await self._db.execute(
-            """INSERT INTO task_comments
-               (id, task_id, author_id, body, replies_to_comment_id, created_at)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (cid, task_id, author_id, body, replies_to_comment_id, now),
-        )
-        await self._db.commit()
+        async with self._tx():
+            cid = await self._insert_with_retry(
+                """INSERT INTO task_comments
+                   (id, task_id, author_id, body, replies_to_comment_id, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (new_id("cmt"), task_id, author_id, body, replies_to_comment_id, now),
+                id_index=0,
+                new_id_fn=lambda: new_id("cmt"),
+            )
         new_comment = {
             "id": cid, "task_id": task_id, "author_id": author_id, "body": body,
             "replies_to_comment_id": replies_to_comment_id, "created_at": now,
@@ -599,10 +1034,144 @@ class ProjectTaskStore(BaseStore):
         return new_comment
 
     async def list_comments(self, task_id: str) -> list[dict]:
-        async with self._db.execute(
+        async with self._read(
             "SELECT * FROM task_comments WHERE task_id = ? ORDER BY created_at ASC",
             (task_id,),
         ) as cur:
             rows = await cur.fetchall()
             keys = [d[0] for d in cur.description]
         return [dict(zip(keys, r)) for r in rows]
+
+    # ------------------------------------------------------------------ checklist items
+
+    async def create_checklist_item(
+        self,
+        task_id: str,
+        text: str,
+        created_by: str,
+    ) -> dict:
+        """Create a checklist item on a task.
+
+        Raises ValueError if the task does not exist: the item's only route to
+        a project subscriber is the task's ``project_id``, so a missing task
+        leaves nothing to publish under. Resolved before the INSERT so a refusal
+        never leaves an orphan row behind.
+        """
+        task = await self.get_task(task_id)
+        if task is None:
+            raise ValueError(f"task not found: {task_id}")
+        now = time.time()
+        async with self._tx():
+            cid = await self._insert_with_retry(
+                """INSERT INTO task_checklist_items
+                   (id, task_id, text, done, verified, reported, archived, created_by, created_at, updated_at)
+                   VALUES (?, ?, ?, 0, 0, 0, 0, ?, ?, ?)""",
+                (new_id("cki"), task_id, text, created_by, now, now),
+                id_index=0,
+                new_id_fn=lambda: new_id("cki"),
+            )
+        async with self._read(
+            "SELECT * FROM task_checklist_items WHERE id = ?", (cid,)
+        ) as cur:
+            row = await cur.fetchone()
+            desc = cur.description
+        item = _row_to_checklist_item(row, desc)
+        await self._publish(task["project_id"], "checklist.item.created", {"id": item["id"], "text": item["text"], "task_id": task_id})
+        return item
+
+    async def list_checklist_items(
+        self,
+        task_id: str,
+        *,
+        include_archived: bool = False,
+    ) -> list[dict]:
+        conds = ["task_id = ?"]
+        params: list = [task_id]
+        if not include_archived:
+            conds.append("archived = 0")
+        sql = f"SELECT * FROM task_checklist_items WHERE {' AND '.join(conds)} ORDER BY created_at ASC"
+        async with self._read(sql, params) as cur:
+            rows = await cur.fetchall()
+            desc = cur.description
+        return [_row_to_checklist_item(r, desc) for r in rows]
+
+    async def update_checklist_item(
+        self,
+        item_id: str,
+        *,
+        done: bool | None = None,
+        verified: bool | None = None,
+        reported: bool | None = None,
+    ) -> dict | None:
+        now = time.time()
+        candidates: list[tuple[str, object]] = []
+        if done is not None:
+            candidates.append(("done", 1 if done else 0))
+        if verified is not None:
+            candidates.append(("verified", 1 if verified else 0))
+        if reported is not None:
+            candidates.append(("reported", 1 if reported else 0))
+        if not candidates:
+            return await self.get_checklist_item(item_id)
+        sets: list[str] = []
+        params: list = []
+        for col, val in candidates:
+            sets.append(f"{col} = ?")
+            params.append(val)
+        sets.append("updated_at = ?")
+        params.append(now)
+        params.append(item_id)
+        async with self._tx():
+            await self._db.execute(
+                f"UPDATE task_checklist_items SET {', '.join(sets)} WHERE id = ?", params
+            )
+        return await self.get_checklist_item(item_id)
+
+    async def archive_checklist_item(self, item_id: str) -> dict:
+        """Archive a checklist item. Only valid if verified=1 and reported=1.
+
+        Raises ValueError if the item cannot be archived because it lacks
+        verification or a report, or because its task is gone — the task
+        carries the ``project_id`` that ``checklist.item.archived`` is
+        published under, and project subscribers listen at project scope only.
+        Resolved before the UPDATE so a refusal leaves the item untouched.
+        """
+        item = await self.get_checklist_item(item_id)
+        if item is None:
+            raise ValueError(f"checklist item not found: {item_id}")
+        if item["verified"] != 1:
+            raise ValueError("item cannot be archived: not verified")
+        if item["reported"] != 1:
+            raise ValueError("item cannot be archived: not reported")
+        task = await self.get_task(item["task_id"])
+        if task is None:
+            raise ValueError(f"task not found: {item['task_id']}")
+        now = time.time()
+        async with self._tx():
+            # The invariant is enforced by the UPDATE, not only by the reads
+            # above it: an update_checklist_item that cleared `verified` or
+            # `reported` between the two would otherwise archive an item that
+            # no longer satisfies it -- and announce the archival. Matching no
+            # row is that race, so it is refused rather than reported as done.
+            cursor = await self._db.execute(
+                "UPDATE task_checklist_items SET archived = 1, updated_at = ? "
+                "WHERE id = ? AND verified = 1 AND reported = 1",
+                (now, item_id),
+            )
+            archived = cursor.rowcount == 1
+        if not archived:
+            raise ValueError(
+                "item cannot be archived: verification or report was withdrawn"
+            )
+        await self._publish(task["project_id"], "checklist.item.archived", {"id": item_id, "task_id": item["task_id"], "archived": True})
+        return await self.get_checklist_item(item_id)
+
+    async def get_checklist_item(self, item_id: str) -> dict | None:
+        async with self._read(
+            "SELECT * FROM task_checklist_items WHERE id = ?", (item_id,)
+        ) as cur:
+            row = await cur.fetchone()
+            if row is None:
+                return None
+            desc = cur.description
+            return _row_to_checklist_item(row, desc)

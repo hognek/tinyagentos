@@ -1,0 +1,2 @@
+### Added
+- Chat channel list now includes `last_preview` (latest message text, collapsed whitespace, max 120 chars) and `last_preview_author` fields via `GET /api/chat/channels`. Mobile chat rows render the latest message under the channel name (WhatsApp-style).

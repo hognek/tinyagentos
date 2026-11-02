@@ -3,10 +3,12 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
+from urllib.parse import urlparse
 
 from tinyagentos.auth_context import CurrentUser, current_user
 from tinyagentos.device_auth import current_user_or_device
+from tinyagentos.routes.desktop_browser.ssrf import SsrfBlockedError, validate_url_or_raise
 
 router = APIRouter()
 
@@ -26,9 +28,20 @@ class RegisterIn(BaseModel):
     @field_validator("platform")
     @classmethod
     def platform_supported(cls, v: str) -> str:
-        if v not in ("ios", "watchos"):
-            raise ValueError("platform must be 'ios' or 'watchos'")
+        # wearos is allowed here; embedded is deliberately NOT: an embedded
+        # device is paired only through the pairing Decision (owner-approved,
+        # with its scopes), never by a self-service register call.
+        if v not in ("ios", "watchos", "android", "wearos"):
+            raise ValueError("platform must be 'ios', 'watchos', 'android', or 'wearos'")
         return v
+
+    @model_validator(mode="after")
+    def _validate_push_token_for_platform(self) -> "RegisterIn":
+        if self.platform == "android" and self.push_token:
+            parsed = urlparse(self.push_token)
+            if parsed.scheme not in ("http", "https") or not parsed.hostname:
+                raise ValueError("push_token must be a URL for android devices")
+        return self
 
 
 class PushTokenIn(BaseModel):
@@ -40,11 +53,45 @@ async def register_device(
     body: RegisterIn, request: Request, user: CurrentUser = Depends(current_user)
 ):
     store = request.app.state.device_store
+    # Wear has no push distributor and embedded has no push channel: a
+    # non-empty token would be stored and later misrouted. Empty = absent.
+    # (embedded cannot reach here via RegisterIn today; the check is kept so a
+    # future widening of the platform list cannot reopen it.)
+    if body.platform in ("embedded", "wearos") and body.push_token:
+        return JSONResponse(
+            {"error": f"push_token is not accepted for {body.platform} devices"},
+            status_code=400,
+        )
+    # A blocked device (revoked + blocked) may not re-pair under a fresh token.
+    # push_token is client-supplied, so a well-behaved client that re-sends the
+    # same APNs token is caught; a caller sending a DIFFERENT push token slips
+    # past this -- acceptable because register already requires the owner's own
+    # auth, and that caller could simply unblock instead; this is
+    # defense-in-depth against silent re-pair, not a hard boundary.
+    if body.push_token and await store.find_blocked_by_push_token(user.user_id, body.push_token) is not None:
+        return JSONResponse(
+            {"error": "device is blocked; unblock it before re-pairing"},
+            status_code=403,
+        )
+    # _MAX_DEVICES_PER_USER slot accounting: list_for_user returns rows where
+    # revoked=0 OR blocked=1, so a blocked device continues to consume a slot
+    # against the per-user cap until it is unblocked (at which point the
+    # blocked flag clears, the row falls out of list_for_user, and the slot
+    # frees). This is deliberate: a blocked device is a retained safety valve
+    # that the owner can still see and unblock, so it counts against the cap.
     if len(await store.list_for_user(user.user_id)) >= _MAX_DEVICES_PER_USER:
         return JSONResponse(
             {"error": f"device limit reached ({_MAX_DEVICES_PER_USER})"},
             status_code=429,
         )
+    if body.platform == "android" and body.push_token:
+        try:
+            validate_url_or_raise(body.push_token, allow_private=True)
+        except SsrfBlockedError:
+            return JSONResponse(
+                {"error": "push_token URL is not allowed"},
+                status_code=400,
+            )
     device = await store.register(
         user_id=user.user_id,
         platform=body.platform,
@@ -57,7 +104,12 @@ async def register_device(
 @router.get("/api/devices")
 async def list_devices(request: Request, user: CurrentUser = Depends(current_user)):
     store = request.app.state.device_store
-    return {"items": await store.list_for_user(user.user_id)}
+    items = await store.list_for_user(user.user_id)
+    # Surface a derived "live scoped token" flag so the UI can tell at a glance
+    # which devices can still authenticate (revoked OR blocked => no token).
+    for d in items:
+        d["live_token"] = not d.get("revoked") and not d.get("blocked")
+    return {"items": items}
 
 
 async def _owned_or_404(store, device_id: str, user: CurrentUser):
@@ -69,6 +121,17 @@ async def _owned_or_404(store, device_id: str, user: CurrentUser):
     # separate surface.
     device = await store.get(device_id)
     if device is None or device["revoked"] or device["user_id"] != user.user_id:
+        return None
+    return device
+
+
+async def _owned_any_state(store, device_id: str, user: CurrentUser):
+    # Ownership check that ignores the revoked/blocked flags. Used by the
+    # block/unblock actions, which must operate on a device whose token is
+    # already dead (blocked implies revoked). _owned_or_404 would refuse such a
+    # row, making it impossible to unblock.
+    device = await store.get(device_id)
+    if device is None or device["user_id"] != user.user_id:
         return None
     return device
 
@@ -92,6 +155,21 @@ async def update_push_token(
         # Session path: unchanged ownership check.
         if await _owned_or_404(store, device_id, user) is None:
             return JSONResponse({"error": "not found"}, status_code=404)
+        device = await store.get(device_id)
+    if device and device.get("platform") == "android" and body.push_token:
+        parsed = urlparse(body.push_token)
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            return JSONResponse(
+                {"error": "push_token must be a URL for android devices"},
+                status_code=422,
+            )
+        try:
+            validate_url_or_raise(body.push_token, allow_private=True)
+        except SsrfBlockedError:
+            return JSONResponse(
+                {"error": "push_token URL is not allowed"},
+                status_code=400,
+            )
     updated = await store.update_push_token(device_id, body.push_token)
     updated.pop("scoped_token", None)
     return updated
@@ -106,3 +184,27 @@ async def revoke_device(
         return JSONResponse({"error": "not found"}, status_code=404)
     await store.revoke(device_id)
     return {"revoked": True}
+
+
+@router.post("/api/devices/{device_id}/block")
+async def block_device(
+    device_id: str, request: Request, user: CurrentUser = Depends(current_user)
+):
+    store = request.app.state.device_store
+    device = await _owned_any_state(store, device_id, user)
+    if device is None:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    changed = await store.block(device_id)
+    return {"blocked": True, "changed": changed}
+
+
+@router.post("/api/devices/{device_id}/unblock")
+async def unblock_device(
+    device_id: str, request: Request, user: CurrentUser = Depends(current_user)
+):
+    store = request.app.state.device_store
+    device = await _owned_any_state(store, device_id, user)
+    if device is None:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    changed = await store.unblock(device_id)
+    return {"unblocked": True, "changed": changed}

@@ -17,6 +17,11 @@ import {
   UserCircle,
   ScrollText,
   Save,
+  Bell,
+  Lock,
+  Presentation,
+  Wifi,
+  Bluetooth,
 } from "lucide-react";
 import {
   Button,
@@ -27,6 +32,7 @@ import {
 import { useShortcuts } from "@/hooks/use-shortcut-registry";
 import { useIsMobile } from "@/hooks/use-is-mobile";
 import { useThemeStore } from "@/stores/theme-store";
+import { WALLPAPER_FIT_OPTIONS } from "@/stores/theme-store";
 import { useDockStore } from "@/stores/dock-store";
 import { ThemesPanel } from "@/apps/SettingsApp/ThemesPanel";
 import { safeFetch, ProgressBar, RestartProgressModal } from "@/apps/SettingsApp/_shared";
@@ -35,12 +41,18 @@ import { UpdatesSection } from "@/apps/SettingsApp/UpdatesPanel";
 import { UsersSection } from "@/apps/SettingsApp/UsersPanel";
 import { AccountSection } from "@/apps/SettingsApp/AccountPanel";
 import { LogsSection } from "@/apps/SettingsApp/LogsPanel";
+import { NotificationsPanel } from "@/apps/SettingsApp/NotificationsPanel";
+import { LockScreenPanel } from "@/apps/SettingsApp/LockScreenPanel";
+import { DemoModePanel } from "@/apps/SettingsApp/DemoModePanel";
+import { WifiPanel } from "@/apps/SettingsApp/WifiPanel";
+import { BluetoothPanel } from "@/apps/SettingsApp/BluetoothPanel";
+import { copyText } from "@/lib/clipboard";
 
 /* ------------------------------------------------------------------ */
 /*  Types                                                              */
 /* ------------------------------------------------------------------ */
 
-type Section = "account" | "system" | "storage" | "memory" | "backup" | "updates" | "advanced" | "shortcuts" | "accessibility" | "desktop" | "users" | "themes" | "logs";
+type Section = "account" | "system" | "storage" | "memory" | "backup" | "updates" | "advanced" | "shortcuts" | "accessibility" | "desktop" | "users" | "themes" | "logs" | "notifications" | "lock" | "demo" | "wifi" | "bluetooth";
 
 interface SectionDef {
   id: Section;
@@ -64,6 +76,13 @@ interface StorageItem {
   maxBytes: number;
 }
 
+interface StorageApiItem {
+  label: string;
+  size: string;
+  bytes: number;
+  total_bytes?: number;
+}
+
 /* ------------------------------------------------------------------ */
 /*  Constants                                                          */
 /* ------------------------------------------------------------------ */
@@ -71,6 +90,8 @@ interface StorageItem {
 const SECTIONS: SectionDef[] = [
   { id: "account", label: "Account", icon: UserCircle },
   { id: "system", label: "System Info", icon: Info },
+  { id: "wifi", label: "Wi-Fi", icon: Wifi },
+  { id: "bluetooth", label: "Bluetooth", icon: Bluetooth },
   { id: "storage", label: "Storage", icon: HardDrive },
   { id: "memory", label: "Memory", icon: Brain },
   { id: "backup", label: "Backup & Restore", icon: Download },
@@ -82,11 +103,14 @@ const SECTIONS: SectionDef[] = [
   { id: "users", label: "Users", icon: Users },
   { id: "themes", label: "Themes", icon: Palette },
   { id: "logs", label: "Logs", icon: ScrollText },
+  { id: "notifications", label: "Notifications", icon: Bell },
+  { id: "lock", label: "Lock screen", icon: Lock },
+  { id: "demo", label: "Demo mode", icon: Presentation },
 ];
 
 // Sections that require admin privileges to view (GHSA-47g9: backend already
 // 403s these for non-admins, this hides them from the sidebar/content too).
-const ADMIN_ONLY = new Set(["system", "storage", "memory", "backup", "updates", "advanced", "users", "logs"]);
+const ADMIN_ONLY = new Set(["system", "storage", "memory", "backup", "updates", "advanced", "users", "logs", "demo", "wifi", "bluetooth"]);
 
 const PLACEHOLDER_SYSTEM: SystemInfo = {
   cpu: "Detecting...",
@@ -111,6 +135,7 @@ function SystemInfoSection() {
   const [info, setInfo] = useState<SystemInfo>(PLACEHOLDER_SYSTEM);
   const [loading, setLoading] = useState(false);
   const [showRestartModal, setShowRestartModal] = useState(false);
+  const [mdnsHostname, setMdnsHostname] = useState<string | null>(null);
 
   const detect = useCallback(async () => {
     setLoading(true);
@@ -175,7 +200,12 @@ function SystemInfoSection() {
     setLoading(false);
   }, []);
 
-  useEffect(() => { detect(); }, [detect]);
+  useEffect(() => {
+    detect();
+    safeFetch<{ mdns_hostname?: string | null } | null>("/api/version", null).then((data) => {
+      if (data?.mdns_hostname) setMdnsHostname(data.mdns_hostname);
+    });
+  }, [detect]);
 
   const rows: [string, string][] = [
     ["CPU", info.cpu],
@@ -185,6 +215,16 @@ function SystemInfoSection() {
     ["Disk", info.disk],
     ["OS", info.os],
   ];
+
+  const port = window.location.port || "6969";
+  const localAddressUrl = mdnsHostname ? `http://${mdnsHostname}:${port}` : null;
+  const [copyFailed, setCopyFailed] = useState(false);
+
+  const copyLocalAddress = async () => {
+    if (!localAddressUrl) return;
+    const ok = await copyText(localAddressUrl);
+    setCopyFailed(!ok);
+  };
 
   return (
     <section aria-label="System information">
@@ -198,6 +238,33 @@ function SystemInfoSection() {
                 <td className="px-5 py-3">{value}</td>
               </tr>
             ))}
+            {mdnsHostname && localAddressUrl && (
+              <tr className="border-b border-white/5 last:border-0">
+                <td className="px-5 py-3 text-shell-text-secondary font-medium w-32">Local address</td>
+                <td className="px-5 py-3 flex items-center gap-2">
+                  <a href={localAddressUrl} target="_blank" rel="noopener noreferrer" className="text-sky-400 hover:underline">
+                    {localAddressUrl}
+                  </a>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={copyLocalAddress}
+                    aria-label="Copy local address"
+                    className="h-6 px-2 py-0"
+                  >
+                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                      <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
+                      <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
+                    </svg>
+                  </Button>
+                  {copyFailed && (
+                    <span role="status" className="text-xs text-red-400 ml-2">
+                      Copy failed, select the address to copy it
+                    </span>
+                  )}
+                </td>
+              </tr>
+            )}
           </tbody>
         </table>
       </div>
@@ -242,33 +309,62 @@ function SystemInfoSection() {
 
 function StorageSection() {
   const [items, setItems] = useState<StorageItem[]>(PLACEHOLDER_STORAGE);
+  const [unavailable, setUnavailable] = useState(false);
 
   useEffect(() => {
-    safeFetch<StorageItem[] | null>("/api/settings/storage", null).then((data) => {
-      if (data && Array.isArray(data)) setItems(data);
-      else
-        setItems([
-          { label: "Models", size: "4.2 GB", bytes: 4200, maxBytes: 32000 },
-          { label: "Data", size: "1.8 GB", bytes: 1800, maxBytes: 32000 },
-          { label: "App Catalog", size: "320 MB", bytes: 320, maxBytes: 32000 },
-        ]);
+    let active = true;
+    safeFetch<{ storage?: StorageApiItem[] } | null>("/api/settings/storage", null).then((data) => {
+      if (!active) return;
+      const storage = data?.storage;
+      if (Array.isArray(storage)) {
+        setItems(
+          storage.map((s) => ({
+            label: s.label,
+            size: s.size,
+            bytes: s.bytes,
+            // The bar shows the share of the disk holding that folder.
+            maxBytes: s.total_bytes ?? 0,
+          })),
+        );
+        setUnavailable(false);
+      } else {
+        setUnavailable(true);
+      }
     });
+    return () => {
+      active = false;
+    };
   }, []);
 
   return (
     <section aria-label="Storage usage">
       <h2 className="text-lg font-semibold mb-5">Storage Usage</h2>
-      <div className="space-y-3">
-        {items.map((item) => (
-          <Card key={item.label} className="p-4">
-            <div className="flex items-center justify-between mb-2">
-              <span className="text-sm font-medium">{item.label}</span>
-              <span className="text-sm text-shell-text-secondary tabular-nums">{item.size}</span>
-            </div>
-            <ProgressBar value={item.bytes} max={item.maxBytes} />
-          </Card>
-        ))}
-      </div>
+      {unavailable ? (
+        <p role="status" className="text-sm text-shell-text-tertiary">
+          Storage usage is unavailable right now.
+        </p>
+      ) : (
+        <div className="space-y-3">
+          {items.map((item) => (
+            <Card key={item.label} className="p-4">
+              <div className="flex items-center justify-between mb-2">
+                <span className="text-sm font-medium">{item.label}</span>
+                <span className="text-sm text-shell-text-secondary tabular-nums">{item.size}</span>
+              </div>
+              {item.maxBytes > 0 ? (
+                <ProgressBar
+                  value={item.bytes}
+                  max={item.maxBytes}
+                  label={`${item.label} disk usage`}
+                  valueText={item.size}
+                />
+              ) : (
+                <p className="text-xs text-shell-text-tertiary">Disk capacity unavailable</p>
+              )}
+            </Card>
+          ))}
+        </div>
+      )}
     </section>
   );
 }
@@ -762,6 +858,8 @@ export function DesktopDockSection() {
   const wallpaperLightImage = useThemeStore((s) => s.wallpaperLightImage);
   const wallpaperLightFallback = useThemeStore((s) => s.wallpaperLightFallback);
   const scheme = useThemeStore((s) => s.scheme);
+  const wallpaperFit = useThemeStore((s) => s.wallpaperFit);
+  const setWallpaperFit = useThemeStore((s) => s.setWallpaperFit);
   const getWallpapers = useThemeStore((s) => s.getWallpapers);
   const [showPicker, setShowPicker] = useState(false);
 
@@ -806,6 +904,26 @@ export function DesktopDockSection() {
             >
               Change…
             </Button>
+          </div>
+        </Card>
+
+        <Card className="p-4">
+          <p className="text-sm font-medium mb-3">Wallpaper fit</p>
+          <p className="text-xs text-shell-text-tertiary mb-3">
+            How the wallpaper fills the screen. Fit and center use the wallpaper fallback colour for the letterbox bars.
+          </p>
+          <div className="flex flex-wrap gap-2" role="group" aria-label="Wallpaper fit">
+            {WALLPAPER_FIT_OPTIONS.map((fit) => (
+              <Button
+                key={fit}
+                variant={wallpaperFit === fit ? "secondary" : "outline"}
+                size="sm"
+                onClick={() => setWallpaperFit(fit)}
+                aria-pressed={wallpaperFit === fit}
+              >
+                {fit.charAt(0).toUpperCase() + fit.slice(1)}
+              </Button>
+            ))}
           </div>
         </Card>
 
@@ -913,6 +1031,11 @@ export function SettingsApp({ windowId: _windowId, section: initialSection }: { 
     users: <UsersSection />,
     themes: <ThemesPanel />,
     logs: <LogsSection />,
+    notifications: <NotificationsPanel />,
+    lock: <LockScreenPanel />,
+    demo: <DemoModePanel />,
+    wifi: <WifiPanel />,
+    bluetooth: <BluetoothPanel />,
   };
 
   const handleSelectSection = (id: Section) => {

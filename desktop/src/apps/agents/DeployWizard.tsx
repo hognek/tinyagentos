@@ -55,8 +55,8 @@ export interface MemoryWizardStepProps {
   setMemoryDeviceId: (v: string | null) => void;
   memoryTierId: string | null;
   setMemoryTierId: (v: string | null) => void;
-  memoryDefault: { device_id: string; tier_id: string; tier_name: string } | null | "none";
-  setMemoryDefault: (v: { device_id: string; tier_id: string; tier_name: string } | null | "none") => void;
+  memoryDefault: { device_id: string; tier_id: string; tier_name: string; models_skipped?: boolean } | null | "none";
+  setMemoryDefault: (v: { device_id: string; tier_id: string; tier_name: string; models_skipped?: boolean } | null | "none") => void;
   memoryInstallTargets: Array<{ name: string; friendly_name: string; tier_id: string }>;
   setMemoryInstallTargets: (v: Array<{ name: string; friendly_name: string; tier_id: string }>) => void;
   memoryDevicesLoaded: boolean;
@@ -71,6 +71,8 @@ export interface MemoryWizardStepProps {
   setMemorySetupError: (v: string | null) => void;
   memoryPickerMode: "default" | "picker";
   setMemoryPickerMode: (v: "default" | "picker") => void;
+  memorySkipModels: boolean;
+  setMemorySkipModels: (v: boolean) => void;
 }
 
 export function MemoryWizardStep({
@@ -96,6 +98,8 @@ export function MemoryWizardStep({
   setMemorySetupError,
   memoryPickerMode,
   setMemoryPickerMode,
+  memorySkipModels,
+  setMemorySkipModels,
 }: MemoryWizardStepProps) {
   // Fetch default + install targets once on mount
   useEffect(() => {
@@ -104,7 +108,7 @@ export function MemoryWizardStep({
       .then(r => r.ok ? r.json() : null)
       .then(data => {
         if (data?.device_id) {
-          setMemoryDefault(data as { device_id: string; tier_id: string; tier_name: string });
+          setMemoryDefault(data as { device_id: string; tier_id: string; tier_name: string; models_skipped?: boolean });
         } else {
           setMemoryDefault("none");
           setMemoryPickerMode("picker");
@@ -150,7 +154,7 @@ export function MemoryWizardStep({
       const r = await fetch("/api/taosmd/setup", {
         method: "POST",
         headers: { "Content-Type": "application/json", Accept: "application/json" },
-        body: JSON.stringify({ device_id: memoryDeviceId, tier: memoryTierId }),
+        body: JSON.stringify({ device_id: memoryDeviceId, tier: memoryTierId, skip_models: memorySkipModels }),
       });
       if (!r.ok) {
         const err = await r.json().catch(() => ({}));
@@ -177,6 +181,37 @@ export function MemoryWizardStep({
   // "Has default" mode
   if (memoryPlugin !== null && memoryPickerMode === "default" && memoryDefault !== null && memoryDefault !== "none") {
     const def = memoryDefault;
+    if (def.models_skipped) {
+      return (
+        <div className="space-y-3">
+          <span className="block text-xs text-shell-text-secondary mb-2">Memory Layer</span>
+          <div className="px-4 py-3 rounded-lg border border-yellow-500/30 bg-yellow-500/5 flex items-start justify-between gap-2">
+            <div>
+              <div className="text-sm font-medium">Models deferred</div>
+              <div className="text-xs text-shell-text-secondary mt-0.5">
+                {def.tier_name} on {def.device_id} — download now to enable memory search
+              </div>
+            </div>
+            <div className="flex flex-col items-end gap-1 shrink-0">
+              <button
+                type="button"
+                onClick={() => setMemoryPickerMode("picker")}
+                className="text-xs text-accent hover:underline"
+              >
+                Download now
+              </button>
+              <button
+                type="button"
+                onClick={() => setMemoryPlugin(null)}
+                className="text-xs text-shell-text-tertiary hover:text-shell-text"
+              >
+                Skip memory for this agent
+              </button>
+            </div>
+          </div>
+        </div>
+      );
+    }
     return (
       <div className="space-y-3">
         <span className="block text-xs text-shell-text-secondary mb-2">Memory Layer</span>
@@ -310,14 +345,25 @@ export function MemoryWizardStep({
       {memoryDeviceId && memoryTierId && (
         <div className="space-y-2">
           {!memorySetupTaskId && (
-            <Button
-              size="sm"
-              className="w-full"
-              onClick={handleSetup}
-              disabled={isRunning}
-            >
-              Set up memory layer
-            </Button>
+            <>
+              <Button
+                size="sm"
+                className="w-full"
+                onClick={handleSetup}
+                disabled={isRunning}
+              >
+                Set up memory layer
+              </Button>
+              <label className="flex items-center gap-2 text-xs text-shell-text-secondary cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={memorySkipModels}
+                  onChange={e => setMemorySkipModels(e.target.checked)}
+                  className="rounded border-white/20 bg-shell-bg-deep"
+                />
+                Skip model downloads (defer to first memory use)
+              </label>
+            </>
           )}
           {memorySetupTaskId && (
             <div className={`px-3 py-2 rounded-lg text-xs ${
@@ -373,6 +419,7 @@ export function DeployWizard({
   const [frameworks, setFrameworks] = useState<Framework[]>([]);
   const [selectedFramework, setSelectedFramework] = useState<string>("");
   const [experimentalAcknowledged, setExperimentalAcknowledged] = useState(false);
+  const [recommendedFramework, setRecommendedFramework] = useState<string>("");
 
   // Dev mode — loaded from localStorage on mount, bypasses experimental click-through
   const [devMode, setDevMode] = useState(() => {
@@ -403,10 +450,11 @@ export function DeployWizard({
   // Step 4 — Memory layer
   // null = no choice yet (show picker); "taosmd" = enabled; null plugin = skipped
   const [memoryPlugin, setMemoryPlugin] = useState<"taosmd" | null>("taosmd");
+  const [memoryMode, setMemoryMode] = useState<"both" | "framework" | "taosmd">("both");
   const [memoryDeviceId, setMemoryDeviceId] = useState<string | null>(null);
   const [memoryTierId, setMemoryTierId] = useState<string | null>(null);
   // null = loading; "none" = no default; object = has default
-  const [memoryDefault, setMemoryDefault] = useState<{ device_id: string; tier_id: string; tier_name: string } | null | "none">(null);
+  const [memoryDefault, setMemoryDefault] = useState<{ device_id: string; tier_id: string; tier_name: string; models_skipped?: boolean } | null | "none">(null);
   const [memoryInstallTargets, setMemoryInstallTargets] = useState<Array<{ name: string; friendly_name: string; tier_id: string }>>([]);
   const [memoryDevicesLoaded, setMemoryDevicesLoaded] = useState(false);
   const [memorySetupTaskId, setMemorySetupTaskId] = useState<string | null>(null);
@@ -414,6 +462,24 @@ export function DeployWizard({
   const [memorySetupMsg, setMemorySetupMsg] = useState<string>("");
   const [memorySetupError, setMemorySetupError] = useState<string | null>(null);
   const [memoryPickerMode, setMemoryPickerMode] = useState<"default" | "picker">("default");
+  const [memorySkipModels, setMemorySkipModels] = useState(false);
+
+  // When the taOSmd memory layer is skipped, the only coherent mode is
+  // "framework". "both" and "taosmd" modes require the taOSmd plugin, so snap
+  // the mode whenever the plugin is null. This makes the pair unrepresentable
+  // instead of surfacing a 400 at deploy time.
+  useEffect(() => {
+    if (memoryPlugin === null) {
+      setMemoryMode("framework");
+    }
+  }, [memoryPlugin]);
+
+  // When memory_mode is "framework", the taOSmd plugin must be disabled.
+  useEffect(() => {
+    if (memoryMode === "framework" && memoryPlugin !== null) {
+      setMemoryPlugin(null);
+    }
+  }, [memoryMode]);
 
   // Step 5 — Permissions
   const [canReadUserMemory, setCanReadUserMemory] = useState(false);
@@ -449,12 +515,26 @@ export function DeployWizard({
     if (!open) return;
     (async () => {
       try {
-        const res = await fetch("/api/frameworks", {
-          headers: { Accept: "application/json" },
-        });
-        const ct = res.headers.get("content-type") ?? "";
-        if (res.ok && ct.includes("application/json")) {
-          const data = await res.json();
+        const [hwRes, fwRes] = await Promise.all([
+          fetch("/api/hardware", {
+            headers: { Accept: "application/json" },
+          }),
+          fetch("/api/frameworks", {
+            headers: { Accept: "application/json" },
+          }),
+        ]);
+        let recommendedFramework = "";
+        try {
+          const hwCt = hwRes.headers.get("content-type") ?? "";
+          if (hwRes.ok && hwCt.includes("application/json")) {
+            const hwData = await hwRes.json();
+            recommendedFramework = String(hwData.recommended_framework ?? "");
+            setRecommendedFramework(recommendedFramework);
+          }
+        } catch { /* ignore hardware fetch failure */ }
+        const ct = fwRes.headers.get("content-type") ?? "";
+        if (fwRes.ok && ct.includes("application/json")) {
+          const data = await fwRes.json();
           if (Array.isArray(data) && data.length > 0) {
             // Filter out broken adapters entirely
             const visible = data.filter(
@@ -476,15 +556,27 @@ export function DeployWizard({
             const rank = (id: string) => (id === "hermes" ? 0 : id === "openclaw" ? 1 : 2);
             mapped.sort((a, b) => rank(a.id) - rank(b.id));
             setFrameworks(mapped);
-            // Default-select Hermes (or the first tested/beta framework) so the
-            // wizard opens on a working choice instead of nothing selected.
+            // Default-select the hardware-recommended framework (if present),
+            // otherwise fall back to Hermes / first tested-beta / first non-experimental.
+            const recommended = recommendedFramework
+              ? mapped.find((f) => f.id === recommendedFramework)
+              : undefined;
             setSelectedFramework((cur) => {
               if (cur) return cur;
-              const preferred = mapped.find((f) => f.id === "hermes")
+              const preferred = recommended
+                ?? mapped.find((f) => f.id === "hermes")
                 ?? mapped.find((f) => f.verification_status === "tested" || f.verification_status === "beta")
                 ?? (mapped[0]?.verification_status !== "experimental" ? mapped[0] : undefined);
               return preferred?.id ?? "";
             });
+            // If the hardware-recommended framework is experimental, auto-acknowledge
+            // so the picker can preselect it without blocking the user.
+            if (recommendedFramework) {
+              const rec = mapped.find((f) => f.id === recommendedFramework);
+              if (rec?.verification_status === "experimental") {
+                setExperimentalAcknowledged(true);
+              }
+            }
           }
         }
       } catch { /* leave frameworks empty, wizard will show nothing selectable */ }
@@ -780,6 +872,7 @@ export function DeployWizard({
       setEmoji("");
       setSelectedFramework("");
       setExperimentalAcknowledged(false);
+      setRecommendedFramework("");
       setSelectedModel("");
       setModels([]);
       setModelsLoaded(false);
@@ -788,6 +881,7 @@ export function DeployWizard({
       setMemory("");
       setCpus("");
       setMemoryPlugin("taosmd");
+      setMemoryMode("both");
       setMemoryDeviceId(null);
       setMemoryTierId(null);
       setMemoryDefault(null);
@@ -879,6 +973,7 @@ export function DeployWizard({
           memory_config: (memoryPlugin && memoryDeviceId && memoryTierId)
             ? { device_id: memoryDeviceId, tier_id: memoryTierId }
             : undefined,
+          memory_mode: memoryMode,
         }),
       });
       if (!res.ok) {
@@ -1000,6 +1095,13 @@ export function DeployWizard({
                     <>
                       <div className="text-xs opacity-60 mt-1">
                         Slug: <code>{slug || "—"}</code>{" "}
+                        {!slug && (
+                          <span>
+                            (this name has no Latin letters -- click "edit" to
+                            set a slug yourself, or the agent name will be
+                            rejected){" "}
+                          </span>
+                        )}
                         <button
                           type="button"
                           onClick={() => {
@@ -1138,12 +1240,17 @@ export function DeployWizard({
                                 Experimental
                               </span>
                             )}
-                            {isTested && (
-                              <span className="px-1.5 py-0.5 rounded text-[10px] font-medium bg-emerald-500/20 text-emerald-400 leading-none">
-                                Tested
-                              </span>
-                            )}
-                            {isSelected && (
+                             {isTested && (
+                               <span className="px-1.5 py-0.5 rounded text-[10px] font-medium bg-emerald-500/20 text-emerald-400 leading-none">
+                                 Tested
+                               </span>
+                             )}
+                             {recommendedFramework === fw.id && (
+                               <span className="px-1.5 py-0.5 rounded text-[10px] font-medium bg-emerald-500/20 text-emerald-400 leading-none">
+                                 Recommended for this device
+                               </span>
+                             )}
+                             {isSelected && (
                               <Check
                                 size={14}
                                 className="ml-auto shrink-0 text-accent"
@@ -1302,30 +1409,77 @@ export function DeployWizard({
 
           {/* Step 4: Memory layer */}
           {step === 4 && (
-            <MemoryWizardStep
-              memoryPlugin={memoryPlugin}
-              setMemoryPlugin={setMemoryPlugin}
-              memoryDeviceId={memoryDeviceId}
-              setMemoryDeviceId={setMemoryDeviceId}
-              memoryTierId={memoryTierId}
-              setMemoryTierId={setMemoryTierId}
-              memoryDefault={memoryDefault}
-              setMemoryDefault={setMemoryDefault}
-              memoryInstallTargets={memoryInstallTargets}
-              setMemoryInstallTargets={setMemoryInstallTargets}
-              memoryDevicesLoaded={memoryDevicesLoaded}
-              setMemoryDevicesLoaded={setMemoryDevicesLoaded}
-              memorySetupTaskId={memorySetupTaskId}
-              setMemorySetupTaskId={setMemorySetupTaskId}
-              memorySetupState={memorySetupState}
-              setMemorySetupState={setMemorySetupState}
-              memorySetupMsg={memorySetupMsg}
-              setMemorySetupMsg={setMemorySetupMsg}
-              memorySetupError={memorySetupError}
-              setMemorySetupError={setMemorySetupError}
-              memoryPickerMode={memoryPickerMode}
-              setMemoryPickerMode={setMemoryPickerMode}
-            />
+            <div className="space-y-4">
+              <span className="block text-xs text-shell-text-secondary mb-2">Memory Mode</span>
+              <div className="grid grid-cols-3 gap-2">
+                {([
+                  ["both", "Both", "Framework memory + taOSmd"],
+                  ["framework", "Framework only", "Native memory, no taOSmd"],
+                  ["taosmd", "taOSmd only", "Durable shared memory"],
+                ] as const).map(([value, label, desc]) => {
+                  const needsTaosmd = value === "both" || value === "taosmd";
+                  const disabled = needsTaosmd && memoryPlugin === null;
+                  const selected = (memoryPlugin === null ? "framework" : memoryMode) === value;
+                  return (
+                    <button
+                      key={value}
+                      type="button"
+                      onClick={() => setMemoryMode(value)}
+                      disabled={disabled}
+                      title={disabled ? "needs the taOSmd memory layer" : undefined}
+                      className={`p-2.5 rounded-lg border text-left transition-colors ${
+                        disabled
+                          ? "border-white/5 bg-shell-bg-deep opacity-50 cursor-not-allowed"
+                          : selected
+                            ? "border-accent bg-accent/10"
+                            : "border-white/10 bg-shell-bg-deep hover:bg-white/5"
+                      }`}
+                    >
+                      <div className="text-xs font-semibold">{label}</div>
+                      <p className="text-[10px] text-shell-text-tertiary leading-tight mt-0.5">{desc}</p>
+                    </button>
+                  );
+                })}
+              </div>
+
+              <div className="text-xs text-shell-text-tertiary">
+                {memoryMode === "both" && "Framework memory holds live working state. taOSmd holds durable facts shared across agents. The agent writes each fact to the right store."}
+                {memoryMode === "framework" && "All memory stays in the framework's native store. Fast and local, dies with the container. No taOSmd calls."}
+                {memoryMode === "taosmd" && "All memory goes to taOSmd. Durable and searchable across the fleet. Use this when the framework has no native memory."}
+              </div>
+
+              {memoryMode !== "framework" && (
+                <div className="border-t border-white/5 pt-3">
+                  <span className="block text-xs text-shell-text-secondary mb-2">Memory Layer</span>
+                  <MemoryWizardStep
+                    memoryPlugin={memoryPlugin}
+                    setMemoryPlugin={setMemoryPlugin}
+                    memoryDeviceId={memoryDeviceId}
+                    setMemoryDeviceId={setMemoryDeviceId}
+                    memoryTierId={memoryTierId}
+                    setMemoryTierId={setMemoryTierId}
+                    memoryDefault={memoryDefault}
+                    setMemoryDefault={setMemoryDefault}
+                    memoryInstallTargets={memoryInstallTargets}
+                    setMemoryInstallTargets={setMemoryInstallTargets}
+                    memoryDevicesLoaded={memoryDevicesLoaded}
+                    setMemoryDevicesLoaded={setMemoryDevicesLoaded}
+                    memorySetupTaskId={memorySetupTaskId}
+                    setMemorySetupTaskId={setMemorySetupTaskId}
+                    memorySetupState={memorySetupState}
+                    setMemorySetupState={setMemorySetupState}
+                    memorySetupMsg={memorySetupMsg}
+                    setMemorySetupMsg={setMemorySetupMsg}
+                    memorySetupError={memorySetupError}
+                    setMemorySetupError={setMemorySetupError}
+                    memoryPickerMode={memoryPickerMode}
+                    setMemoryPickerMode={setMemoryPickerMode}
+                    memorySkipModels={memorySkipModels}
+                    setMemorySkipModels={setMemorySkipModels}
+                  />
+                </div>
+              )}
+            </div>
           )}
 
           {/* Step 5: Permissions */}
@@ -1521,6 +1675,7 @@ export function DeployWizard({
                   ["Framework", frameworks.find((f) => f.id === selectedFramework)?.name ?? selectedFramework],
                   ["Model", models.find((m) => m.id === selectedModel)?.name ?? selectedModel],
                   ["Memory layer", memoryPlugin === null ? "Skipped" : memoryTierId ? `taOSmd · ${memoryTierId} on ${memoryDeviceId}` : "taOSmd (global default)"],
+                  ["Memory mode", memoryMode],
                   ["RAM limit", memory ? (parseInt(memory, 10) >= 1024 ? `${Math.round(parseInt(memory, 10) / 1024)} GB` : `${memory} MB`) : "Unlimited"],
                   ["CPUs", cpus ? `${cpus} Core${cpus !== "1" ? "s" : ""}` : "Unlimited"],
                   ["User Memory", canReadUserMemory ? "Allowed (read-only)" : "Denied"],

@@ -9,16 +9,17 @@ import { SearchPalette } from "@/components/SearchPalette";
 import { ShortcutProvider, useShortcut } from "@/hooks/use-shortcut-registry";
 import { useSessionPersistence } from "@/hooks/use-session-persistence";
 import { useDeviceMode } from "@/hooks/use-device-mode";
+import { useMobileControl } from "@/hooks/use-desktop-control";
 import { useIsPwa } from "@/hooks/use-is-pwa";
 import { useThemeStore, restoreActiveTheme, installWebkitRepaintGuards } from "@/stores/theme-store";
 import { useOnAuthReady } from "@/hooks/use-on-auth-ready";
 import { usePushClickHandler } from "@/hooks/use-push-click";
 import { useProcessStore } from "@/stores/process-store";
 import { useDockStore } from "@/stores/dock-store";
-import { getApp } from "@/registry/app-registry";
-import { MobileDock } from "@/components/mobile/MobileDock";
+import { getApp, pinnedAppId, pinnedLaunchProps } from "@/registry/app-registry";
+import { MobileDock, useMobileDockMetrics } from "@/components/mobile/MobileDock";
 import { CardSwitcher } from "@/components/mobile/CardSwitcher";
-import { MobileTopBar } from "@/components/mobile/MobileTopBar";
+import { MobileTopBar, MOBILE_TOP_BAR_HEIGHT } from "@/components/mobile/MobileTopBar";
 import { MobileAppWindow } from "@/components/mobile/MobileAppWindow";
 import { MobileHomePages } from "@/components/mobile/MobileHomePages";
 import { LoginGate } from "@/components/LoginGate";
@@ -35,6 +36,11 @@ import { InstallPromptBanner } from "@/shell/InstallPromptBanner";
 import { EffectsLayer } from "@/theme/effects/EffectsLayer";
 import { SafetyFloor } from "@/components/SafetyFloor";
 import { withCsrf, getCsrfToken } from "@/lib/csrf";
+import { useLockOnScreenOff } from "@/shell/useLockOnScreenOff";
+import { useHomeKey } from "@/hooks/use-home-key";
+import { useSwitcherKey } from "@/hooks/use-switcher-key";
+import { installShellLinks } from "@/lib/shell-links";
+import { primeDeviceClass } from "@/lib/mobile-shell";
 
 interface SystemShortcutsProps {
   toggleSearch: () => void;
@@ -96,10 +102,13 @@ function SystemShortcuts({ toggleSearch, toggleLaunchpad, toggleAssistant }: Sys
 
   // Ctrl+1 through Ctrl+9 — open/focus Nth pinned dock app
   const openPinned = useCallback((n: number) => {
-    const appId = pinned[n];
-    if (!appId) return;
-    const app = getApp(appId);
-    if (app) openWindow(appId, app.defaultSize);
+    const pinId = pinned[n];
+    if (!pinId) return;
+    const targetId = pinnedAppId(pinId);
+    const app = getApp(targetId);
+    if (app) {
+      openWindow(targetId, app.defaultSize, pinnedLaunchProps(pinId));
+    }
   }, [pinned, openWindow]);
 
   useShortcut("Ctrl+1", useCallback(() => openPinned(0), [openPinned]), "Open pinned app 1", "system");
@@ -197,6 +206,7 @@ export function App() {
   const wallpaperOverlayText = useThemeStore((s) => s.wallpaperOverlayText);
   const showOverlayText = useThemeStore((s) => s.showOverlayText);
   const reduceEffects = useThemeStore((s) => s.reduceEffects);
+  const wallpaperFit = useThemeStore((s) => s.wallpaperFit);
   const isAnimatedWallpaper = wallpaperKind === "animated";
   const useLightWallpaper = scheme === "light" && !!wallpaperLightImage;
   const effWallpaperImage = useLightWallpaper ? wallpaperLightImage : wallpaperImage;
@@ -204,12 +214,16 @@ export function App() {
   const effWallpaperFallback = useLightWallpaper ? wallpaperLightFallback : wallpaperFallback;
   const windows = useProcessStore((s) => s.windows);
   const openWindow = useProcessStore((s) => s.openWindow);
-  const closeWindow = useProcessStore((s) => s.closeWindow);
+  const removeWindow = useProcessStore((s) => s.removeWindow);
   const minimizeWindow = useProcessStore((s) => s.minimizeWindow);
 
   // Browser-mode flag: when on mobile but not in PWA, apply browser-safe
   // layout that accounts for Safari's dynamic URL bar + share/tab bars
   const isBrowserMobile = mode !== "desktop" && !isPwa;
+  const { height: mobileDockHeight } = useMobileDockMetrics(isBrowserMobile);
+
+  // On the handset, the power key locks: see useLockOnScreenOff.
+  useLockOnScreenOff();
 
   const activeWindow = windows.find((w) => w.id === activeWindowId);
 
@@ -284,6 +298,9 @@ export function App() {
   // later re-login.
   useOnAuthReady(() => {
     void restoreActiveTheme();
+    // Learn once whether this is a taOSmobile handset, so app opens can go to
+    // the device shell as their own windows (lib/mobile-shell).
+    void primeDeviceClass();
   });
 
   // Apply reduce-effects / performance mode (#58) as a root attribute so the CSS
@@ -323,6 +340,17 @@ export function App() {
     setActiveWindowId(null);
     setCardSwitcherOpen(false);
     setSearchOpen(false);
+    setLaunchpadOpen(false);
+  }, []);
+  // The handset nav bar's home button: the open app goes to the background
+  // (it stays in the switcher), the home screen shows.
+  useHomeKey(mode !== "desktop", handleMobileHome);
+  // The nav bar's switcher button: open it (F14 while open keeps it open).
+  const handleSwitcherKey = useCallback(() => setCardSwitcherOpen(true), []);
+  useSwitcherKey(mode !== "desktop", handleSwitcherKey);
+  // On the handset, links apps open in a new window go to Firefox.
+  useEffect(() => {
+    installShellLinks();
   }, []);
 
   const handleSelectApp = useCallback((windowId: string) => {
@@ -331,27 +359,26 @@ export function App() {
   }, []);
 
   const handleMobileOpenApp = useCallback((appId: string) => {
-    // If already open, focus it
-    const existing = windows.find((w) => w.appId === appId);
-    if (existing) {
-      setActiveWindowId(existing.id);
-    } else {
-      const app = getApp(appId);
-      if (app) {
-        const wid = openWindow(appId, app.defaultSize);
-        setActiveWindowId(wid);
-      }
+    // openWindow focuses an already-open window itself (returning its id), and
+    // on a taOSmobile handset hands the open to the device shell first -- so
+    // do not short-circuit an existing window here.
+    const app = getApp(appId);
+    if (app) {
+      const wid = openWindow(appId, app.defaultSize);
+      setActiveWindowId(wid || null);
     }
     setCardSwitcherOpen(false);
     setSearchOpen(false);
-  }, [windows, openWindow]);
+  }, [openWindow]);
 
   const handleMobileClose = useCallback(() => {
     if (activeWindowId) {
-      closeWindow(activeWindowId);
+      // Remove, do not just mark closing: MobileAppWindow has no close
+      // animation to finish it, so the app would stay in the switcher.
+      removeWindow(activeWindowId);
       setActiveWindowId(null);
     }
-  }, [activeWindowId, closeWindow]);
+  }, [activeWindowId, removeWindow]);
 
   const handleMobileMinimise = useCallback(() => {
     if (activeWindowId) {
@@ -359,6 +386,10 @@ export function App() {
       setActiveWindowId(null);
     }
   }, [activeWindowId, minimizeWindow]);
+
+  // Agent window control (window.taosDesktop, taos:window) for the phone
+  // layout, which never mounts <Desktop/> and so never got its receiver.
+  useMobileControl({ setActive: setActiveWindowId }, mode !== "desktop");
 
   if (mode === "desktop") {
     return (
@@ -407,16 +438,15 @@ export function App() {
     <ShortcutProvider>
       <SystemShortcuts toggleSearch={toggleSearch} toggleLaunchpad={toggleLaunchpad} toggleAssistant={toggleAssistant} />
       <LoginGate>
-    <div className={`taos-wallpaper taos-mobile-root relative h-screen w-screen flex flex-col text-shell-text${isBrowserMobile ? " taos-browser" : ""}`} style={{ backgroundColor: effWallpaperFallback, ["--wallpaper-desktop" as never]: isAnimatedWallpaper ? "none" : effWallpaperImage, ["--wallpaper-mobile" as never]: isAnimatedWallpaper ? "none" : effWallpaperMobile }}>
-      {isAnimatedWallpaper && wallpaperComponent === "particles" && <ParticlesWallpaper />}
+    <div className={`taos-wallpaper taos-mobile-root relative h-screen w-screen flex flex-col text-shell-text${isBrowserMobile ? " taos-browser" : ""}`} data-wallpaper-fit={wallpaperFit || undefined} style={{ backgroundColor: effWallpaperFallback, ["--wallpaper-desktop" as never]: isAnimatedWallpaper ? "none" : effWallpaperImage, ["--wallpaper-mobile" as never]: isAnimatedWallpaper ? "none" : effWallpaperMobile }}>
+      {isAnimatedWallpaper && !reduceEffects && wallpaperComponent === "particles" && <ParticlesWallpaper />}
       {showOverlayText && wallpaperOverlayText && <WallpaperTextOverlay text={wallpaperOverlayText} />}
       <EffectsLayer />
       {/* Install banner — shown in browser mode, hidden in PWA */}
       {isBrowserMobile && <InstallPromptBanner />}
       <div className={`relative z-[1] flex-1 flex flex-col overflow-hidden transition-all duration-500 ${launched ? "opacity-100 scale-100" : "opacity-0 scale-95"}`}>
         <MobileTopBar
-          onHome={handleMobileHome}
-          onSearch={() => { setCardSwitcherOpen(false); setSearchOpen((v) => !v); }}
+          onSearch={() => { setCardSwitcherOpen(false); setLaunchpadOpen(false); setSearchOpen((v) => !v); }}
         />
         {/* Main content area */}
         <div className="flex-1 relative overflow-hidden">
@@ -454,9 +484,14 @@ export function App() {
           setLaunchpadOpen(true);
         }}
       />
-      <Launchpad open={launchpadOpen} onClose={() => setLaunchpadOpen(false)} onOpenApp={(wid) => setActiveWindowId(wid)} />
+      <Launchpad
+        open={launchpadOpen}
+        onClose={() => setLaunchpadOpen(false)}
+        onOpenApp={(wid) => setActiveWindowId(wid)}
+        insets={{ top: MOBILE_TOP_BAR_HEIGHT, bottom: mobileDockHeight }}
+      />
       <SearchPalette open={searchOpen} onClose={() => setSearchOpen(false)} onOpenApp={(wid) => setActiveWindowId(wid)} />
-      <NotificationToasts />
+      <NotificationToasts topInset={MOBILE_TOP_BAR_HEIGHT} />
       <NotificationCentre />
       <TaosAssistantPanel />
       <SafetyFloor />

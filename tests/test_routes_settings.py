@@ -46,7 +46,11 @@ class TestUpdateAlwaysRestarts:
                 "tinyagentos.routes.system._do_restart",
                 new=_fake_restart,
             ),
-            patch("tinyagentos.restart_orchestrator.write_pending_restart"),
+            patch("tinyagentos.routes.settings.write_pending_restart"),
+            patch(
+                "tinyagentos.update_preflight.check_preflight",
+                return_value=[],  # Mock preflight check to pass
+            ),
         ):
             resp = await client.post("/api/settings/update")
 
@@ -72,6 +76,60 @@ class TestSettingsRoutes:
         assert resp.status_code == 200
         data = resp.json()
         assert "storage" in data
+        # Each folder reports the size of the disk it lives on, for the usage bar.
+        for item in data["storage"]:
+            assert item["total_bytes"] > 0
+            assert item["bytes"] <= item["total_bytes"]
+
+    @pytest.mark.asyncio
+    async def test_models_row_sizes_the_installers_models_root(self, client, tmp_path, monkeypatch):
+        root = tmp_path / "elsewhere-models"
+        root.mkdir()
+        (root / "weights.bin").write_bytes(b"x" * 50_000)
+        monkeypatch.setenv("TAOS_MODELS_ROOT", str(root))
+
+        items = {i["label"]: i for i in (await client.get("/api/settings/storage")).json()["storage"]}
+        assert items["Models"]["path"] == str(root)
+        assert items["Models"]["bytes"] >= 50_000
+
+    @pytest.mark.asyncio
+    async def test_each_row_reports_its_own_filesystem(self, client, monkeypatch):
+        import collections
+        import tinyagentos.routes.settings as settings_mod
+
+        totals = {}
+
+        def fake_disk_usage(path):
+            totals.setdefault(str(path), 10_000_000_000 + 1_000 * len(totals))
+            return collections.namedtuple("usage", "total used free")(totals[str(path)], 0, 0)
+
+        monkeypatch.setattr(settings_mod.shutil, "disk_usage", fake_disk_usage)
+        for item in (await client.get("/api/settings/storage")).json()["storage"]:
+            probe = settings_mod.Path(item["path"])
+            while not probe.exists() and probe != probe.parent:
+                probe = probe.parent
+            assert item["total_bytes"] == totals[str(probe)]
+
+    @pytest.mark.asyncio
+    async def test_data_row_does_not_count_the_models_folder_twice(self, client, monkeypatch):
+        monkeypatch.setenv(
+            "TAOS_MODELS_ROOT", str(client._transport.app.state.config_path.parent / "models")
+        )
+
+        async def rows():
+            body = (await client.get("/api/settings/storage")).json()
+            return {i["label"]: i["bytes"] for i in body["storage"]}
+
+        data_dir = client._transport.app.state.config_path.parent
+        models = data_dir / "models"
+        models.mkdir(parents=True, exist_ok=True)
+        before = await rows()
+        (models / "weights.bin").write_bytes(b"x" * 1_000_000)
+        after = await rows()
+
+        assert after["Models"] - before["Models"] >= 1_000_000
+        # Models lives inside the data dir; growing it must not grow the Data row.
+        assert after["Data"] - before["Data"] < 100_000
 
     @pytest.mark.asyncio
     async def test_save_platform_settings(self, client):
@@ -488,3 +546,129 @@ class TestMemoryUrlSettings:
             headers={"Content-Type": "application/json"},
         )
         assert resp.status_code == 422
+
+
+class TestLaunchdMigrationWarning:
+    """Migration warnings must reach the user exactly once, no substring sniffing."""
+
+    @pytest.mark.asyncio
+    async def test_migration_warning_appears_exactly_once_in_update_message(
+        self, client, monkeypatch,
+    ):
+        """A migration warning must appear exactly once in the update response message."""
+        import asyncio
+        from unittest.mock import patch, AsyncMock, MagicMock
+        import plistlib
+
+        warning_text = "plist migrated but launch settings apply after next login"
+
+        async def fake_apply_launchd_migration(install_dir):
+            return True, warning_text
+
+        fake_proc = MagicMock()
+        fake_proc.returncode = 0
+        fake_proc.communicate = AsyncMock(return_value=(b"", b""))
+
+        with (
+            patch("tinyagentos.routes.settings.asyncio.create_subprocess_exec", return_value=fake_proc),
+            patch("tinyagentos.routes.settings._stash_local_source_changes", new_callable=AsyncMock, return_value=False),
+            patch("tinyagentos.routes.settings.apply_launchd_migration", new=fake_apply_launchd_migration),
+            patch("tinyagentos.routes.settings._update_local_taosmd", new_callable=AsyncMock, return_value={}),
+            patch("tinyagentos.routes.system._do_restart"),
+            patch("tinyagentos.restart_orchestrator.write_pending_restart"),
+            patch("tinyagentos.desktop_rebuild.rebuild_desktop_bundle_if_stale", new_callable=AsyncMock, return_value=MagicMock(rebuilt=False, success=True, message="current")),
+            patch("tinyagentos.update_preflight.check_preflight", return_value=[]),
+        ):
+            resp = await client.post("/api/settings/update")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        message = data.get("message", "")
+
+        count = message.count(warning_text)
+        assert count == 1, (
+            f"Warning should appear exactly once, got {count} occurrences in: {message!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_launchd_warning_spacing_before_restarting(self, client, monkeypatch):
+        """A non-None launchd_warning must be followed by a single space, then
+        'Restarting now…' — no double space, no missing space."""
+        import asyncio
+        from unittest.mock import patch, AsyncMock, MagicMock
+
+        warning_text = "launchd warning text"
+
+        async def fake_apply_launchd_migration(install_dir):
+            return True, warning_text
+
+        fake_proc = MagicMock()
+        fake_proc.returncode = 0
+        fake_proc.communicate = AsyncMock(return_value=(b"", b""))
+
+        with (
+            patch("tinyagentos.routes.settings.asyncio.create_subprocess_exec", return_value=fake_proc),
+            patch("tinyagentos.routes.settings._stash_local_source_changes", new_callable=AsyncMock, return_value=False),
+            patch("tinyagentos.routes.settings.apply_launchd_migration", new=fake_apply_launchd_migration),
+            patch("tinyagentos.routes.settings._update_local_taosmd", new_callable=AsyncMock, return_value={}),
+            patch("tinyagentos.routes.system._do_restart"),
+            patch("tinyagentos.restart_orchestrator.write_pending_restart"),
+            patch("tinyagentos.desktop_rebuild.rebuild_desktop_bundle_if_stale", new_callable=AsyncMock, return_value=MagicMock(rebuilt=False, success=True, message="current")),
+            patch("tinyagentos.update_preflight.check_preflight", return_value=[]),
+        ):
+            resp = await client.post("/api/settings/update")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        message = data.get("message", "")
+
+        expected_suffix = f"{warning_text} Restarting now…"
+        assert message.endswith(expected_suffix), (
+            f"Expected message to end with {expected_suffix!r}, got {message!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_rebuild_failure_warning_in_update_message(self, client, monkeypatch):
+        """When desktop rebuild fails, the update message includes a clear warning."""
+        import asyncio
+        from unittest.mock import patch, AsyncMock, MagicMock
+
+        # The rebuild fails with this message
+        rebuild_message = "EACCES writing static/desktop/sw.js"
+
+        async def fake_rebuild(project_dir, force=True):
+            return MagicMock(rebuilt=False, success=False, message=rebuild_message)
+
+        fake_proc = MagicMock()
+        fake_proc.returncode = 0
+        fake_proc.communicate = AsyncMock(return_value=(b"", b""))
+
+        async def fake_install_dependencies(project_dir):
+            return 0, "ok"
+
+        async def fake_smoke_test(*args, **kwargs):
+            return 0, "Import smoke OK"
+
+        with (
+            patch("tinyagentos.routes.settings.asyncio.create_subprocess_exec", return_value=fake_proc),
+            patch("tinyagentos.routes.settings._stash_local_source_changes", new_callable=AsyncMock, return_value=False),
+            patch("tinyagentos.routes.settings._install_dependencies", new=fake_install_dependencies),
+            patch("tinyagentos.routes.settings._run_capture", new=fake_smoke_test),
+            patch("tinyagentos.routes.settings.apply_launchd_migration", new_callable=AsyncMock, return_value=(True, None)),
+            patch("tinyagentos.routes.settings._update_local_taosmd", new_callable=AsyncMock, return_value={}),
+            patch("tinyagentos.routes.system._do_restart"),
+            patch("tinyagentos.restart_orchestrator.write_pending_restart"),
+            patch("tinyagentos.desktop_rebuild.rebuild_desktop_bundle_if_stale", new=fake_rebuild),
+            patch("tinyagentos.update_preflight.check_preflight", return_value=[]),
+        ):
+            resp = await client.post("/api/settings/update")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        message = data.get("message", "")
+
+        # The warning should be part of the message
+        expected_warning = f"Frontend rebuild failed, so the old interface is still loaded: {rebuild_message}. Use Settings > Rebuild frontend after fixing it."
+        assert expected_warning in message, (
+            f"Expected warning not found in message: {message!r}"
+        )

@@ -1,14 +1,65 @@
 from __future__ import annotations
 import asyncio
 import logging
+import re
 import time
 from dataclasses import dataclass, field, asdict
 
 logger = logging.getLogger(__name__)
 
 
+# Scheduler resource-class grammar (docs/design/resource-scheduler.md).
+#
+# A worker advertises the resources it owns as `Resource.name` values, and the
+# controller trusts that list when authorising lease claims
+# (ClusterManager._worker_for_resource). The list is also stored per worker and
+# rendered in the cluster UI, so an unchecked class is an operator-controlled
+# string that reaches the scheduler. install-worker.sh exports
+# TAOS_WORKER_RESOURCES, which makes the inventory an operator knob, so the
+# controller validates the grammar before it stores anything.
+#
+# Grammar (one entry per class):
+#   cpu-inference            everything; the universal fallback
+#   gpu-cuda-<n>             NVIDIA GPU index
+#   gpu-rocm-<n>             AMD GPU index
+#   gpu-vulkan-<n>           Vulkan GPU index
+#   gpu-sycl-<n>             SYCL GPU index
+#   gpu-metal                Apple Silicon (Metal)
+#   gpu-mali                 Mali (experimental)
+#   npu-<soc>                NPU, e.g. npu-rk3588
+#   accel-<name>             accelerator boards, e.g. accel-hailo
+#
+# Anchored with \Z rather than $: $ also matches immediately before a trailing
+# newline, so "gpu-cuda-0\n" would validate and then be stored and compared
+# verbatim by the lease path.
+RESOURCE_CLASS_RE = re.compile(
+    r"^(?:"
+    r"cpu-inference"
+    r"|gpu-(?:cuda|rocm|vulkan|sycl)-\d+"
+    r"|gpu-(?:metal|mali)"
+    r"|npu-[a-z0-9][a-z0-9-]*"
+    r"|accel-[a-z0-9][a-z0-9-]*"
+    r")\Z"
+)
+
+
+def invalid_resource_classes(resources: list[str] | None) -> list[str]:
+    """Return the entries of a resource inventory that break the class grammar.
+
+    Empty/None inventories are valid: an older worker that registers without an
+    inventory falls back to the legacy grammar check at lease time.
+    """
+    if not resources:
+        return []
+    return [
+        name for name in resources
+        if not isinstance(name, str) or not RESOURCE_CLASS_RE.match(name)
+    ]
+
+
 @dataclass
 class WorkerInfo:
+    """Cluster worker record populated by register/heartbeat."""
     name: str
     url: str                          # Worker's base URL
     hardware: dict = field(default_factory=dict)  # From hardware detection
@@ -18,6 +69,13 @@ class WorkerInfo:
     models: list[str] = field(default_factory=list)     # Currently loaded models
     available_models: list[dict] = field(default_factory=list)  # Models this worker CAN load (from local manifest)
     capabilities: list[str] = field(default_factory=list)  # embed, chat, rerank, image-gen, tts, etc
+    # "worker" (a job-running cluster worker) or "device" (a taOSusb board
+    # paired over Bluetooth -- see cluster/ble/pairing.py). A device is
+    # never a placement candidate for any job type, the model mesh
+    # included: see ClusterManager.get_workers_for_capability() and
+    # browser_sessions._capable_workers(), which both filter on this field
+    # rather than trusting `capabilities` to stay empty of job capabilities.
+    kind: str = "worker"
     status: str = "online"            # online | offline | busy
     last_heartbeat: float = 0
     registered_at: float = 0
@@ -25,6 +83,8 @@ class WorkerInfo:
     platform: str = ""                # linux | windows | macos
     tier_id: str = ""                 # catalog hardware tier, e.g. "x86-cuda-12gb"
     potential_capabilities: list[str] = field(default_factory=list)  # derived from catalog + tier
+    # Scheduler resource inventory: Resource.name values the worker has registered (gpu-cuda-0, npu-rk3588, cpu-inference)
+    resources: list[str] = field(default_factory=list)
     # KV cache quantization support exposed as separate K and V type lists
     # plus a boundary-layer-protect flag. Research (NexusQuant llama.cpp#21591
     # plus Ziskind empirical) shows asymmetric K/V is the correct default:
@@ -69,6 +129,15 @@ class WorkerInfo:
     # free", so those workers are never permanently un-leasable.
     free_vram_mb: int | None = None
     used_vram_mb: int | None = None
+    # Wall-clock timestamp of the most recent heartbeat that carried a VRAM
+    # sample.  Used by claim_lease to age out only leases granted after the
+    # last actual VRAM report, so a vram-less heartbeat does not cause live
+    # leases to drop out of already_held.
+    last_vram_report_at: float = 0.0
+    # Wall-clock timestamp when the sampled VRAM was taken (worker-monotonic).
+    # Used by claim_lease to count leases granted during heartbeat transit.
+    # None = unknown (legacy workers, or receipts without age).
+    vram_sampled_at: float | None = None
 
 
 @dataclass
@@ -93,9 +162,20 @@ class GpuLease:
         required_vram_mb: How many MiB of VRAM the caller declared it
             needs.  Used by the pre-claim check to refuse a claim when
             the worker's ``free_vram_mb`` is too low.
+        granted_at: wall-clock timestamp (``time.time()``) when the lease
+            was granted.  Used to age VRAM accounting against the worker's
+            last heartbeat so already-allocated VRAM is not double-counted.
+        claim_channel: The coordination thread this lease's peer-visible
+            claim was published on (empty for a lease with no bus claim,
+            e.g. one taken by the dispatcher through the cluster API).
+            Kept so a keep-alive refreshes the SAME thread: the channel is
+            an input to the claim, never to its renewal.
     """
     lease_id: str
     resource_id: str
     caller: str = ""
     expires_at: float = 0.0
     required_vram_mb: int = 0
+    granted_at: float = 0.0
+    claim_channel: str = ""
+    epoch: str = ""

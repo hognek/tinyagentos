@@ -5,9 +5,11 @@ import json
 from pathlib import Path
 from typing import Literal
 
-from fastapi import APIRouter, HTTPException, Request, UploadFile, File
+from fastapi import APIRouter, HTTPException, Request, UploadFile, File, Form, Query
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
+
+from tinyagentos.device_auth import require_device
 
 from tinyagentos.workspace_trash import (
     TrashItemNotFound,
@@ -57,17 +59,27 @@ async def _authorize_files_actor(
     project = await ps.get_project_by_slug(slug)
     uid = getattr(request.state, "user_id", None)
     if uid:
-        # Session path: project visibility gate. A non-owner non-admin human
-        # collapses into the SAME existence-hiding 404 the agent path uses.
-        # An UNKNOWN slug is deliberately allowed through for session users:
-        # the project files tree is slug-addressed and lazily created, which
-        # test_list_unknown_slug_returns_empty documents as intended. The agent
-        # path below is strict (unknown slug -> 404) because an agent must not
-        # be able to address a project it was never granted.
         is_admin = bool(getattr(request.state, "is_admin", False))
         if project is not None and not is_admin and project.get("user_id") != uid:
             return JSONResponse({"error": "not found"}, status_code=404)
         return ("user", uid)
+    
+    device = getattr(request.state, "_device", None)
+    if device:
+        # The auth middleware stashed this device WITHOUT authorising it (it only
+        # lets the Bearer through). This route does not use the device
+        # dependencies, so run the resolver here: it re-checks the token and
+        # enforces the TLS gate and the files:upload scope (HTTPException 401/403).
+        device = await require_device(request)
+        if project is not None:
+            if project.get("user_id") == device["user_id"]:
+                return ("device_bearer", device["user_id"])
+            # Device is never admin; non-owner gets same outcome as session member.
+            if mode == "write":
+                return JSONResponse({"error": "forbidden"}, status_code=403)
+            return JSONResponse({"error": "not found"}, status_code=404)
+        return JSONResponse({"error": "not found"}, status_code=404)
+    
     auth_header = request.headers.get("Authorization", "")
     if not auth_header.lower().startswith("bearer "):
         # Middleware normally 401s unauthenticated requests before the route
@@ -202,14 +214,49 @@ async def api_project_watch_files(request: Request, slug: str, path: str = "", i
 
 
 @router.post("/api/projects/{slug}/files/upload")
-async def api_project_upload_file(request: Request, slug: str, path: str = "", file: UploadFile = File(...)):
-    """Upload a file to the project's files folder."""
+async def api_project_upload_file(
+    request: Request,
+    slug: str,
+    path: str | None = Query(None),
+    form_path: str | None = Form(None, alias="path"),
+    filename: str | None = Form(None),
+    file: UploadFile = File(...),
+):
+    """Upload a file to the project's files folder.
+
+    ``path`` is the target DIRECTORY (relative to the files root), never the
+    file name. It is accepted from the query string or a multipart form
+    field; if both are sent and disagree the upload is refused with 400.
+
+    ``filename`` (optional form field) overrides the stored name. It must be
+    a bare name: anything carrying a path component (``/``, ``\\``, ``.``,
+    ``..``) is refused with 400 rather than silently stripped.
+
+    The response's ``stored_as`` is the real path relative to the files root.
+    """
     auth = await _authorize_files_actor(request, slug, "write")
     if isinstance(auth, JSONResponse):
         return auth
     workspace = _get_project_files_root(request, slug)
     if workspace is None:
         return JSONResponse({"error": "Invalid slug"}, status_code=400)
+
+    if path is not None and form_path is not None and path != form_path:
+        return JSONResponse(
+            {"error": "path given in both query and form with different values"},
+            status_code=400,
+        )
+    path = path if path is not None else (form_path or "")
+
+    if filename is not None:
+        if (
+            not filename
+            or "/" in filename
+            or "\\" in filename
+            or filename in (".", "..")
+            or Path(filename).name != filename
+        ):
+            return JSONResponse({"error": "Invalid filename"}, status_code=400)
 
     if path:
         target_dir = _resolve_safe(workspace, path)
@@ -221,12 +268,22 @@ async def api_project_upload_file(request: Request, slug: str, path: str = "", f
     else:
         target_dir = workspace
 
-    filename = Path(file.filename).name
-    dest = target_dir / filename
+    filename = Path(filename if filename is not None else file.filename).name
+    # Belt and braces: the final destination must sit directly inside the
+    # target directory, which itself must sit inside the files root.
+    dest = _resolve_safe(target_dir, filename)
+    if dest is None or dest.parent != target_dir.resolve() or not dest.is_relative_to(workspace.resolve()):
+        return JSONResponse({"error": "Invalid filename"}, status_code=400)
     content = await file.read()
     dest.write_bytes(content)
-    rel = dest.relative_to(workspace)
-    return {"name": filename, "path": str(rel), "size": len(content), "status": "uploaded"}
+    rel = dest.relative_to(workspace.resolve()).as_posix()
+    return {
+        "name": filename,
+        "path": rel,
+        "stored_as": rel,
+        "size": len(content),
+        "status": "uploaded",
+    }
 
 
 @router.post("/api/projects/{slug}/mkdir")
@@ -350,7 +407,7 @@ async def api_project_purge_trash_item(request: Request, slug: str, item_id: str
 
 @router.delete("/api/projects/{slug}/trash")
 async def api_project_empty_trash(request: Request, slug: str):
-    """Permanently delete every item in a project's trash."""
+    """Permanently delete every item from a project's trash."""
     auth = await _authorize_files_actor(request, slug, "write")
     if isinstance(auth, JSONResponse):
         return auth

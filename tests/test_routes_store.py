@@ -3,6 +3,7 @@ import pytest_asyncio
 import yaml
 from httpx import AsyncClient, ASGITransport
 from tinyagentos.app import create_app
+from taos_test_csrf import csrf_event_hooks
 
 
 @pytest.fixture
@@ -45,7 +46,7 @@ async def store_client(app_with_store):
     _rec = app_with_store.state.auth.find_user("admin")
     _token = app_with_store.state.auth.create_session(user_id=_rec["id"] if _rec else "", long_lived=True)
     transport = ASGITransport(app=app_with_store)
-    async with AsyncClient(transport=transport, base_url="http://test", cookies={"taos_session": _token}) as c:
+    async with AsyncClient(transport=transport, base_url="http://test", cookies={"taos_session": _token}, event_hooks=csrf_event_hooks()) as c:
         yield c
     await store.close()
     await app_with_store.state.qmd_client.close()
@@ -97,6 +98,14 @@ class TestStoreAPI:
         assert "ram_mb" in data
         assert data["ram_mb"] >= 0
 
+    async def test_hardware_profile_includes_recommended_framework(self, store_client):
+        resp = await store_client.get("/api/hardware")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "recommended_framework" in data
+        assert isinstance(data["recommended_framework"], str)
+        assert len(data["recommended_framework"]) > 0
+
     async def test_resolve_returns_200_not_500(self, store_client):
         """Regression: registry.get_app -> registry.get typo caused 500 on every resolve."""
         resp = await store_client.post(
@@ -143,7 +152,7 @@ class TestCategoryPassthrough:
         _rec = app.state.auth.find_user("admin")
         _token = app.state.auth.create_session(user_id=_rec["id"] if _rec else "", long_lived=True)
         transport = ASGITransport(app=app)
-        async with AsyncClient(transport=transport, base_url="http://test", cookies={"taos_session": _token}) as c:
+        async with AsyncClient(transport=transport, base_url="http://test", cookies={"taos_session": _token}, event_hooks=csrf_event_hooks()) as c:
             yield c
         await store.close()
         await app.state.qmd_client.close()
@@ -337,7 +346,7 @@ class TestDockerInstallRecordsRuntimeLocation:
         _rec = app.state.auth.find_user("admin")
         _token = app.state.auth.create_session(user_id=_rec["id"] if _rec else "", long_lived=True)
         transport = ASGITransport(app=app)
-        async with AsyncClient(transport=transport, base_url="http://test", cookies={"taos_session": _token}) as c:
+        async with AsyncClient(transport=transport, base_url="http://test", cookies={"taos_session": _token}, event_hooks=csrf_event_hooks()) as c:
             yield c, app
         await store.close()
         await app.state.qmd_client.close()

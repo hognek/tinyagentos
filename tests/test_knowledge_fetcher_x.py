@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import pytest
+import pytest_asyncio
+import sqlite3
 import tempfile
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -62,14 +64,15 @@ SAMPLE_TWEET = {
 @pytest.mark.asyncio
 async def test_fetch_tweet_ytdlp_success():
     """fetch_tweet_ytdlp returns a correctly shaped dict on success."""
-    mock_proc = MagicMock()
+    mock_proc = AsyncMock()
     mock_proc.returncode = 0
     mock_proc.communicate = AsyncMock(
-        return_value=(json.dumps(SAMPLE_YTDLP_OUTPUT).encode(), b"")
+        return_value=(json.dumps([SAMPLE_YTDLP_OUTPUT]).encode(), b"")
     )
 
-    with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
-        result = await fetch_tweet_ytdlp("https://twitter.com/testhandle/status/1234567890")
+    with patch("shutil.which", return_value="/usr/bin/yt-dlp"):
+        with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
+            result = await fetch_tweet_ytdlp("https://twitter.com/testhandle/status/1234567890")
 
     assert result is not None
     assert result["id"] == "1234567890"
@@ -86,28 +89,28 @@ async def test_fetch_tweet_ytdlp_success():
 
 @pytest.mark.asyncio
 async def test_fetch_tweet_ytdlp_nonzero_returncode():
-    """fetch_tweet_ytdlp returns None when yt-dlp exits non-zero."""
-    mock_proc = MagicMock()
+    """fetch_tweet_ytdlp raises RuntimeError when yt-dlp exits non-zero."""
+    mock_proc = AsyncMock()
     mock_proc.returncode = 1
     mock_proc.communicate = AsyncMock(return_value=(b"", b"ERROR: Not found"))
 
-    with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
-        result = await fetch_tweet_ytdlp("https://twitter.com/bad/status/999")
-
-    assert result is None
+    with patch("shutil.which", return_value="/usr/bin/yt-dlp"):
+        with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
+            with pytest.raises(RuntimeError, match="yt-dlp failed"):
+                await fetch_tweet_ytdlp("https://twitter.com/bad/status/999")
 
 
 @pytest.mark.asyncio
 async def test_fetch_tweet_ytdlp_invalid_json():
-    """fetch_tweet_ytdlp returns None when yt-dlp outputs invalid JSON."""
-    mock_proc = MagicMock()
+    """fetch_tweet_ytdlp raises RuntimeError when yt-dlp outputs invalid JSON."""
+    mock_proc = AsyncMock()
     mock_proc.returncode = 0
     mock_proc.communicate = AsyncMock(return_value=(b"NOT_JSON", b""))
 
-    with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
-        result = await fetch_tweet_ytdlp("https://twitter.com/test/status/123")
-
-    assert result is None
+    with patch("shutil.which", return_value="/usr/bin/yt-dlp"):
+        with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
+            with pytest.raises(RuntimeError, match="fetch_tweet_ytdlp error"):
+                await fetch_tweet_ytdlp("https://twitter.com/test/status/123")
 
 
 @pytest.mark.asyncio
@@ -119,14 +122,15 @@ async def test_fetch_tweet_ytdlp_missing_counts():
         "uploader": "Alice",
         "uploader_id": "alice",
     }
-    mock_proc = MagicMock()
+    mock_proc = AsyncMock()
     mock_proc.returncode = 0
     mock_proc.communicate = AsyncMock(
-        return_value=(json.dumps(minimal_output).encode(), b"")
+        return_value=(json.dumps([minimal_output]).encode(), b"")
     )
 
-    with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
-        result = await fetch_tweet_ytdlp("https://twitter.com/alice/status/987")
+    with patch("shutil.which", return_value="/usr/bin/yt-dlp"):
+        with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
+            result = await fetch_tweet_ytdlp("https://twitter.com/alice/status/987")
 
     assert result is not None
     assert result["likes"] == 0
@@ -145,14 +149,15 @@ async def test_fetch_tweet_ytdlp_handle_from_uploader_url():
         "uploader_id": "",
         "uploader_url": "https://twitter.com/bobhandle",
     }
-    mock_proc = MagicMock()
+    mock_proc = AsyncMock()
     mock_proc.returncode = 0
     mock_proc.communicate = AsyncMock(
-        return_value=(json.dumps(output).encode(), b"")
+        return_value=(json.dumps([output]).encode(), b"")
     )
 
-    with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
-        result = await fetch_tweet_ytdlp("https://twitter.com/bobhandle/status/111")
+    with patch("shutil.which", return_value="/usr/bin/yt-dlp"):
+        with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
+            result = await fetch_tweet_ytdlp("https://twitter.com/bobhandle/status/111")
 
     assert result is not None
     assert result["handle"] == "bobhandle"
@@ -244,114 +249,214 @@ def test_extract_metadata_keys():
 # XWatchStore tests
 # ---------------------------------------------------------------------------
 
-@pytest.fixture
-def watch_store(tmp_path):
+@pytest_asyncio.fixture
+async def watch_store(tmp_path):
     store = XWatchStore(db_path=tmp_path / "x-watches.db")
-    store.init()
+    await store.init()
     yield store
-    store.close()
+    await store.close()
 
 
-def test_watch_store_init_creates_db(tmp_path):
+@pytest.mark.asyncio
+async def test_watch_store_init_creates_db(tmp_path):
     db_path = tmp_path / "sub" / "x-watches.db"
     store = XWatchStore(db_path=db_path)
-    store.init()
+    await store.init()
     assert db_path.exists()
-    store.close()
+    await store.close()
 
 
-def test_watch_store_create_and_get(watch_store):
-    watch = watch_store.create_watch("elonmusk", frequency=3600)
+@pytest.mark.asyncio
+async def test_watch_store_create_and_get(watch_store):
+    watch = await watch_store.create_watch("user-1", "elonmusk", frequency=3600)
     assert watch["handle"] == "elonmusk"
     assert watch["frequency"] == 3600
     assert watch["enabled"] == 1
     assert watch["filters"] == {}
     assert watch["last_check"] == 0
 
-    fetched = watch_store.get_watch("elonmusk")
+    fetched = await watch_store.get_watch("elonmusk", "user-1")
     assert fetched is not None
     assert fetched["handle"] == "elonmusk"
 
 
-def test_watch_store_create_strips_at(watch_store):
-    watch = watch_store.create_watch("@someuser")
+@pytest.mark.asyncio
+async def test_watch_store_create_strips_at(watch_store):
+    watch = await watch_store.create_watch("user-1", "@someuser")
     assert watch["handle"] == "someuser"
 
 
-def test_watch_store_create_duplicate_raises(watch_store):
-    watch_store.create_watch("alice")
+@pytest.mark.asyncio
+async def test_watch_store_create_duplicate_raises(watch_store):
+    await watch_store.create_watch("user-1", "alice")
     with pytest.raises(ValueError, match="already exists"):
-        watch_store.create_watch("alice")
+        await watch_store.create_watch("user-1", "alice")
 
 
-def test_watch_store_create_with_filters(watch_store):
+@pytest.mark.asyncio
+async def test_watch_store_create_with_filters(watch_store):
     filters = {"min_likes": 100, "threads_only": True}
-    watch = watch_store.create_watch("testuser", filters=filters, frequency=900)
+    watch = await watch_store.create_watch("user-1", "testuser", filters=filters, frequency=900)
     assert watch["filters"]["min_likes"] == 100
     assert watch["filters"]["threads_only"] is True
     assert watch["frequency"] == 900
 
 
-def test_watch_store_list_watches(watch_store):
-    watch_store.create_watch("user1")
-    watch_store.create_watch("user2")
-    watches = watch_store.list_watches()
+@pytest.mark.asyncio
+async def test_watch_store_list_watches(watch_store):
+    await watch_store.create_watch("user-1", "user1")
+    await watch_store.create_watch("user-1", "user2")
+    watches = await watch_store.list_watches("user-1")
     assert len(watches) == 2
     handles = {w["handle"] for w in watches}
     assert "user1" in handles
     assert "user2" in handles
 
 
-def test_watch_store_list_empty(watch_store):
-    watches = watch_store.list_watches()
+@pytest.mark.asyncio
+async def test_watch_store_list_empty(watch_store):
+    watches = await watch_store.list_watches("user-1")
     assert watches == []
 
 
-def test_watch_store_update_frequency(watch_store):
-    watch_store.create_watch("charlie", frequency=1800)
-    updated = watch_store.update_watch("charlie", {"frequency": 600})
+@pytest.mark.asyncio
+async def test_watch_store_update_frequency(watch_store):
+    await watch_store.create_watch("user-1", "charlie", frequency=1800)
+    updated = await watch_store.update_watch("charlie", "user-1", {"frequency": 600})
     assert updated is not None
     assert updated["frequency"] == 600
 
 
-def test_watch_store_update_enabled(watch_store):
-    watch_store.create_watch("dave")
-    updated = watch_store.update_watch("dave", {"enabled": 0})
+@pytest.mark.asyncio
+async def test_watch_store_update_enabled(watch_store):
+    await watch_store.create_watch("user-1", "dave")
+    updated = await watch_store.update_watch("dave", "user-1", {"enabled": 0})
     assert updated is not None
     assert updated["enabled"] == 0
 
 
-def test_watch_store_update_filters(watch_store):
-    watch_store.create_watch("eve")
+@pytest.mark.asyncio
+async def test_watch_store_update_filters(watch_store):
+    await watch_store.create_watch("user-1", "eve")
     new_filters = {"all_posts": True, "min_likes": 50}
-    updated = watch_store.update_watch("eve", {"filters": new_filters})
+    updated = await watch_store.update_watch("eve", "user-1", {"filters": new_filters})
     assert updated is not None
     assert updated["filters"]["all_posts"] is True
 
 
-def test_watch_store_update_nonexistent_returns_none(watch_store):
-    result = watch_store.update_watch("ghost", {"frequency": 100})
+@pytest.mark.asyncio
+async def test_watch_store_update_nonexistent_returns_none(watch_store):
+    result = await watch_store.update_watch("ghost", "user-1", {"frequency": 100})
     assert result is None
 
 
-def test_watch_store_delete_existing(watch_store):
-    watch_store.create_watch("frank")
-    deleted = watch_store.delete_watch("frank")
+@pytest.mark.asyncio
+async def test_watch_store_delete_existing(watch_store):
+    await watch_store.create_watch("user-1", "frank")
+    deleted = await watch_store.delete_watch("frank", "user-1")
     assert deleted is True
-    assert watch_store.get_watch("frank") is None
+    assert await watch_store.get_watch("frank", "user-1") is None
 
 
-def test_watch_store_delete_nonexistent(watch_store):
-    deleted = watch_store.delete_watch("nobody")
+@pytest.mark.asyncio
+async def test_watch_store_delete_nonexistent(watch_store):
+    deleted = await watch_store.delete_watch("nobody", "user-1")
     assert deleted is False
 
 
-def test_watch_store_get_nonexistent(watch_store):
-    result = watch_store.get_watch("nobody")
+@pytest.mark.asyncio
+async def test_watch_store_get_nonexistent(watch_store):
+    result = await watch_store.get_watch("nobody", "user-1")
     assert result is None
 
 
-def test_watch_store_requires_init():
-    store = XWatchStore()
+@pytest.mark.asyncio
+async def test_watch_store_requires_init(tmp_path):
+    store = XWatchStore(db_path=tmp_path / "x-watches.db")
     with pytest.raises(RuntimeError, match="init()"):
-        store.list_watches()
+        await store.list_watches("user")
+
+
+# ---------------------------------------------------------------------------
+# RED tests for R2-20: XWatchStore must use data_dir, aiosqlite, user_id scoping,
+# and be wired onto app.state.
+# ---------------------------------------------------------------------------
+
+def test_x_watch_store_app_state_after_create_app(tmp_path):
+    from tinyagentos.app import create_app
+
+    app = create_app(data_dir=tmp_path)
+    assert hasattr(app.state, "x_watch_store")
+    assert app.state.x_watch_store is not None
+    import asyncio
+
+    asyncio.run(app.state.x_watch_store.close())
+
+
+def test_x_watch_store_path_under_data_dir(tmp_path, monkeypatch):
+    from tinyagentos.app import create_app
+
+    other_cwd = tmp_path / "other_cwd"
+    other_cwd.mkdir()
+    monkeypatch.chdir(other_cwd)
+    data_dir = tmp_path / "my_data"
+    app = create_app(data_dir=data_dir)
+    store = app.state.x_watch_store
+    assert store is not None
+    assert store.db_path == data_dir / "x-watches.db"
+    import asyncio
+
+    asyncio.run(store.close())
+
+
+@pytest.mark.asyncio
+async def test_x_watch_store_list_scoped_by_user(tmp_path):
+    store = XWatchStore(db_path=tmp_path / "x-watches.db")
+    await store.init()
+    await store.create_watch("user-alice", "alice")
+    await store.create_watch("user-bob", "bob")
+    alice_watches = await store.list_watches("user-alice")
+    bob_watches = await store.list_watches("user-bob")
+    assert len(alice_watches) == 1
+    assert alice_watches[0]["handle"] == "alice"
+    assert len(bob_watches) == 1
+    assert bob_watches[0]["handle"] == "bob"
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_x_watch_store_upgrades_pre_user_id_db(tmp_path):
+    db_path = tmp_path / "pre-user-id.db"
+    old_schema = """
+    CREATE TABLE x_author_watches (
+        handle TEXT PRIMARY KEY,
+        filters_json TEXT NOT NULL DEFAULT '{}',
+        frequency INTEGER NOT NULL DEFAULT 1800,
+        enabled INTEGER NOT NULL DEFAULT 1,
+        last_check REAL NOT NULL DEFAULT 0,
+        created_at REAL NOT NULL
+    );
+    """
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript(old_schema)
+    conn.execute(
+        "INSERT INTO x_author_watches (handle, filters_json, frequency, enabled, last_check, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+        ("oldhandle", "{}", 3600, 1, 0, 1700000000.0),
+    )
+    conn.commit()
+    conn.close()
+
+    store = XWatchStore(db_path=db_path)
+    await store.init()
+
+    conn2 = sqlite3.connect(str(db_path))
+    cols = [row[1] for row in conn2.execute("PRAGMA table_info(x_author_watches)").fetchall()]
+    assert "user_id" in cols
+
+    row = conn2.execute("SELECT handle, user_id FROM x_author_watches WHERE handle = 'oldhandle'").fetchone()
+    assert row is not None
+    assert row[0] == "oldhandle"
+    assert row[1] == "legacy"
+    conn2.close()
+
+    await store.close()

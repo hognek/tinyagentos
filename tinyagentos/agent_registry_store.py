@@ -12,6 +12,7 @@ The public key is exposed via GET /api/agents/registry/pubkey so the A2A bus
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -25,6 +26,7 @@ from typing import Optional
 import aiosqlite
 
 from tinyagentos.base_store import BaseStore
+from tinyagentos.config import slugify_agent_name
 
 logger = logging.getLogger(__name__)
 
@@ -34,18 +36,32 @@ logger = logging.getLogger(__name__)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS agent_registry (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    canonical_id    TEXT    NOT NULL UNIQUE,
-    display_name    TEXT    NOT NULL DEFAULT '',
-    framework       TEXT    NOT NULL DEFAULT '',
-    user_id         TEXT    NOT NULL DEFAULT '',
-    origin          TEXT    NOT NULL DEFAULT 'taos-deployed',
-    handle          TEXT    NOT NULL DEFAULT '',
-    role            TEXT,
-    capabilities    TEXT    NOT NULL DEFAULT '[]',
-    created_ts      TEXT    NOT NULL,
-    revoked_at      TEXT,
-    status          TEXT    NOT NULL DEFAULT 'active'
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    canonical_id        TEXT    NOT NULL UNIQUE,
+    display_name        TEXT    NOT NULL DEFAULT '',
+    framework           TEXT    NOT NULL DEFAULT '',
+    user_id             TEXT    NOT NULL DEFAULT '',
+    origin              TEXT    NOT NULL DEFAULT 'taos-deployed',
+    handle              TEXT    NOT NULL DEFAULT '',
+    role                TEXT,
+    capabilities        TEXT    NOT NULL DEFAULT '[]',
+    created_ts          TEXT    NOT NULL,
+    revoked_at          TEXT,
+    status              TEXT    NOT NULL DEFAULT 'active',
+    sponsor_contact_id  TEXT
+);
+
+-- Per-(identity, project) sponsorship association (D1 rework, #2048).
+-- A single agent identity can be reused BY HANDLE across projects, and each
+-- project's delegating contact sponsors the identity independently.  One row
+-- per (canonical_id, project_id) describes exactly one sponsorship, so each
+-- contact's cascade finds exactly what they sponsored in their own project.
+CREATE TABLE IF NOT EXISTS agent_sponsorship (
+    canonical_id        TEXT    NOT NULL,
+    project_id          TEXT    NOT NULL,
+    sponsor_contact_id  TEXT    NOT NULL,
+    created_at          REAL    NOT NULL,
+    PRIMARY KEY (canonical_id, project_id)
 );
 """
 
@@ -205,6 +221,116 @@ async def _migration_v4_dedupe_active_handles(conn) -> None:
         await conn.commit()
 
 
+async def _migration_v5_add_token_min_iat(conn) -> None:
+    """Add token_min_iat column (idempotent) for per-identity token rotation.
+
+    Default value 0 means every existing row's tokens remain valid so the
+    migration cannot lock the fleet out.  Future bumps store a Unix timestamp;
+    any token whose ``iat`` claim is strictly less than this value is rejected
+    during auth, allowing per-identity credential rotation without revoking the
+    entire identity.
+    """
+    existing_cols = {
+        row[1]
+        for row in await (
+            await conn.execute("PRAGMA table_info(agent_registry)")
+        ).fetchall()
+    }
+    if "token_min_iat" not in existing_cols:
+        await conn.execute(
+            "ALTER TABLE agent_registry ADD COLUMN token_min_iat INTEGER NOT NULL DEFAULT 0"
+        )
+        await conn.commit()
+
+
+async def _migration_v6_add_install_id(conn) -> None:
+    """Add install_id column (idempotent), anchoring an identity to ONE install.
+
+    Empty for every pre-existing row, which is correct rather than merely
+    convenient: those identities were minted before installs were distinguished,
+    so claiming to know which install they belong to would be an invention.  A
+    blank install_id therefore means "unknown", never "this install".
+
+    This is what makes per-install identities listable and revocable AS A GROUP
+    (``list_for_install``): the account/cluster model has one owner holding
+    identities across several installs, so "revoke that machine" has to be
+    answerable without string-matching canonical_ids.
+    """
+    existing_cols = {
+        row[1]
+        for row in await (
+            await conn.execute("PRAGMA table_info(agent_registry)")
+        ).fetchall()
+    }
+    if "install_id" not in existing_cols:
+        await conn.execute(
+            "ALTER TABLE agent_registry ADD COLUMN install_id TEXT NOT NULL DEFAULT ''"
+        )
+        await conn.commit()
+
+
+async def _migration_v7_add_sponsor_contact_id(conn) -> None:
+    """Add sponsor_contact_id column (idempotent) for Cross-User Collab D1.
+
+    Delegated agents (those minted via a contact's delegation-request flow)
+    carry ``sponsor_contact_id`` linking back to the sponsoring contact.
+    Existing rows (non-delegated) get NULL.
+    """
+    existing_cols = {
+        row[1]
+        for row in await (
+            await conn.execute("PRAGMA table_info(agent_registry)")
+        ).fetchall()
+    }
+    if "sponsor_contact_id" not in existing_cols:
+        await conn.execute(
+            "ALTER TABLE agent_registry ADD COLUMN sponsor_contact_id TEXT"
+        )
+        await conn.commit()
+
+
+# Sentinel project_id used when backfilling the association from the legacy
+# sponsor_contact_id column.  Pre-association rows carry a sponsor but no
+# project binding (the old column could not record one), so the backfilled
+# association is keyed to this empty project_id.  It is deliberately distinct
+# from any real project_id, which is always a non-empty string validated by
+# the delegation flow.
+_LEGACY_SPONSORSHIP_PROJECT = ""
+
+
+async def _migration_v8_backfill_sponsorship(conn) -> None:
+    """Backfill agent_sponsorship from the legacy sponsor_contact_id column.
+
+    Databases created before the per-(identity, project) association carried
+    sponsorship on ``agent_registry.sponsor_contact_id``.  This migration
+    copies each stamped identity into an association row (idempotent via
+    INSERT OR IGNORE) so a pre-existing single-sponsor identity reproduces the
+    old cascade result exactly: ``list_by_sponsor`` finds it, and revoking the
+    one association leaves no rows, so the identity is revoked.
+
+    The legacy column is retained READ-ONLY for one release; new sponsorships
+    are written to ``agent_sponsorship`` only.  The column is dropped in a
+    later release.
+    """
+    rows = await (
+        await conn.execute(
+            "SELECT canonical_id, sponsor_contact_id FROM agent_registry "
+            "WHERE sponsor_contact_id IS NOT NULL AND sponsor_contact_id != ''"
+        )
+    ).fetchall()
+    if not rows:
+        return
+    now = time.time()
+    for canonical_id, sponsor_contact_id in rows:
+        await conn.execute(
+            "INSERT OR IGNORE INTO agent_sponsorship "
+            "(canonical_id, project_id, sponsor_contact_id, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (canonical_id, _LEGACY_SPONSORSHIP_PROJECT, sponsor_contact_id, now),
+        )
+    await conn.commit()
+
+
 # ---------------------------------------------------------------------------
 # Signing-key helpers (Ed25519, persisted to disk)
 # ---------------------------------------------------------------------------
@@ -217,10 +343,11 @@ def load_or_create_signing_keypair(data_dir: Path) -> tuple[bytes, bytes]:
 
     Generates an Ed25519 keypair on first call and persists the private key
     PEM to ``<data_dir>/agent_registry_signing.pem`` with mode 0600.
-    Subsequent calls load and return the same keypair.  Idempotent under
-    concurrent processes - the writer uses O_EXCL so only one process
-    creates the file.
+    Subsequent calls load and return the same keypair.  Uses filelock to
+    serialize the generate-or-load and atomic_write (tmp + rename) for the
+    write so concurrent processes never see an empty or partial key.
     """
+    from filelock import FileLock
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
     from cryptography.hazmat.primitives.serialization import (
         Encoding,
@@ -229,26 +356,21 @@ def load_or_create_signing_keypair(data_dir: Path) -> tuple[bytes, bytes]:
         PublicFormat,
         load_pem_private_key,
     )
+    from tinyagentos.atomic_io import atomic_write_bytes
 
     data_dir.mkdir(parents=True, exist_ok=True)
     pem_path = data_dir / _REGISTRY_KEY_FILENAME
+    lock_path = data_dir / (_REGISTRY_KEY_FILENAME + ".lock")
 
-    if pem_path.exists():
-        private_key = load_pem_private_key(pem_path.read_bytes(), password=None)
-    else:
-        private_key = Ed25519PrivateKey.generate()
-        pem_bytes = private_key.private_bytes(
-            Encoding.PEM, PrivateFormat.PKCS8, NoEncryption()
-        )
-        try:
-            fd = os.open(str(pem_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            try:
-                os.write(fd, pem_bytes)
-            finally:
-                os.close(fd)
-        except FileExistsError:
-            # Lost the race - load the winner's key instead.
+    with FileLock(str(lock_path)):
+        if pem_path.exists():
             private_key = load_pem_private_key(pem_path.read_bytes(), password=None)
+        else:
+            private_key = Ed25519PrivateKey.generate()
+            pem_bytes = private_key.private_bytes(
+                Encoding.PEM, PrivateFormat.PKCS8, NoEncryption()
+            )
+            atomic_write_bytes(pem_path, pem_bytes, mode=0o600)
 
     private_pem = private_key.private_bytes(
         Encoding.PEM, PrivateFormat.PKCS8, NoEncryption()
@@ -276,6 +398,22 @@ def _b64url_decode(s: str) -> bytes:
     return base64.urlsafe_b64decode(s)
 
 
+# The one place the "how do I keep this credential" rule is written down.  It
+# is returned WITH every minted token (``storage_guidance`` in the mint
+# responses) because the seconds right after the handover are the only chance
+# the holder gets: the token is shown once and stored nowhere retrievable.  The
+# rule itself is old (it lived only in docs and convention, never in the
+# product); inlining it at mint is what makes it actionable.
+TOKEN_STORAGE_GUIDANCE = (
+    "Store this token in TWO locations that survive a machine migration "
+    "(a rebuilt or replaced host takes a single copy with it). Both copies must "
+    "be mode 0600 (owner read/write only) and outside any git working tree. The "
+    "token is shown once and is stored nowhere retrievable; if it is lost, "
+    "rotate this identity to get a replacement token rather than minting a new "
+    "agent."
+)
+
+
 def mint_registry_token(
     canonical_id: str,
     private_key_pem: bytes,
@@ -283,6 +421,8 @@ def mint_registry_token(
     user_id: str = "",
     framework: str = "",
     project_id: Optional[str] = None,
+    principal_type: str = "agent",
+    iat: Optional[int] = None,
 ) -> str:
     """Return a signed compact EdDSA JWT: <header>.<payload>.<signature> (base64url).
 
@@ -291,13 +431,23 @@ def mint_registry_token(
     can verify it without importing tinyagentos code.
 
     Claims:
-      sub        - canonical_id (immutable agent identity)
-      iss        - "taos-registry"
-      iat        - unix timestamp of issuance
-      user_id    - owning user_id at registration time
-      framework  - agent framework at registration time
-      project_id - project binding, present only when non-empty; absent means
-                   the token is global (not bound to any project)
+      sub           - canonical_id for agents, user_id for humans (the principal
+                      identifier)
+      iss           - "taos-registry"
+      iat           - unix timestamp of issuance
+      jti           - unique token id
+      principal_type- "agent" (default) or "human" — the two principal types
+                      verified through the same Ed25519 chain
+      user_id       - owning user_id at registration time (agent tokens only)
+      framework     - agent framework at registration time (agent tokens only)
+      project_id    - project binding, present only when non-empty; absent means
+                      the token is global (not bound to any project)
+
+    ``iat`` overrides the issuance timestamp (Unix seconds).  Rotation passes
+    the identity's new ``token_min_iat`` cutoff here so the replacement token is
+    born AT the cutoff and therefore clears it, even when the credential it
+    supersedes was minted in the same second -- see
+    ``rotate_tokens`` in routes/agent_registry.py for why that matters.
 
     Signed with Ed25519 over the UTF-8 bytes of ``<header_b64url>.<payload_b64url>``.
     """
@@ -311,11 +461,13 @@ def mint_registry_token(
     claims: dict = {
         "sub": canonical_id,
         "iss": "taos-registry",
-        "iat": int(time.time()),
+        "iat": int(time.time()) if iat is None else int(iat),
         "jti": uuid.uuid4().hex,
-        "user_id": user_id,
-        "framework": framework,
+        "principal_type": principal_type,
     }
+    if principal_type == "agent":
+        claims["user_id"] = user_id
+        claims["framework"] = framework
     if project_id:
         claims["project_id"] = project_id
     payload = _b64url_encode(
@@ -350,6 +502,10 @@ def verify_registry_token(token: str, public_key_pem: bytes) -> dict:
         raise ValueError("token signature verification failed") from None
 
     payload = json.loads(_b64url_decode(payload_b64))
+    if not isinstance(payload, dict):
+        raise ValueError(
+            f"payload must be a JSON object, got {type(payload).__name__}"
+        )
     return payload
 
 
@@ -357,11 +513,36 @@ def verify_registry_token(token: str, public_key_pem: bytes) -> dict:
 # Canonical-ID minting
 # ---------------------------------------------------------------------------
 
-_SLUG_RE = re.compile(r"[^a-z0-9]+")
-
-
 def _slugify(text: str) -> str:
-    return _SLUG_RE.sub("-", text.lower().strip()).strip("-") or "agent"
+    """Slug for a registry handle or display name.
+
+    Delegates to :func:`tinyagentos.config.slugify_agent_name` so the OS has
+    one slug implementation rather than two that drift. Returns "" when
+    nothing survives; callers that must have a slug use
+    :func:`agent_slug_or_fallback`.
+    """
+    return slugify_agent_name(text)
+
+
+def agent_slug_or_fallback(name: str) -> str:
+    """Return ``_slugify(name)``, or a deterministic ``agent-<digest>`` when the
+    name (pure emoji, pure punctuation) leaves nothing behind.
+
+    The digest is taken over the raw name, so two unslugifiable names never
+    share a slug. The constant ``"agent"`` this replaces did the opposite: it
+    gave every such name the same slug, so agents registered in the same second
+    landed on neighbouring canonical ids under one shared identity prefix — a
+    collision in the table that exists to keep identities apart.
+    """
+    slug = _slugify(name)
+    if slug:
+        return slug
+    # 8 bytes (16 hex chars): a 4-byte digest is only a 32-bit collision space,
+    # and get_by_slug() resolves a slug to "the oldest matching record" -- two
+    # different unslugifiable names colliding into the same fallback would
+    # silently resolve a lookup (e.g. a DM channel member) to the wrong agent.
+    digest = hashlib.blake2s(name.encode("utf-8"), digest_size=8).hexdigest()
+    return f"agent-{digest}"
 
 
 def mint_canonical_id(slug: str, ts: datetime) -> str:
@@ -369,6 +550,23 @@ def mint_canonical_id(slug: str, ts: datetime) -> str:
     date_part = ts.strftime("%Y%m%d")
     time_part = ts.strftime("%H%M%S")
     return f"{slug}-{date_part}-{time_part}"
+
+
+def _slug_globs(slug: str) -> tuple[str, str]:
+    """GLOB patterns for the canonical ids minted from *slug*.
+
+    mint_canonical_id yields ``{slug}-{YYYYMMDD}-{HHMMSS}`` and, on a
+    same-second slug collision, a ``-{2hex}`` suffix. Both shapes are matched
+    exactly (no trailing wildcard), so slug ``alpha`` does not match the id of
+    an agent whose own slug is ``alpha-20260101-120000-x``.
+    """
+    base = (
+        f"{slug}-"
+        "[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]"
+        "-"
+        "[0-9][0-9][0-9][0-9][0-9][0-9]"
+    )
+    return base, base + "-[0-9a-f][0-9a-f]"
 
 
 _RESERVED_PREFIXES = ("user-", "human-", "admin-", "taos-")
@@ -434,6 +632,11 @@ class AgentRegistryStore(BaseStore):
         # be held together. Created at construction (not in init()) so it always
         # exists before any caller, independent of init ordering.
         self._reporting_lock = asyncio.Lock()
+        # Serialises every write-through-self._db sequence so a concurrent
+        # rollback from one coroutine cannot discard another coroutine's
+        # uncommitted writes.  The shared aiosqlite connection yields on every
+        # await, so two writers can interleave inside the same open transaction.
+        self._write_lock = asyncio.Lock()
 
     async def init(self) -> None:
         await super().init()
@@ -448,6 +651,10 @@ class AgentRegistryStore(BaseStore):
         # Dedupe BEFORE the index so a pre-invariant DB with duplicate active
         # handles cannot make the CREATE UNIQUE INDEX (hence boot) fail.
         await _migration_v4_dedupe_active_handles(self._db)
+        await _migration_v5_add_token_min_iat(self._db)
+        await _migration_v6_add_install_id(self._db)
+        await _migration_v7_add_sponsor_contact_id(self._db)
+        await _migration_v8_backfill_sponsorship(self._db)
         # Created after the status migration so the partial index's WHERE clause
         # can reference the status column on the pre-status migration path.
         # Guard the index creation too: if some path we did not anticipate still
@@ -479,6 +686,7 @@ class AgentRegistryStore(BaseStore):
         reports_to: Optional[str] = None,
         capabilities: Optional[list[str]] = None,
         allow_reserved: bool = False,
+        install_id: str = "",
     ) -> dict:
         """Mint a canonical_id, persist the record, and return it.
 
@@ -492,58 +700,214 @@ class AgentRegistryStore(BaseStore):
         layer never populates from a request body, so external callers
         cannot reach it.
 
+        Sponsorship is NOT stamped here.  Delegated agents (cross-user collab
+        D1) are recorded via ``set_sponsorship`` on the per-(identity, project)
+        association table after registration, so a single identity can be
+        sponsored independently in several projects.
+
         Raises ``RuntimeError`` if the store is not initialised, and
         ``ValueError`` if the name resolves to a reserved prefix.
         """
         if self._db is None:
             raise RuntimeError("AgentRegistryStore not initialised - call init() first")
 
-        capabilities = capabilities or []
-        now_utc = datetime.now(timezone.utc)
-        source_name = display_name if display_name else framework
-        slug = _slugify(source_name)
-        if not allow_reserved:
-            _check_reserved_prefix(slug, source_name)
-        base_id = mint_canonical_id(slug, now_utc)
-        canonical_id = base_id
-        created_ts = now_utc.isoformat()
+        async with self._write_lock:
+            capabilities = capabilities or []
+            now_utc = datetime.now(timezone.utc)
+            source_name = display_name if display_name else framework
+            slug = agent_slug_or_fallback(source_name)
+            if not allow_reserved:
+                _check_reserved_prefix(slug, source_name)
+            base_id = mint_canonical_id(slug, now_utc)
+            canonical_id = base_id
+            created_ts = now_utc.isoformat()
 
-        # Collision guard: if the same slug+second already exists, append a
-        # 2-char hex suffix to break the tie.
-        suffix_n = 0
-        while True:
-            existing = await (
+            # Collision guard: if the same slug+second already exists, append a
+            # 2-char hex suffix to break the tie.
+            suffix_n = 0
+            while True:
+                existing = await (
+                    await self._db.execute(
+                        "SELECT id FROM agent_registry WHERE canonical_id = ?",
+                        (canonical_id,),
+                    )
+                ).fetchone()
+                if existing is None:
+                    break
+                suffix_n += 1
+                canonical_id = f"{base_id}-{suffix_n:02x}"
+
+            caps_json = json.dumps(capabilities)
+            initial_status = "pending" if origin == "external-selfjoin" else "active"
+
+            last_integrity_error = None
+            for _attempt in range(16):
+                try:
+                    await self._db.execute(
+                        """
+                        INSERT INTO agent_registry
+                            (canonical_id, display_name, framework, user_id, origin,
+                             handle, role, title, reports_to, capabilities, created_ts, status,
+                             install_id)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (canonical_id, display_name, framework, user_id, origin,
+                         handle, role, title, reports_to, caps_json, created_ts, initial_status,
+                         install_id),
+                    )
+                    await self._db.commit()
+                    break
+                except aiosqlite.IntegrityError as exc:
+                    await self._db.rollback()
+                    last_integrity_error = exc
+                    existing = await (
+                        await self._db.execute(
+                            "SELECT id FROM agent_registry WHERE canonical_id = ?",
+                            (canonical_id,),
+                        )
+                    ).fetchone()
+                    if existing is not None:
+                        suffix_n += 1
+                        canonical_id = f"{base_id}-{suffix_n:02x}"
+                        continue
+                    raise
+            else:
+                if last_integrity_error is not None:
+                    raise last_integrity_error
+
+            row = await (
                 await self._db.execute(
-                    "SELECT id FROM agent_registry WHERE canonical_id = ?",
+                    "SELECT * FROM agent_registry WHERE canonical_id = ?",
                     (canonical_id,),
                 )
             ).fetchone()
-            if existing is None:
-                break
-            suffix_n += 1
-            canonical_id = f"{base_id}-{suffix_n:02x}"
+            return _row_to_dict(row)
 
-        caps_json = json.dumps(capabilities)
-        initial_status = "pending" if origin == "external-selfjoin" else "active"
-        await self._db.execute(
-            """
-            INSERT INTO agent_registry
-                (canonical_id, display_name, framework, user_id, origin,
-                 handle, role, title, reports_to, capabilities, created_ts, status)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (canonical_id, display_name, framework, user_id, origin,
-             handle, role, title, reports_to, caps_json, created_ts, initial_status),
-        )
-        await self._db.commit()
+    async def adopt(
+        self,
+        *,
+        canonical_id: str,
+        framework: str,
+        created_ts: str,
+        display_name: str = "",
+        user_id: str = "",
+        origin: str = "taos-deployed",
+        handle: str = "",
+        role: Optional[str] = None,
+        title: Optional[str] = None,
+        reports_to: Optional[str] = None,
+        capabilities: Optional[list[str]] = None,
+        status: str = "active",
+        allow_reserved: bool = False,
+    ) -> dict:
+        """Adopt an existing canonical_id byte-for-byte on this device.
 
-        row = await (
-            await self._db.execute(
-                "SELECT * FROM agent_registry WHERE canonical_id = ?",
-                (canonical_id,),
+        Account-device-sync S1: a canonical_id is minted ONCE by the first
+        device and ADOPTED byte-for-byte by every device that joins the
+        account, with no migration of the id format. This path persists the
+        given id verbatim -- it never mints, never appends a collision
+        suffix, and never rewrites ``created_ts``.
+
+        Idempotent re-adopt: if a row with this canonical_id already exists
+        and its ``framework`` and ``handle`` match the arguments, that row is
+        returned unchanged and NO write occurs. If the id already belongs to
+        a different agent (different framework or handle) this raises
+        ``ValueError`` -- the existing row is never updated.
+
+        ``allow_reserved`` bypasses the reserved-prefix guard. It exists for
+        the internal taOS Agent adopt path, which legitimately names agents
+        under the reserved ``taos-`` prefix; it is deliberately a keyword the
+        HTTP layer never populates from a request body, so external callers
+        cannot reach it.
+
+        Raises ``RuntimeError`` if the store is not initialised, ``ValueError``
+        on a malformed id, a reserved prefix, an unknown status, a collision
+        with a different agent, or a handle already held by another active
+        agent.
+        """
+        if self._db is None:
+            raise RuntimeError("AgentRegistryStore not initialised - call init() first")
+
+        if not re.fullmatch(
+            r"[a-z0-9][a-z0-9-]*-[0-9]{8}-[0-9]{6}(-[0-9a-f]{2})?",
+            canonical_id,
+        ):
+            raise ValueError(f"adopt: malformed canonical_id {canonical_id!r}")
+
+        if not allow_reserved:
+            slug = re.sub(
+                r"-[0-9]{8}-[0-9]{6}(-[0-9a-f]{2})?$", "", canonical_id
             )
-        ).fetchone()
-        return _row_to_dict(row)
+            _check_reserved_prefix(slug, display_name)
+
+        if status not in VALID_STATUSES:
+            raise ValueError(
+                f"unknown status {status!r}; valid: {sorted(VALID_STATUSES)}"
+            )
+
+        async with self._write_lock:
+            capabilities = capabilities or []
+            caps_json = json.dumps(capabilities)
+
+            existing = await (
+                await self._db.execute(
+                    "SELECT * FROM agent_registry WHERE canonical_id = ?",
+                    (canonical_id,),
+                )
+            ).fetchone()
+            if existing is not None:
+                rec = _row_to_dict(existing)
+                if (
+                    rec.get("framework") == framework
+                    and rec.get("handle") == handle
+                ):
+                    return rec
+                raise ValueError(
+                    f"adopt: canonical_id {canonical_id!r} already belongs to a "
+                    f"different agent"
+                )
+
+            if handle:
+                holder = await (
+                    await self._db.execute(
+                        "SELECT canonical_id FROM agent_registry "
+                        "WHERE handle = ? AND status = 'active' AND handle != ''",
+                        (handle,),
+                    )
+                ).fetchone()
+                if holder is not None:
+                    raise ValueError(
+                        f"adopt: handle {handle!r} is already owned by another "
+                        f"active agent ({holder[0]})"
+                    )
+
+            try:
+                await self._db.execute(
+                    """
+                    INSERT INTO agent_registry
+                        (canonical_id, display_name, framework, user_id, origin,
+                         handle, role, title, reports_to, capabilities, created_ts, status)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        canonical_id, display_name, framework, user_id, origin,
+                        handle, role, title, reports_to, caps_json, created_ts, status,
+                    ),
+                )
+                await self._db.commit()
+            except aiosqlite.IntegrityError as exc:
+                await self._db.rollback()
+                raise ValueError(
+                    f"adopt: could not persist canonical_id {canonical_id!r}"
+                ) from exc
+
+            row = await (
+                await self._db.execute(
+                    "SELECT * FROM agent_registry WHERE canonical_id = ?",
+                    (canonical_id,),
+                )
+            ).fetchone()
+            return _row_to_dict(row)
 
     # ------------------------------------------------------------------
     # Read
@@ -555,7 +919,8 @@ class AgentRegistryStore(BaseStore):
         no transaction is open.
         """
         if self._db is not None:
-            await self._db.rollback()
+            async with self._write_lock:
+                await self._db.rollback()
 
     async def delete(self, canonical_id: str) -> None:
         """Permanently remove *canonical_id* (used to clean up a half-registered
@@ -564,10 +929,11 @@ class AgentRegistryStore(BaseStore):
         """
         if self._db is None:
             raise RuntimeError("AgentRegistryStore not initialised")
-        await self._db.execute(
-            "DELETE FROM agent_registry WHERE canonical_id = ?", (canonical_id,)
-        )
-        await self._db.commit()
+        async with self._write_lock:
+            await self._db.execute(
+                "DELETE FROM agent_registry WHERE canonical_id = ?", (canonical_id,)
+            )
+            await self._db.commit()
 
     async def get(self, canonical_id: str) -> Optional[dict]:
         """Return the record for *canonical_id*, or ``None``."""
@@ -603,28 +969,42 @@ class AgentRegistryStore(BaseStore):
         # a caller-supplied string must not reach the matcher.
         if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", slug or ""):
             return None
-        # mint_canonical_id yields {slug}-{YYYYMMDD}-{HHMMSS} (and, on a
-        # same-second slug collision, a -{2hex} suffix). GLOBing the 8-6 digit
-        # tail pins the slug to its own canonical-id boundary.
-        pattern = (
-            f"{slug}-"
-            "[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]"
-            "-"
-            "[0-9][0-9][0-9][0-9][0-9][0-9]"
-            "*"
-        )
+        pattern, suffixed = _slug_globs(slug)
         if status is None:
             cursor = await self._db.execute(
-                "SELECT * FROM agent_registry WHERE canonical_id GLOB ? ORDER BY id LIMIT 1",
-                (pattern,),
+                "SELECT * FROM agent_registry WHERE (canonical_id GLOB ? OR canonical_id GLOB ?)"
+                " ORDER BY id LIMIT 1",
+                (pattern, suffixed),
             )
         else:
             cursor = await self._db.execute(
-                "SELECT * FROM agent_registry WHERE canonical_id GLOB ? AND status = ? ORDER BY id LIMIT 1",
-                (pattern, status),
+                "SELECT * FROM agent_registry WHERE (canonical_id GLOB ? OR canonical_id GLOB ?)"
+                " AND status = ? ORDER BY id LIMIT 1",
+                (pattern, suffixed, status),
             )
         row = await cursor.fetchone()
         return _row_to_dict(row) if row else None
+
+    async def count_by_slug(self, slug: str, *, status: str = "active") -> int:
+        """How many entries with *status* decode to *slug* (same match as get_by_slug).
+
+        A slug is not unique: two users can each register ``alpha`` and get
+        distinct canonical ids. Owner checks that accept a bare slug use this
+        to refuse the ambiguous case instead of silently taking the oldest row.
+        """
+        if self._db is None:
+            raise RuntimeError("AgentRegistryStore not initialised")
+        if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", slug or ""):
+            return 0
+        pattern, suffixed = _slug_globs(slug)
+        row = await (
+            await self._db.execute(
+                "SELECT COUNT(*) FROM agent_registry"
+                " WHERE (canonical_id GLOB ? OR canonical_id GLOB ?) AND status = ?",
+                (pattern, suffixed, status),
+            )
+        ).fetchone()
+        return int(row[0]) if row else 0
 
     async def get_by_handle(self, handle: str, *, status: str = "active") -> Optional[dict]:
         """Return the oldest entry with *handle* and *status*, or ``None``.
@@ -648,6 +1028,47 @@ class AgentRegistryStore(BaseStore):
             )
         row = await cursor.fetchone()
         return _row_to_dict(row) if row else None
+
+    async def get_by_handle_normalised(
+        self, handle: str, *, status: str = "active"
+    ) -> Optional[dict]:
+        """Return the oldest entry whose handle SLUGIFIES to *handle*'s slug.
+
+        ``get_by_handle`` is an exact SQL match, which is why one identity can
+        exist under two spellings at once: the consent approve path registers
+        ``_slugify(identity_claim)`` (``taosmd-dev``) while ``_INTERNAL_AGENTS``
+        names the display spelling (``@taOSmd-dev``).  Looking up only the
+        spelling we happen to hold misses the other row and mints a duplicate.
+
+        Matching on the slug is direction-free: every spelling of one handle
+        maps to the same key, so it does not matter which the caller has.  The
+        reverse is impossible to do by string surgery -- ``taosmd-dev`` cannot
+        be turned back into ``@taOSmd-dev`` because slugifying discards case.
+
+        The scan is deliberate: the registry holds a handful of rows, there is
+        no index on a normalised handle, and correctness here is worth more than
+        an index.  Pass ``status=None`` to match any status.
+        """
+        if self._db is None:
+            raise RuntimeError("AgentRegistryStore not initialised")
+        want = _slugify(handle)
+        if not want:
+            return None
+        if status is None:
+            cursor = await self._db.execute(
+                "SELECT * FROM agent_registry WHERE handle != '' ORDER BY id"
+            )
+        else:
+            cursor = await self._db.execute(
+                "SELECT * FROM agent_registry WHERE handle != '' AND status = ? ORDER BY id",
+                (status,),
+            )
+        rows = await cursor.fetchall()
+        for row in rows:
+            rec = _row_to_dict(row)
+            if _slugify(rec.get("handle") or "") == want:
+                return rec
+        return None
 
     async def list_all(self, *, status: Optional[str] = None) -> list[dict]:
         """Return all registry records, optionally filtered by *status*."""
@@ -680,8 +1101,43 @@ class AgentRegistryStore(BaseStore):
         rows = await cursor.fetchall()
         return [_row_to_dict(r) for r in rows]
 
+    async def list_for_install(
+        self, install_id: str, *, status: Optional[str] = None
+    ) -> list[dict]:
+        """Return every record minted by ONE install, optionally by status.
+
+        An empty *install_id* returns nothing rather than every legacy row.
+        Blank means "unknown install" (see the v6 migration), so matching on it
+        would quietly scoop up identities from before installs were tracked --
+        and this is the query a group revocation would be built on, where
+        over-matching costs an agent its credentials.
+        """
+        if self._db is None:
+            raise RuntimeError("AgentRegistryStore not initialised")
+        if not install_id:
+            return []
+        if status is not None:
+            cursor = await self._db.execute(
+                "SELECT * FROM agent_registry WHERE install_id = ? AND status = ? ORDER BY id",
+                (install_id, status),
+            )
+        else:
+            cursor = await self._db.execute(
+                "SELECT * FROM agent_registry WHERE install_id = ? ORDER BY id",
+                (install_id,),
+            )
+        rows = await cursor.fetchall()
+        return [_row_to_dict(r) for r in rows]
+
     async def list_revoked(self) -> list[dict]:
-        """Return [{canonical_id, revoked_at}] for all revoked entries (back-compat feed)."""
+        """Return [{canonical_id, revoked_at}] for all revoked agent identities.
+
+        This feed is deliberately scoped to agent identities only, as decided on
+        2026-08-13. Human credential withdrawal is handled through the
+        session/auth layer and does not appear here. Do not extend this feed to
+        include human principals or subject_type fields without a new design
+        decision.
+        """
         if self._db is None:
             raise RuntimeError("AgentRegistryStore not initialised")
         cursor = await self._db.execute(
@@ -720,6 +1176,139 @@ class AgentRegistryStore(BaseStore):
             rows.extend(await cursor.fetchall())
         return [_row_to_dict(r) for r in rows]
 
+    async def list_by_sponsor(
+        self, sponsor_contact_id: str, *, status: Optional[str] = None
+    ) -> list[dict]:
+        """Return every identity *sponsor_contact_id* sponsors, via the association.
+
+        Sponsorship is now per-(identity, project): the same identity may be
+        sponsored by several contacts across several projects, so the victim
+        set for a contact's cascade is resolved through ``agent_sponsorship``
+        rather than a single column on the identity.  Each contact therefore
+        finds exactly what they sponsored in their own project(s).
+
+        Optionally filtered by *status* (on the identity row).
+        """
+        if self._db is None:
+            raise RuntimeError("AgentRegistryStore not initialised")
+        if status is not None:
+            cursor = await self._db.execute(
+                "SELECT DISTINCT ar.* FROM agent_registry ar "
+                "JOIN agent_sponsorship sp ON sp.canonical_id = ar.canonical_id "
+                "WHERE sp.sponsor_contact_id = ? AND ar.status = ? ORDER BY ar.id",
+                (sponsor_contact_id, status),
+            )
+        else:
+            cursor = await self._db.execute(
+                "SELECT DISTINCT ar.* FROM agent_registry ar "
+                "JOIN agent_sponsorship sp ON sp.canonical_id = ar.canonical_id "
+                "WHERE sp.sponsor_contact_id = ? ORDER BY ar.id",
+                (sponsor_contact_id,),
+            )
+        rows = await cursor.fetchall()
+        return [_row_to_dict(r) for r in rows]
+
+    async def set_sponsorship(
+        self, canonical_id: str, project_id: str, sponsor_contact_id: str
+    ) -> bool:
+        """Record that *sponsor_contact_id* sponsors *canonical_id* in *project_id*.
+
+        The association's PRIMARY KEY (canonical_id, project_id) makes this
+        atomic and deterministic: the FIRST writer for a given
+        (identity, project) wins, and any later write is a no-op (the INSERT
+        is ignored on the unique-key conflict).  This is the atomic
+        first-writer-wins discipline the old ``sponsor_contact_id`` column
+        guard defended — moved to the table it actually belongs on.
+
+        Returns True if a new sponsorship row was written, False if
+        (canonical_id, project_id) was already sponsored (ignored).
+        """
+        if self._db is None:
+            raise RuntimeError("AgentRegistryStore not initialised")
+        cur = await self._db.execute(
+            "INSERT OR IGNORE INTO agent_sponsorship "
+            "(canonical_id, project_id, sponsor_contact_id, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (canonical_id, project_id, sponsor_contact_id, time.time()),
+        )
+        await self._db.commit()
+        return cur.rowcount == 1
+
+    async def remove_sponsorship(self, canonical_id: str, project_id: str) -> None:
+        """Delete the sponsorship association for (canonical_id, project_id).
+
+        Used by cascade revocation: revoking the association removes the
+        contact's claim over the identity in that project WITHOUT necessarily
+        revoking the identity itself (which only dies when no associations
+        remain).
+        """
+        if self._db is None:
+            raise RuntimeError("AgentRegistryStore not initialised")
+        await self._db.execute(
+            "DELETE FROM agent_sponsorship WHERE canonical_id = ? AND project_id = ?",
+            (canonical_id, project_id),
+        )
+        await self._db.commit()
+
+    async def list_sponsorships_for_identity(
+        self, canonical_id: str
+    ) -> list[dict]:
+        """Return every sponsorship association row for *canonical_id*.
+
+        A sponsored identity survives a contact's cascade while ANY row
+        remains; it is revoked only once the last row is removed.
+        """
+        if self._db is None:
+            raise RuntimeError("AgentRegistryStore not initialised")
+        cursor = await self._db.execute(
+            "SELECT canonical_id, project_id, sponsor_contact_id, created_at "
+            "FROM agent_sponsorship WHERE canonical_id = ? ORDER BY created_at",
+            (canonical_id,),
+        )
+        return [
+            {
+                "canonical_id": r["canonical_id"],
+                "project_id": r["project_id"],
+                "sponsor_contact_id": r["sponsor_contact_id"],
+                "created_at": r["created_at"],
+            }
+            for r in await cursor.fetchall()
+        ]
+
+    async def list_sponsorships_by_contact(
+        self, sponsor_contact_id: str, *, project_id: Optional[str] = None
+    ) -> list[dict]:
+        """Return the sponsorship association rows for *sponsor_contact_id*.
+
+        Optionally scoped to a single *project_id* (membership-revoke).  This
+        is the association-level query the cascade iterates: each row names
+        the (identity, project) pair the contact actually sponsored.
+        """
+        if self._db is None:
+            raise RuntimeError("AgentRegistryStore not initialised")
+        if project_id is not None:
+            cursor = await self._db.execute(
+                "SELECT canonical_id, project_id, sponsor_contact_id, created_at "
+                "FROM agent_sponsorship "
+                "WHERE sponsor_contact_id = ? AND project_id = ? ORDER BY created_at",
+                (sponsor_contact_id, project_id),
+            )
+        else:
+            cursor = await self._db.execute(
+                "SELECT canonical_id, project_id, sponsor_contact_id, created_at "
+                "FROM agent_sponsorship "
+                "WHERE sponsor_contact_id = ? ORDER BY created_at",
+                (sponsor_contact_id,),
+            )
+        return [
+            {
+                "canonical_id": r["canonical_id"],
+                "project_id": r["project_id"],
+                "sponsor_contact_id": r["sponsor_contact_id"],
+                "created_at": r["created_at"],
+            }
+            for r in await cursor.fetchall()
+        ]
     # ------------------------------------------------------------------
     # Lifecycle state machine
     # ------------------------------------------------------------------
@@ -740,38 +1329,39 @@ class AgentRegistryStore(BaseStore):
         if self._db is None:
             raise RuntimeError("AgentRegistryStore not initialised")
 
-        record = await self.get(canonical_id)
-        if record is None:
-            raise KeyError(canonical_id)
+        async with self._write_lock:
+            record = await self.get(canonical_id)
+            if record is None:
+                raise KeyError(canonical_id)
 
-        before_status = record.get("status") or "active"
-        _assert_valid_transition(before_status, new_status)
+            before_status = record.get("status") or "active"
+            _assert_valid_transition(before_status, new_status)
 
-        now = datetime.now(timezone.utc).isoformat()
-        # Atomic: the UPDATE is conditional on the status still being
-        # ``before_status``, so two concurrent transitions cannot both win a
-        # read/validate/write race - the loser's WHERE matches 0 rows. This
-        # also guarantees the returned/audited before_status is accurate.
-        if new_status == "revoked":
-            cur = await self._db.execute(
-                "UPDATE agent_registry SET status = ?, revoked_at = COALESCE(revoked_at, ?) "
-                "WHERE canonical_id = ? AND status = ?",
-                (new_status, now, canonical_id, before_status),
-            )
-        else:
-            cur = await self._db.execute(
-                "UPDATE agent_registry SET status = ? "
-                "WHERE canonical_id = ? AND status = ?",
-                (new_status, canonical_id, before_status),
-            )
-        await self._db.commit()
-        if cur.rowcount == 0:
-            # Status changed under us between the read and the write.
-            raise ValueError(
-                f"lifecycle transition conflict: {canonical_id!r} is no longer "
-                f"in state {before_status!r}"
-            )
-        return await self.get(canonical_id)  # type: ignore[return-value]
+            # Atomic: the UPDATE is conditional on the status still being
+            # ``before_status``, so two concurrent transitions cannot both win a
+            # read/validate/write race - the loser's WHERE matches 0 rows. This
+            # also guarantees the returned/audited before_status is accurate.
+            now = datetime.now(timezone.utc).isoformat()
+            if new_status == "revoked":
+                cur = await self._db.execute(
+                    "UPDATE agent_registry SET status = ?, revoked_at = COALESCE(revoked_at, ?) "
+                    "WHERE canonical_id = ? AND status = ?",
+                    (new_status, now, canonical_id, before_status),
+                )
+            else:
+                cur = await self._db.execute(
+                    "UPDATE agent_registry SET status = ? "
+                    "WHERE canonical_id = ? AND status = ?",
+                    (new_status, canonical_id, before_status),
+                )
+            await self._db.commit()
+            if cur.rowcount == 0:
+                # Status changed under us between the read and the write.
+                raise ValueError(
+                    f"lifecycle transition conflict: {canonical_id!r} is no longer "
+                    f"in state {before_status!r}"
+                )
+            return await self.get(canonical_id)  # type: ignore[return-value]
 
     # ------------------------------------------------------------------
     # Revoke
@@ -798,57 +1388,84 @@ class AgentRegistryStore(BaseStore):
         """
         if self._db is None:
             raise RuntimeError("AgentRegistryStore not initialised")
-        record = await self.get(canonical_id)
-        if record is None:
-            return None
+        async with self._write_lock:
+            record = await self.get(canonical_id)
+            if record is None:
+                return None
 
-        cols: list[str] = []
-        vals: list = []
-        if display_name is not None:
-            cols.append("display_name = ?")
-            vals.append(display_name)
-        if handle is not None:
-            cols.append("handle = ?")
-            vals.append(handle)
-        if role is not None:
-            cols.append("role = ?")
-            vals.append(role)
-        if title is not None:
-            cols.append("title = ?")
-            vals.append(title)
-        if capabilities is not None:
-            cols.append("capabilities = ?")
-            vals.append(json.dumps(capabilities))
-        if not cols:
-            return record
-        vals.append(canonical_id)
-        await self._db.execute(
-            f"UPDATE agent_registry SET {', '.join(cols)} WHERE canonical_id = ?",
-            vals,
-        )
-        await self._db.commit()
-        return await self.get(canonical_id)
+            cols: list[str] = []
+            vals: list = []
+            if display_name is not None:
+                cols.append("display_name = ?")
+                vals.append(display_name)
+            if handle is not None:
+                cols.append("handle = ?")
+                vals.append(handle)
+            if role is not None:
+                cols.append("role = ?")
+                vals.append(role)
+            if title is not None:
+                cols.append("title = ?")
+                vals.append(title)
+            if capabilities is not None:
+                cols.append("capabilities = ?")
+                vals.append(json.dumps(capabilities))
+            if not cols:
+                return record
+            vals.append(canonical_id)
+            try:
+                await self._db.execute(
+                    f"UPDATE agent_registry SET {', '.join(cols)} WHERE canonical_id = ?",
+                    vals,
+                )
+            except aiosqlite.IntegrityError as exc:
+                if handle is not None:
+                    raise ValueError(
+                        f"handle {handle!r} is already owned by another active agent"
+                    ) from exc
+                raise
+            await self._db.commit()
+            return await self.get(canonical_id)
 
     async def revoke(self, canonical_id: str) -> Optional[dict]:
-        """Set revoked_at on *canonical_id*.  Returns updated record or None."""
+        """Transition *canonical_id* to 'revoked' via the state-transition guard.
+
+        Returns the updated record.
+        Raises ``KeyError`` if *canonical_id* does not exist.
+        Raises ``ValueError`` if the transition is not allowed.
+        """
         if self._db is None:
             raise RuntimeError("AgentRegistryStore not initialised")
-        record = await self.get(canonical_id)
-        if record is None:
-            return None
-        if record.get("revoked_at"):
-            # Already revoked - return the existing record unchanged.
-            return record
-        now = datetime.now(timezone.utc).isoformat()
-        # Atomic: only the first concurrent revoke matches (revoked_at IS NULL);
-        # a second one no-ops and returns the already-revoked record.
-        await self._db.execute(
-            "UPDATE agent_registry SET revoked_at = ?, status = 'revoked' "
-            "WHERE canonical_id = ? AND revoked_at IS NULL",
-            (now, canonical_id),
-        )
-        await self._db.commit()
-        return await self.get(canonical_id)
+        return await self.set_status(canonical_id, "revoked")
+
+    async def bump_token_min_iat(self, canonical_id: str, ts: int) -> Optional[dict]:
+        """Advance *canonical_id*'s ``token_min_iat`` to at least *ts*, and
+        STRICTLY past whatever it was, invalidating every token minted before
+        the new cutoff.
+
+        The advance happens in ONE statement -- ``MAX(token_min_iat + 1, ?)`` --
+        so a caller cannot compute a cutoff from a stale read and land on a
+        value a concurrent rotation already used.  Two rotations must never
+        share a cutoff: the second would mint a token whose ``iat`` equals the
+        cutoff and the first rotation's replacement would survive it, silently
+        leaving a superseded credential live.
+
+        The caller is responsible for authorisation (admin/session-owner checks).
+        Returns the updated record, or ``None`` if *canonical_id* does not exist.
+        """
+        if self._db is None:
+            raise RuntimeError("AgentRegistryStore not initialised")
+        async with self._write_lock:
+            record = await self.get(canonical_id)
+            if record is None:
+                return None
+            await self._db.execute(
+                "UPDATE agent_registry SET token_min_iat = MAX(token_min_iat + 1, ?) "
+                "WHERE canonical_id = ?",
+                (ts, canonical_id),
+            )
+            await self._db.commit()
+            return await self.get(canonical_id)
 
     # ------------------------------------------------------------------
     # Org model (#161): reporting lines, roles/titles, org tree
@@ -875,27 +1492,28 @@ class AgentRegistryStore(BaseStore):
         """
         if self._db is None:
             raise RuntimeError("AgentRegistryStore not initialised")
-        record = await self.get(canonical_id)
-        if record is None:
-            return None
+        async with self._write_lock:
+            record = await self.get(canonical_id)
+            if record is None:
+                return None
 
-        cols: list[str] = []
-        vals: list = []
-        if role is not None:
-            cols.append("role = ?")
-            vals.append(role or None)
-        if title is not None:
-            cols.append("title = ?")
-            vals.append(title or None)
-        if not cols:
-            return record
-        vals.append(canonical_id)
-        await self._db.execute(
-            f"UPDATE agent_registry SET {', '.join(cols)} WHERE canonical_id = ?",
-            vals,
-        )
-        await self._db.commit()
-        return await self.get(canonical_id)
+            cols: list[str] = []
+            vals: list = []
+            if role is not None:
+                cols.append("role = ?")
+                vals.append(role or None)
+            if title is not None:
+                cols.append("title = ?")
+                vals.append(title or None)
+            if not cols:
+                return record
+            vals.append(canonical_id)
+            await self._db.execute(
+                f"UPDATE agent_registry SET {', '.join(cols)} WHERE canonical_id = ?",
+                vals,
+            )
+            await self._db.commit()
+            return await self.get(canonical_id)
 
     async def set_reporting(
         self, canonical_id: str, reports_to: Optional[str]
@@ -952,12 +1570,13 @@ class AgentRegistryStore(BaseStore):
                     current = current_record.get("reports_to") if current_record else None
                     depth += 1
 
-            await self._db.execute(
-                "UPDATE agent_registry SET reports_to = ? WHERE canonical_id = ?",
-                (reports_to, canonical_id),
-            )
-            await self._db.commit()
-            return await self.get(canonical_id)  # type: ignore[return-value]
+            async with self._write_lock:
+                await self._db.execute(
+                    "UPDATE agent_registry SET reports_to = ? WHERE canonical_id = ?",
+                    (reports_to, canonical_id),
+                )
+                await self._db.commit()
+                return await self.get(canonical_id)  # type: ignore[return-value]
 
     async def direct_reports(self, canonical_id: str) -> list[dict]:
         """Return the agents whose reports_to is *canonical_id*, oldest first."""

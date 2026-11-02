@@ -1,10 +1,12 @@
 import { useState, useEffect, useCallback } from "react";
+import { useRefreshOnFocus } from "@/hooks/use-refresh-on-focus";
 import {
   Activity, Cpu, MemoryStick, Zap, HardDrive, Thermometer, Network, CircuitBoard,
   Gauge, Layers, RefreshCw, Loader2, Server,
 } from "lucide-react";
 import { Card, CardContent, Button } from "@/components/ui";
 import { AiStackRecovery } from "./ActivityApp.aiStack";
+import { ModelActivityPanel } from "./ActivityApp.modelActivity";
 import type { ClusterWorker } from "@/lib/cluster";
 import { workerStatus, workerHardwareSummary, workerShortIp, normalizeBackendName, STATUS_PILL_CLASS, STATUS_LABEL } from "@/lib/cluster";
 
@@ -252,6 +254,8 @@ export function ActivityApp({ windowId: _windowId }: { windowId: string }) {
     const interval = setInterval(fetchData, 2000);
     return () => clearInterval(interval);
   }, [fetchData]);
+
+  useRefreshOnFocus(fetchData);
 
   useEffect(() => {
     fetchCluster();
@@ -940,6 +944,10 @@ export function ActivityApp({ windowId: _windowId }: { windowId: string }) {
             </CardContent>
           </Card>
         )}
+
+        {/* Model Activity feed (#208): its own surface, distinct from the
+            AI-stack manager in the header (ActivityApp.aiStack.tsx). */}
+        <ModelActivityPanel />
 
         {/* Top processes */}
         <Card className="col-span-12 p-4">

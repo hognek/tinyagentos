@@ -53,6 +53,15 @@ CREATE TABLE IF NOT EXISTS chat_attachments (
     uploaded_at REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_chat_attachments_message ON chat_attachments(message_id);
+
+CREATE TABLE IF NOT EXISTS chat_receipts (
+    message_id TEXT NOT NULL,
+    reader_id TEXT NOT NULL,
+    reader_type TEXT NOT NULL DEFAULT 'agent',
+    delivered_at REAL,
+    seen_at REAL,
+    PRIMARY KEY (message_id, reader_id)
+);
 """
 
 _JSON_FIELDS = ("content_blocks", "embeds", "components", "attachments", "reactions", "metadata")
@@ -78,6 +87,8 @@ class ChatMessageStore(BaseStore):
         super().__init__(db_path)
         # Serialises concurrent reaction read-modify-write operations
         self._reaction_lock = asyncio.Lock()
+        # Serialises concurrent content_blocks read-modify-write operations
+        self._content_lock = asyncio.Lock()
 
     async def init(self) -> None:
         await super().init()
@@ -267,6 +278,52 @@ class ChatMessageStore(BaseStore):
             desc = cursor.description
         return [_parse(r, desc) for r in rows]
 
+    async def latest_previews(self, channel_ids: list[str]) -> dict[str, dict]:
+        """Return the latest non-deleted, non-thread, non-ephemeral message per channel.
+
+        Returns {channel_id: {"text": <collapsed content, max 120 chars>,
+                               "author_id": ..., "author_type": ..., "created_at": ...}}.
+        Empty input returns {} without querying.
+
+        One indexed lookup per channel: ``idx_chat_messages_channel`` is
+        ``(channel_id, created_at)``, so ``ORDER BY created_at DESC LIMIT 1``
+        reads a handful of rows from the end of that channel's index range. A
+        window function ranking every message per channel would scan a
+        channel's whole history on each channel-list request (CR on #3674).
+        """
+        if not channel_ids:
+            return {}
+
+        sql = """
+            SELECT channel_id, content, author_id, author_type, created_at
+            FROM chat_messages
+            WHERE channel_id = ?
+              AND deleted_at IS NULL
+              AND thread_id IS NULL
+              AND ephemeral = 0
+            ORDER BY created_at DESC
+            LIMIT 1
+        """
+        result: dict[str, dict] = {}
+        for channel_id in channel_ids:
+            async with self._db.execute(sql, (channel_id,)) as cursor:
+                row = await cursor.fetchone()
+                desc = cursor.description
+            if row is None:
+                continue
+            parsed = _parse(row, desc)
+            # Collapse whitespace and truncate to 120 chars
+            text = " ".join(parsed["content"].split())
+            if len(text) > 120:
+                text = text[:120]
+            result[parsed["channel_id"]] = {
+                "text": text,
+                "author_id": parsed["author_id"],
+                "author_type": parsed["author_type"],
+                "created_at": parsed["created_at"],
+            }
+        return result
+
     async def edit_message(self, message_id: str, content: str) -> None:
         now = time.time()
         await self._db.execute(
@@ -275,12 +332,107 @@ class ChatMessageStore(BaseStore):
         )
         await self._db.commit()
 
+    async def edit_last_agent_reply(self, message_id: str, content: str) -> bool:
+        """Rewrite *message_id* only if it is still the last completed agent reply.
+
+        One conditional UPDATE, so the eligibility check and the write are
+        atomic: the row must be a live, complete agent message with no
+        content blocks, and the most recent live agent message of its thread
+        (top level when ``thread_id`` is NULL; ephemeral rows never count).
+        Returns ``False`` when any condition fails and nothing was written.
+        """
+        cursor = await self._db.execute(
+            "UPDATE chat_messages SET content = ?, edited_at = ?"
+            " WHERE id = ? AND author_type = 'agent' AND deleted_at IS NULL"
+            " AND state = 'complete'"
+            " AND COALESCE(json_array_length(NULLIF(content_blocks, '')), 0) = 0"
+            " AND id = ("
+            "   SELECT latest.id FROM chat_messages AS latest"
+            "   WHERE latest.channel_id = chat_messages.channel_id"
+            "   AND latest.thread_id IS chat_messages.thread_id"
+            "   AND latest.author_type = 'agent'"
+            "   AND latest.deleted_at IS NULL AND latest.ephemeral = 0"
+            "   ORDER BY latest.created_at DESC, latest.rowid DESC LIMIT 1)",
+            (content, time.time(), message_id),
+        )
+        await self._db.commit()
+        return cursor.rowcount == 1
+
     async def set_metadata(self, message_id: str, metadata: dict) -> None:
         await self._db.execute(
             "UPDATE chat_messages SET metadata = ? WHERE id = ?",
             (json.dumps(metadata), message_id),
         )
         await self._db.commit()
+
+    async def append_content_block(self, message_id: str, block: dict) -> list | None:
+        """Append a single content block to a message's ``content_blocks`` JSON array.
+
+        Returns the updated blocks list, or None if the message was not found.
+
+        The append happens in a single UPDATE so it is atomic. Reading the array
+        into Python, appending and writing it back lets two concurrent appends
+        interleave, and the loser is dropped with no error and no log line.
+        """
+        async with self._content_lock:
+            cursor = await self._db.execute(
+                "UPDATE chat_messages SET content_blocks = json_insert("
+                "  CASE WHEN content_blocks IS NULL OR content_blocks = '' THEN '[]'"
+                "       ELSE content_blocks END,"
+                "  '$[#]', json(?)"
+                ") WHERE id = ?",
+                (json.dumps(block), message_id),
+            )
+            if cursor.rowcount == 0:
+                return None
+            await self._db.commit()
+            async with self._db.execute(
+                "SELECT content_blocks FROM chat_messages WHERE id = ?", (message_id,)
+            ) as read_cursor:
+                row = await read_cursor.fetchone()
+            if row is None:
+                return None
+            return json.loads(row[0]) if row[0] else []
+
+    async def extend_content_blocks(self, message_id: str, blocks: list, cap: int = 50) -> list:
+        """Atomically extend a message's content_blocks with new blocks, respecting a cap.
+
+        Existing blocks are kept first; new blocks are appended until the total
+        reaches ``cap``. Any excess new blocks are dropped.
+
+        Returns the resulting content_blocks list.
+
+        This method holds ``self._content_lock`` for the duration of the read-
+        modify-write sequence, so it cannot interleave with ``append_content_block``.
+        """
+        async with self._content_lock:
+            # Read current content_blocks
+            async with self._db.execute(
+                "SELECT content_blocks FROM chat_messages WHERE id = ?", (message_id,)
+            ) as cursor:
+                row = await cursor.fetchone()
+            current = []
+            if row and row[0]:
+                try:
+                    parsed = json.loads(row[0])
+                    if isinstance(parsed, list):
+                        current = parsed
+                except (json.JSONDecodeError, TypeError):
+                    # If we can't parse or it's not a list, treat as empty
+                    pass
+            # Determine how many new blocks we can add without exceeding cap
+            available = cap - len(current)
+            if available < 0:
+                available = 0
+            to_add = blocks[:available]
+            new_blocks = current + to_add
+            # Write back
+            await self._db.execute(
+                "UPDATE chat_messages SET content_blocks = ? WHERE id = ?",
+                (json.dumps(new_blocks), message_id),
+            )
+            await self._db.commit()
+            return new_blocks
 
     async def soft_delete_message(self, message_id: str) -> bool:
         """Mark message as soft-deleted; returns True if a row was updated."""
@@ -566,6 +718,13 @@ class ChatMessageStore(BaseStore):
         )
         await self._db.commit()
 
+    async def update_content_blocks(self, message_id: str, blocks: list | None) -> None:
+        await self._db.execute(
+            "UPDATE chat_messages SET content_blocks = ? WHERE id = ?",
+            (json.dumps(blocks or []), message_id),
+        )
+        await self._db.commit()
+
     async def pin_message(self, channel_id: str, message_id: str, pinned_by: str) -> None:
         """Pin a message in a channel. Idempotent. Raises ValueError if pin cap
         (50) would be exceeded by a new pin."""
@@ -629,11 +788,19 @@ class ChatMessageStore(BaseStore):
         channel_id: str | None = None,
         author_id: str | None = None,
         limit: int = 50,
+        *,
+        channel_ids: list[str] | None = None,
     ) -> list[dict]:
         pattern = f"%{query}%"
         conditions = ["content LIKE ?"]
         params: list = [pattern]
-        if channel_id is not None:
+        if channel_ids is not None:
+            if not channel_ids:
+                return []
+            placeholders = ",".join("?" * len(channel_ids))
+            conditions.append(f"channel_id IN ({placeholders})")
+            params.extend(channel_ids)
+        elif channel_id is not None:
             conditions.append("channel_id = ?")
             params.append(channel_id)
         if author_id is not None:
@@ -645,3 +812,152 @@ class ChatMessageStore(BaseStore):
             rows = await cursor.fetchall()
             desc = cursor.description
         return [_parse(r, desc) for r in rows]
+
+    async def mark_delivered(
+        self, message_id: str, reader_id: str, reader_type: str = "agent"
+    ) -> dict | None:
+        """Mark a message as delivered to a reader.
+        
+        Upserts the receipt row. First timestamp wins — never overwrites a non-null value.
+        Returns the row dict only when something changed, else None.
+        """
+        # First check if the message exists
+        msg = await self.get_message(message_id)
+        if msg is None:
+            return None
+        
+        now = time.time()
+        # Try to insert first
+        cursor = await self._db.execute(
+            """INSERT OR IGNORE INTO chat_receipts
+               (message_id, reader_id, reader_type, delivered_at)
+               VALUES (?, ?, ?, ?)""",
+            (message_id, reader_id, reader_type, now),
+        )
+        await self._db.commit()
+        
+        if cursor.rowcount == 1:
+            # New row inserted
+            return {
+                "message_id": message_id,
+                "reader_id": reader_id,
+                "reader_type": reader_type,
+                "delivered_at": now,
+                "seen_at": None,
+            }
+        
+        # Row exists — check if delivered_at is null and update it
+        async with self._db.execute(
+            "SELECT delivered_at, seen_at FROM chat_receipts WHERE message_id = ? AND reader_id = ?",
+            (message_id, reader_id),
+        ) as cursor:
+            row = await cursor.fetchone()
+        
+        if row and row[0] is None:
+            # delivered_at is null, update it
+            await self._db.execute(
+                "UPDATE chat_receipts SET delivered_at = ? WHERE message_id = ? AND reader_id = ?",
+                (now, message_id, reader_id),
+            )
+            await self._db.commit()
+            return {
+                "message_id": message_id,
+                "reader_id": reader_id,
+                "reader_type": reader_type,
+                "delivered_at": now,
+                "seen_at": row[1],
+            }
+        
+        return None
+
+    async def mark_seen(
+        self, message_id: str, reader_id: str, reader_type: str = "agent"
+    ) -> dict | None:
+        """Mark a message as seen by a reader.
+        
+        Upserts the receipt row. First timestamp wins — never overwrites a non-null value.
+        Also fills delivered_at when null. Returns the row dict only when something changed, else None.
+        """
+        # First check if the message exists
+        msg = await self.get_message(message_id)
+        if msg is None:
+            return None
+        
+        now = time.time()
+        # Try to insert first
+        cursor = await self._db.execute(
+            """INSERT OR IGNORE INTO chat_receipts
+               (message_id, reader_id, reader_type, delivered_at, seen_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            (message_id, reader_id, reader_type, now, now),
+        )
+        await self._db.commit()
+        
+        if cursor.rowcount == 1:
+            # New row inserted with both timestamps
+            return {
+                "message_id": message_id,
+                "reader_id": reader_id,
+                "reader_type": reader_type,
+                "delivered_at": now,
+                "seen_at": now,
+            }
+        
+        # Row exists — check what needs updating
+        async with self._db.execute(
+            "SELECT delivered_at, seen_at FROM chat_receipts WHERE message_id = ? AND reader_id = ?",
+            (message_id, reader_id),
+        ) as cursor:
+            row = await cursor.fetchone()
+        
+        if row is None:
+            return None
+        
+        current_delivered, current_seen = row
+        updates = []
+        params = []
+        
+        if current_delivered is None:
+            updates.append("delivered_at = ?")
+            params.append(now)
+        if current_seen is None:
+            updates.append("seen_at = ?")
+            params.append(now)
+        
+        if not updates:
+            return None
+        
+        params.extend([message_id, reader_id])
+        await self._db.execute(
+            f"UPDATE chat_receipts SET {', '.join(updates)} WHERE message_id = ? AND reader_id = ?",
+            tuple(params),
+        )
+        await self._db.commit()
+        
+        return {
+            "message_id": message_id,
+            "reader_id": reader_id,
+            "reader_type": reader_type,
+            "delivered_at": now if current_delivered is None else current_delivered,
+            "seen_at": now if current_seen is None else current_seen,
+        }
+
+    async def get_receipts(self, message_id: str) -> list[dict]:
+        """Get all receipts for a message."""
+        async with self._db.execute(
+            "SELECT message_id, reader_id, reader_type, delivered_at, seen_at "
+            "FROM chat_receipts WHERE message_id = ?",
+            (message_id,),
+        ) as cursor:
+            rows = await cursor.fetchall()
+        
+        return [
+            {
+                "message_id": row[0],
+                "reader_id": row[1],
+                "reader_type": row[2],
+                "delivered_at": row[3],
+                "seen_at": row[4],
+            }
+            for row in rows
+        ]

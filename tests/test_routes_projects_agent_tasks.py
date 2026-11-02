@@ -64,7 +64,7 @@ async def _new_task(ctx, pid, title="T"):
     return resp.json()["id"]
 
 
-async def _mint_agent(ctx, project_id, scopes=("project_tasks",)):
+async def _mint_agent(ctx, project_id, scopes=("project_tasks",), handle="@grok"):
     registry = ctx.app.state.agent_registry
     grants = ctx.app.state.agent_grants
     priv, _pub = ctx.app.state.agent_registry_keypair
@@ -72,7 +72,7 @@ async def _mint_agent(ctx, project_id, scopes=("project_tasks",)):
         framework="grok",
         display_name="Grok",
         origin="external-selfjoin",
-        handle="@grok",
+        handle=handle,
     )
     cid = rec["canonical_id"]
     await registry.set_status(cid, "active")
@@ -172,6 +172,8 @@ class TestAgentCanDriveOwnBoard:
             )
         assert resp.status_code == 200, resp.text
         assert resp.json()["priority"] == 7
+        after = await ctx.client.get(f"/api/projects/{pid}/tasks/{tid}")
+        assert after.json()["priority"] == 7
 
     async def test_lead_agent_patch_labels_succeeds(self, ctx):
         pid = await _new_project(ctx, "alpha")
@@ -187,6 +189,8 @@ class TestAgentCanDriveOwnBoard:
             )
         assert resp.status_code == 200, resp.text
         assert resp.json()["labels"] == ["bug", "urgent"]
+        after = await ctx.client.get(f"/api/projects/{pid}/tasks/{tid}")
+        assert after.json()["labels"] == ["bug", "urgent"]
 
     async def test_lead_agent_patch_title_succeeds(self, ctx):
         pid = await _new_project(ctx, "alpha")
@@ -202,6 +206,8 @@ class TestAgentCanDriveOwnBoard:
             )
         assert resp.status_code == 200, resp.text
         assert resp.json()["title"] == "renamed by agent"
+        after = await ctx.client.get(f"/api/projects/{pid}/tasks/{tid}")
+        assert after.json()["title"] == "renamed by agent"
 
     async def test_agent_patch_assignee_id_rejected(self, ctx):
         """assignee_id stays human-only: an agent PATCH of it -> 403."""
@@ -232,6 +238,67 @@ class TestAgentCanDriveOwnBoard:
                 headers=_hdr(token),
             )
         assert resp.status_code == 403
+
+    async def test_agent_patch_null_assignee_rejected(self, ctx):
+        """An explicit null is a WRITE (it clears the column, tsk-5xq2mw), so the
+        agent whitelist must refuse it exactly like a non-null value -> 403.
+        Keyed on which fields the caller SENT, not on their value."""
+        pid = await _new_project(ctx, "alpha")
+        tid = await _new_task(ctx, pid)
+        cid, token = await _mint_agent(ctx, pid, scopes=("project_tasks_update",))
+        await ctx.app.state.project_store.add_member(pid, cid, "native")
+        await ctx.app.state.project_store.set_lead(pid, cid)
+        await ctx.client.patch(
+            f"/api/projects/{pid}/tasks/{tid}", json={"assignee_id": "worker-1"}
+        )
+        async with _bare(ctx.app) as bare:
+            resp = await bare.patch(
+                f"/api/projects/{pid}/tasks/{tid}",
+                json={"assignee_id": None},
+                headers=_hdr(token),
+            )
+            assert resp.status_code == 403, resp.text
+        # Re-read as the admin session: this token carries project_tasks_update
+        # only, which does not authorize a read.
+        after = await ctx.client.get(f"/api/projects/{pid}/tasks/{tid}")
+        assert after.json()["assignee_id"] == "worker-1"
+
+    async def test_agent_patch_null_parent_rejected(self, ctx):
+        """Same for parent_task_id: clearing a hierarchy stays human-only."""
+        pid = await _new_project(ctx, "alpha")
+        parent = await _new_task(ctx, pid, title="Parent")
+        tid = await _new_task(ctx, pid)
+        cid, token = await _mint_agent(ctx, pid, scopes=("project_tasks_update",))
+        await ctx.app.state.project_store.add_member(pid, cid, "native")
+        await ctx.app.state.project_store.set_lead(pid, cid)
+        await ctx.client.patch(
+            f"/api/projects/{pid}/tasks/{tid}", json={"parent_task_id": parent}
+        )
+        async with _bare(ctx.app) as bare:
+            resp = await bare.patch(
+                f"/api/projects/{pid}/tasks/{tid}",
+                json={"parent_task_id": None},
+                headers=_hdr(token),
+            )
+            assert resp.status_code == 403, resp.text
+        after = await ctx.client.get(f"/api/projects/{pid}/tasks/{tid}")
+        assert after.json()["parent_task_id"] == parent
+
+    async def test_agent_patch_unknown_field_is_422(self, ctx):
+        """A field this route cannot write is refused, not answered 200 with an
+        unchanged task (tsk-5xq2mw)."""
+        pid = await _new_project(ctx, "alpha")
+        tid = await _new_task(ctx, pid)
+        cid, token = await _mint_agent(ctx, pid, scopes=("project_tasks_update",))
+        await ctx.app.state.project_store.add_member(pid, cid, "native")
+        await ctx.app.state.project_store.set_lead(pid, cid)
+        async with _bare(ctx.app) as bare:
+            resp = await bare.patch(
+                f"/api/projects/{pid}/tasks/{tid}",
+                json={"created_by": "someone-else"},
+                headers=_hdr(token),
+            )
+        assert resp.status_code == 422, resp.text
 
     async def test_non_lead_agent_patch_rejected(self, ctx):
         """An agent that neither created nor leads the project cannot PATCH
@@ -296,6 +363,12 @@ class TestAgentCanDriveOwnBoard:
         tid = await _new_task(ctx, pid)
         cid, token = await _mint_agent(ctx, pid)
         async with _bare(ctx.app) as bare:
+            claim = await bare.post(
+                f"/api/projects/{pid}/tasks/{tid}/claim",
+                json={"claimer_id": cid},
+                headers=_hdr(token),
+            )
+            assert claim.status_code == 200
             resp = await bare.post(
                 f"/api/projects/{pid}/tasks/{tid}/close",
                 json={"closed_by": cid},
@@ -391,6 +464,63 @@ class TestActorBinding:
                 headers=_hdr(token),
             )
         assert resp.status_code == 403
+
+    async def test_agent_cannot_close_unclaimed_card_it_did_not_author(self, ctx):
+        pid = await _new_project(ctx, "alpha")
+        tid = await _new_task(ctx, pid)
+        cid, token = await _mint_agent(ctx, pid)
+        async with _bare(ctx.app) as bare:
+            resp = await bare.post(
+                f"/api/projects/{pid}/tasks/{tid}/close",
+                json={"closed_by": cid},
+                headers=_hdr(token),
+            )
+        assert resp.status_code == 403
+        check = await ctx.client.get(f"/api/projects/{pid}/tasks/{tid}")
+        assert check.status_code == 200
+        assert check.json()["status"] == "open"
+
+    async def test_author_agent_closes_own_unclaimed_card(self, ctx):
+        """An agent may close an unclaimed card it authored (created_by matches
+        the agent's canonical id). The card is created directly via the store
+        so created_by is the agent id, not the session user."""
+        pid = await _new_project(ctx, "alpha")
+        cid, token = await _mint_agent(ctx, pid)
+        store = ctx.app.state.project_task_store
+        task = await store.create_task(
+            project_id=pid,
+            title="authored by agent",
+            created_by=cid,
+        )
+        tid = task["id"]
+        async with _bare(ctx.app) as bare:
+            resp = await bare.post(
+                f"/api/projects/{pid}/tasks/{tid}/close",
+                json={"closed_by": cid},
+                headers=_hdr(token),
+            )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["status"] == "closed"
+        assert resp.json()["closed_by"] == cid
+
+    async def test_agent_closes_unclaimed_card_after_claiming_it(self, ctx):
+        pid = await _new_project(ctx, "alpha")
+        tid = await _new_task(ctx, pid)
+        cid, token = await _mint_agent(ctx, pid)
+        async with _bare(ctx.app) as bare:
+            claim = await bare.post(
+                f"/api/projects/{pid}/tasks/{tid}/claim",
+                json={"claimer_id": cid},
+                headers=_hdr(token),
+            )
+            assert claim.status_code == 200
+            resp = await bare.post(
+                f"/api/projects/{pid}/tasks/{tid}/close",
+                json={"closed_by": cid},
+                headers=_hdr(token),
+            )
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "closed"
 
     async def test_comment_as_someone_else_is_403(self, ctx):
         """Invariant 3: a comment author is an actor id; an agent may not post a
@@ -530,6 +660,166 @@ class TestSessionRegression:
         assert close.status_code == 200
         assert close.json()["status"] == "closed"
 
+    async def test_admin_session_closes_agent_claimed_card_lead_is_agent(self, ctx):
+        """Issue #2191 repro: the board lead is an AGENT registry id, so a
+        session admin's actor id (a USER id) can never equal lead_member_id.
+        The ownership guard's force bypass must cover owner + session admin,
+        not just the lead, or every admin-session close of an agent-claimed
+        card returns 409."""
+        pid = await _new_project(ctx, "alpha")
+        tid = await _new_task(ctx, pid)
+        lead_cid, _lead_token = await _mint_agent(ctx, pid, handle="@lead")
+        pstore = ctx.app.state.project_store
+        await pstore.add_member(pid, lead_cid, "native")
+        await pstore.set_lead(pid, lead_cid)
+        # A different lane agent claims the card.
+        lane_cid, lane_token = await _mint_agent(ctx, pid, handle="@lane")
+        async with _bare(ctx.app) as bare:
+            claim = await bare.post(
+                f"/api/projects/{pid}/tasks/{tid}/claim",
+                json={"claimer_id": lane_cid},
+                headers=_hdr(lane_token),
+            )
+        assert claim.status_code == 200, claim.text
+        assert claim.json()["claimed_by"] == lane_cid
+        # The admin session closes it, recording the closer as its own user id.
+        close = await ctx.client.post(
+            f"/api/projects/{pid}/tasks/{tid}/close",
+            json={"closed_by": ctx.uid},
+        )
+        assert close.status_code == 200, close.text
+        assert close.json()["status"] == "closed"
+        assert close.json()["closed_by"] == ctx.uid
+
+    async def test_lead_agent_closes_other_agents_card(self, ctx):
+        """Control (merge-gate path): the lead-agent bypass is preserved — a
+        lead agent still force-closes a card claimed by a different lane
+        agent."""
+        pid = await _new_project(ctx, "alpha")
+        tid = await _new_task(ctx, pid)
+        lead_cid, lead_token = await _mint_agent(ctx, pid, handle="@lead")
+        pstore = ctx.app.state.project_store
+        await pstore.add_member(pid, lead_cid, "native")
+        await pstore.set_lead(pid, lead_cid)
+        lane_cid, lane_token = await _mint_agent(ctx, pid, handle="@lane")
+        async with _bare(ctx.app) as bare:
+            claim = await bare.post(
+                f"/api/projects/{pid}/tasks/{tid}/claim",
+                json={"claimer_id": lane_cid},
+                headers=_hdr(lane_token),
+            )
+            assert claim.status_code == 200, claim.text
+            close = await bare.post(
+                f"/api/projects/{pid}/tasks/{tid}/close",
+                json={"closed_by": lead_cid},
+                headers=_hdr(lead_token),
+            )
+        assert close.status_code == 200, close.text
+        assert close.json()["status"] == "closed"
+        assert close.json()["closed_by"] == lead_cid
+
+    async def test_lead_agent_closes_unclaimed_card(self, ctx):
+        """A lead agent may close an unclaimed card it did not author."""
+        pid = await _new_project(ctx, "alpha")
+        tid = await _new_task(ctx, pid)
+        lead_cid, lead_token = await _mint_agent(ctx, pid, handle="@lead")
+        pstore = ctx.app.state.project_store
+        await pstore.add_member(pid, lead_cid, "native")
+        await pstore.set_lead(pid, lead_cid)
+        async with _bare(ctx.app) as bare:
+            resp = await bare.post(
+                f"/api/projects/{pid}/tasks/{tid}/close",
+                json={"closed_by": lead_cid},
+                headers=_hdr(lead_token),
+            )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["status"] == "closed"
+        assert resp.json()["closed_by"] == lead_cid
+
+    async def test_admin_session_closes_unclaimed_card(self, ctx):
+        """A session admin may close an unclaimed card authored by another agent."""
+        pid = await _new_project(ctx, "alpha")
+        author_cid, author_token = await _mint_agent(
+            ctx, pid, scopes=("project_tasks_create",), handle="@author"
+        )
+        async with _bare(ctx.app) as bare:
+            create = await bare.post(
+                f"/api/projects/{pid}/tasks",
+                json={"title": "authored by @author"},
+                headers=_hdr(author_token),
+            )
+        assert create.status_code == 200, create.text
+        tid = create.json()["id"]
+        resp = await ctx.client.post(
+            f"/api/projects/{pid}/tasks/{tid}/close",
+            json={"closed_by": ctx.uid},
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["status"] == "closed"
+        assert resp.json()["closed_by"] == ctx.uid
+
+    async def test_non_author_agent_cannot_close_unclaimed_card(self, ctx):
+        """A plain member agent (not the author, not the lead) may not close an
+        unclaimed card authored by a different agent."""
+        pid = await _new_project(ctx, "alpha")
+        author_cid, author_token = await _mint_agent(
+            ctx, pid, scopes=("project_tasks_create",), handle="@author"
+        )
+        async with _bare(ctx.app) as bare:
+            create = await bare.post(
+                f"/api/projects/{pid}/tasks",
+                json={"title": "authored by @author"},
+                headers=_hdr(author_token),
+            )
+        assert create.status_code == 200, create.text
+        tid = create.json()["id"]
+        _member_cid, member_token = await _mint_agent(ctx, pid)
+        async with _bare(ctx.app) as bare:
+            resp = await bare.post(
+                f"/api/projects/{pid}/tasks/{tid}/close",
+                json={"closed_by": _member_cid},
+                headers=_hdr(member_token),
+            )
+        assert resp.status_code == 403, resp.text
+        assert "only the card's author" in resp.text
+
+    async def test_admin_session_closes_unclaimed_card_bypass_isolated_from_authorship(self, ctx):
+        """Admin bypass for closing unclaimed cards is isolated from authorship:
+        create the card with created_by set to someone-else, then the admin
+        session closes it -> 200. This proves the bypass does not depend on
+        the admin being the author."""
+        pid = await _new_project(ctx, "alpha")
+        store = ctx.app.state.project_task_store
+        task = await store.create_task(
+            project_id=pid,
+            title="authored by someone else",
+            created_by="someone-else",
+        )
+        tid = task["id"]
+        resp = await ctx.client.post(
+            f"/api/projects/{pid}/tasks/{tid}/close",
+            json={"closed_by": ctx.uid},
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["status"] == "closed"
+        assert resp.json()["closed_by"] == ctx.uid
+
+    async def test_admin_session_closes_unclaimed_card_in_project_it_does_not_own(self, ctx):
+        pstore = ctx.app.state.project_store
+        project = await pstore.create_project(
+            name="foreign", slug="foreign", created_by="other-owner", user_id="other-owner"
+        )
+        pid = project["id"]
+        task = await ctx.app.state.project_task_store.create_task(
+            project_id=pid, title="authored by someone else", created_by="someone-else"
+        )
+        resp = await ctx.client.post(
+            f"/api/projects/{pid}/tasks/{task['id']}/close",
+            json={"closed_by": ctx.uid},
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["status"] == "closed"
+
     async def test_unauthenticated_still_401(self, ctx):
         pid = await _new_project(ctx, "alpha")
         async with _bare(ctx.app) as bare:
@@ -656,6 +946,103 @@ class TestLeadAgentMarkClaimable:
         assert resp.status_code == 200, resp.text
         labels = resp.json()["labels"]
         assert "claimable" in labels and "urgent" in labels
+
+    @staticmethod
+    def _is_selectable(task):
+        labels = task.get("labels") or []
+        claimer_id = task.get("claimed_by")
+        return (
+            task.get("status") in ("open", "todo", "ready", "backlog")
+            and claimer_id is None
+            and ("claimable" in labels or "fleet:claimable" in labels)
+        )
+
+    async def test_revoke_dual_claimable_labels_makes_task_not_selectable(self, ctx):
+        """Revoking a task carrying both claimable and fleet:claimable strips both
+        labels, so the dispatcher can no longer select it."""
+        pid = await _new_project(ctx, "claimable-dual-revoke")
+        tid = await _new_task(ctx, pid)
+        cid, token = await _mint_agent(ctx, pid)
+        await ctx.app.state.project_store.add_member(pid, cid, "native")
+        await ctx.app.state.project_store.set_lead(pid, cid)
+        async with _bare(ctx.app) as bare:
+            await bare.post(
+                f"/api/projects/{pid}/tasks/{tid}/claimable",
+                json={"claimable": True},
+                headers=_hdr(token),
+            )
+            await ctx.client.patch(
+                f"/api/projects/{pid}/tasks/{tid}",
+                json={"labels": ["claimable", "fleet:claimable"]},
+            )
+            revoke = await bare.post(
+                f"/api/projects/{pid}/tasks/{tid}/claimable",
+                json={"claimable": False},
+                headers=_hdr(token),
+            )
+        assert revoke.status_code == 200, revoke.text
+        assert not self._is_selectable(revoke.json())
+
+    async def test_revoke_claimable_only_makes_task_not_selectable(self, ctx):
+        """Revoking a task carrying only the bare claimable label removes it."""
+        pid = await _new_project(ctx, "claimable-single-revoke")
+        tid = await _new_task(ctx, pid)
+        cid, token = await _mint_agent(ctx, pid)
+        await ctx.app.state.project_store.add_member(pid, cid, "native")
+        await ctx.app.state.project_store.set_lead(pid, cid)
+        async with _bare(ctx.app) as bare:
+            await bare.post(
+                f"/api/projects/{pid}/tasks/{tid}/claimable",
+                json={"claimable": True},
+                headers=_hdr(token),
+            )
+            revoke = await bare.post(
+                f"/api/projects/{pid}/tasks/{tid}/claimable",
+                json={"claimable": False},
+                headers=_hdr(token),
+            )
+        assert revoke.status_code == 200, revoke.text
+        assert not self._is_selectable(revoke.json())
+
+    async def test_revoke_fleet_claimable_only_makes_task_not_selectable(self, ctx):
+        """Revoking a task carrying only fleet:claimable removes it even though the
+        bare claimable label is absent. The old handler early-returned in this case."""
+        pid = await _new_project(ctx, "claimable-fleet-only-revoke")
+        tid = await _new_task(ctx, pid)
+        cid, token = await _mint_agent(ctx, pid)
+        await ctx.app.state.project_store.add_member(pid, cid, "native")
+        await ctx.app.state.project_store.set_lead(pid, cid)
+        async with _bare(ctx.app) as bare:
+            await ctx.client.patch(
+                f"/api/projects/{pid}/tasks/{tid}",
+                json={"labels": ["fleet:claimable"]},
+            )
+            revoke = await bare.post(
+                f"/api/projects/{pid}/tasks/{tid}/claimable",
+                json={"claimable": False},
+                headers=_hdr(token),
+            )
+        assert revoke.status_code == 200, revoke.text
+        assert not self._is_selectable(revoke.json())
+
+    async def test_grant_claimable_adds_only_claimable(self, ctx):
+        """Granting claimable on a bare task adds only the bare claimable label,
+        never fleet:claimable."""
+        pid = await _new_project(ctx, "claimable-grant-only")
+        tid = await _new_task(ctx, pid)
+        cid, token = await _mint_agent(ctx, pid)
+        await ctx.app.state.project_store.add_member(pid, cid, "native")
+        await ctx.app.state.project_store.set_lead(pid, cid)
+        async with _bare(ctx.app) as bare:
+            resp = await bare.post(
+                f"/api/projects/{pid}/tasks/{tid}/claimable",
+                json={"claimable": True},
+                headers=_hdr(token),
+            )
+        assert resp.status_code == 200, resp.text
+        labels = resp.json()["labels"]
+        assert "claimable" in labels
+        assert "fleet:claimable" not in labels
 
     async def test_session_owner_marks_claimable(self, ctx):
         pid = await _new_project(ctx, "claimable-owner")

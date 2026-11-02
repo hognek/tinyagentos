@@ -7,6 +7,7 @@ import {
   previewTheme,
   revertPreview,
   keepTheme,
+  APP_TYPE_INDICATOR_OPTIONS,
 } from "@/stores/theme-store";
 import { useTaosAgentStore } from "@/stores/taos-agent-store";
 import { BUILTIN_THEMES } from "@/theme/builtin-themes";
@@ -22,15 +23,23 @@ const EMPTY_CONFIG: ThemeConfig = { tokens: {}, structure: {}, effects: [], requ
 
 export function ThemesPanel() {
   const [themes, setThemes] = useState<InstalledTheme[]>([]);
+  const [error, setError] = useState<string | null>(null);
   const [previewId, setPreviewId] = useState<string | null>(null);
   const [priorConfig, setPriorConfig] = useState<ThemeConfig>(EMPTY_CONFIG);
 
   const activeThemeId = useThemeStore((s) => s.activeThemeId);
+  const appTypeIndicator = useThemeStore((s) => s.appTypeIndicator);
+  const setAppTypeIndicator = useThemeStore((s) => s.setAppTypeIndicator);
   const openPanel = useTaosAgentStore((s) => s.openPanel);
 
   useEffect(() => {
     fetch("/api/themes", { credentials: "include" })
-      .then((r) => (r.ok ? r.json() : []))
+      .then((r) => {
+        if (!r.ok) {
+          throw new Error(`${r.status} ${r.statusText}`);
+        }
+        return r.json();
+      })
       .then((data: InstalledTheme[]) => {
         const installed = Array.isArray(data) ? data : [];
         const builtinIds = new Set(BUILTIN_THEMES.map((b) => b.theme_id));
@@ -41,6 +50,7 @@ export function ThemesPanel() {
         setThemes(merged);
       })
       .catch(() => {
+        setError("Could not load installed themes. Showing built-in themes.");
         setThemes([...BUILTIN_THEMES]);
       });
   }, []);
@@ -84,6 +94,11 @@ export function ThemesPanel() {
       </div>
 
       <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
+        {error && (
+          <p role="alert" className="text-xs text-amber-400 col-span-full">
+            {error}
+          </p>
+        )}
         {themes.map((theme) => {
           const isActive = theme.theme_id === activeThemeId;
           const isPreviewing = theme.theme_id === previewId;
@@ -122,6 +137,37 @@ export function ThemesPanel() {
             No themes installed yet.
           </p>
         )}
+      </div>
+
+      <div className="mt-5">
+        <h3 className="text-sm font-medium text-shell-text-secondary mb-2">App type indicators</h3>
+        <div
+          role="radiogroup"
+          aria-label="App type indicators"
+          className="flex items-center rounded-full border border-shell-border bg-shell-surface p-[3px]"
+        >
+          {APP_TYPE_INDICATOR_OPTIONS.map((option) => (
+            <button
+              key={option}
+              type="button"
+              role="radio"
+              aria-checked={appTypeIndicator === option}
+              aria-label={option === "badge" ? "Badges" : option === "outline" ? "Outlines" : "Off"}
+              onClick={() => setAppTypeIndicator(option)}
+              className={[
+                "flex items-center gap-1.5 rounded-full px-2.5 py-1 text-[10.5px] font-semibold transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/40",
+                appTypeIndicator === option
+                  ? "bg-shell-surface-active text-shell-text"
+                  : "text-shell-text-secondary hover:text-shell-text",
+              ].join(" ")}
+            >
+              {option === "badge" ? "Badges" : option === "outline" ? "Outlines" : "Off"}
+            </button>
+          ))}
+        </div>
+        <p className="mt-1.5 text-xs text-shell-text-tertiary">
+          Show whether an app is a taOS, Linux, Android, web, container or agent-built app.
+        </p>
       </div>
 
       {previewId && (

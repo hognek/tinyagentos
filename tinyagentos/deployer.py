@@ -25,6 +25,12 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from tinyagentos.secrets import SecretsStore
 
+# Per-framework AGENTS.md path inside the agent's container. Frameworks read
+# this file on every turn to pick up agent rules (per the taosmd contract —
+# see issue #378). It is defined in ``agent_git`` because the versioned scope
+# of the agent state repo derives from it; re-exported here under the name
+# callers have always used.
+from tinyagentos.agent_git import AGENTS_MD_PATHS
 from tinyagentos.agent_image import (
     GENERIC_BASE_ALIAS,
     base_image_alias,
@@ -35,6 +41,7 @@ from tinyagentos.containers import (
     start_container, stop_container, destroy_container,
     add_proxy_device,
 )
+from tinyagentos.llm_proxy import EMBEDDING_ALIAS
 
 logger = logging.getLogger(__name__)
 
@@ -102,13 +109,8 @@ _TAOSMD_END = "<!-- taosmd:rules-end -->"
 # that do not match are skipped rather than written outside ~/.ssh.
 _SAFE_SSH_KEY_NAME = re.compile(r"^[A-Za-z0-9._-]+$")
 
-# Per-framework AGENTS.md path inside the agent's container.
-# Frameworks read this file on every turn to pick up agent rules
-# (per the taosmd contract — see issue #378).
-AGENTS_MD_PATHS: dict[str, str] = {
-    "openclaw": "/root/.openclaw/AGENTS.md",
-    "hermes": "/root/.hermes/AGENTS.md",
-}
+# Auto-committer pushed into every agent container (deploy step 4c).
+_COMMITTER_SCRIPT = Path(__file__).parent / "scripts" / "agent_committer.py"
 
 
 def _splice_taosmd_block(existing: str, new_rules: str) -> str:
@@ -169,6 +171,75 @@ class DeployRequest:
     # the container environment. Optional (None) so existing callers/tests
     # are unaffected. Typed loosely to avoid a runtime import cycle.
     secrets_store: "SecretsStore | None" = None
+    # Memory mode: "both" (default), "framework" (native only), "taosmd"
+    # (taOSmd only). Injected as TAOS_MEMORY_MODE so the framework runtime
+    # can honour it at turn boundaries without a separate config push.
+    memory_mode: str = "both"
+    # Registry JWT for the deployed agent (owner user_id + memory_read only).
+    # When non-empty, injected as TAOS_AGENT_TOKEN into the container env.
+    # Additive: TAOS_LOCAL_TOKEN is unchanged.
+    agent_token: str = ""
+
+
+# Where an agent container reaches its LLM: its OWN loopback, port 4000, the
+# listen side of the ``taos-proxy-litellm`` incus proxy device (whose host
+# side is the gateway's agent listener). Never the host's ``litellm_port``:
+# that is a host port the container cannot see (7834 on fresh installs).
+AGENT_LLM_BASE_URL = "http://127.0.0.1:4000"
+AGENT_LLM_LISTEN_PORT = 4000
+
+
+def _gateway_port_for(req: DeployRequest) -> int:
+    """The verified LLM gateway agent-listener port for a LOCAL deploy, or 0.
+
+    Non-zero only when the caller passed the port of a listener this start
+    verified (``extra_config["llm_gateway_port"]``, set from ``app.state``).
+    Remote workers have no proxy device, so always 0.
+    """
+    if req.remote:
+        return 0
+    try:
+        return int((req.extra_config or {}).get("llm_gateway_port") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _agent_controller_port_for(req: DeployRequest) -> int:
+    """The verified agent controller listener port for a LOCAL deploy, or 0.
+
+    Non-zero only when the caller passed the port of a listener this start
+    verified (``extra_config["agent_controller_port"]``, set from ``app.state``).
+    """
+    try:
+        return int((req.extra_config or {}).get("agent_controller_port") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _mint_local_scoped_key(req: DeployRequest, models: list[str]) -> str | None:
+    """A scoped per-agent key straight from the local key store."""
+    from tinyagentos.litellm_keystore import LiteLLMKeyStore, default_keystore_path
+    from tinyagentos.llm_proxy import scoped_key_models
+
+    try:
+        return LiteLLMKeyStore(default_keystore_path(req.data_dir)).mint(
+            req.name, scoped_key_models(models or None)
+        )
+    except Exception as exc:  # noqa: BLE001 - reported by the caller
+        logger.warning("deploy %s: local key store mint failed: %s", req.name, exc)
+        return None
+
+
+def _mint_gateway_key_for(req: DeployRequest, llm_key: str) -> bool:
+    """Mint this agent's gateway key from its key-store row; True when live."""
+    from tinyagentos.litellm_keystore import LiteLLMKeyStore, default_keystore_path
+
+    try:
+        store = LiteLLMKeyStore(default_keystore_path(req.data_dir))
+        return store.mint_mirror(req.name, llm_key) is not None and store.live_mirror(req.name, llm_key)
+    except Exception as exc:  # noqa: BLE001 - the plain key still works
+        logger.warning("deploy %s: gateway key mint failed: %s", req.name, exc)
+        return False
 
 
 async def deploy_agent(req: DeployRequest) -> dict:
@@ -187,6 +258,29 @@ async def deploy_agent(req: DeployRequest) -> dict:
     container_name = f"taos-agent-{req.name}"
     steps = []
 
+    # Decision dec-26f4cw: the gateway's agent listener is loopback-only and a
+    # remote worker has no proxy device, so a remote agent has no LLM path.
+    # Refuse before anything is created rather than hand it a dead URL.
+    if req.remote:
+        from tinyagentos.llm_gateway.cutover import REMOTE_NO_GATEWAY_REASON
+
+        msg = f"remote deploy of {req.name} to {req.remote} refused: {REMOTE_NO_GATEWAY_REASON}"
+        logger.error("deploy %s: %s", req.name, msg)
+        return {"success": False, "error": msg, "steps": steps}
+
+    # The agent's route back to the controller is the dedicated agent
+    # controller listener. Refuse before anything is created if it is not live.
+    agent_controller_port = _agent_controller_port_for(req)
+    if not agent_controller_port:
+        msg = (
+            "the agent controller listener is not verified on this controller "
+            "start (still starting, its port is taken, or it is disabled), so "
+            "the agent would have no route to the controller; retry once the "
+            "controller has finished starting"
+        )
+        logger.error("deploy %s: %s", req.name, msg)
+        return {"success": False, "error": msg, "steps": steps}
+
     # Trace directory on the host — the only host-side path this deployer
     # creates. Layout matches the target for Phase 2.C trace_store migration:
     # {data_dir}/trace/{slug}/ → /root/.taos/trace/ inside container.
@@ -201,102 +295,49 @@ async def deploy_agent(req: DeployRequest) -> dict:
     # Env vars injected at container creation time.
     env: dict[str, str] = {}
 
-    # LLM proxy (LiteLLM).
+    # LLM: the in-process gateway, reached through the agent's proxy device.
+    # The key is minted in the local key store (no process involved); the
+    # gateway authenticates it.
     llm_key = None
+    gateway_port = 0
     if req.extra_config and req.extra_config.get("llm_proxy"):
         proxy = req.extra_config["llm_proxy"]
-        if proxy.is_running():
-            # Scope the virtual key to exactly the models this agent is
-            # allowed to call. An empty list is preserved as empty (not
-            # ["default"]) when the agent was deployed without a model
-            # pick so mint failure isn't masked by an ambient alias.
-            key_models = [m for m in [req.model, *(req.fallback_models or [])] if m]
-            llm_key = await proxy.create_agent_key(req.name, models=key_models or None)
+        gateway_port = _gateway_port_for(req)
+        if not gateway_port:
+            msg = (
+                "the LLM gateway agent listener is not verified on this controller "
+                "start (still starting, its port is taken, or it is disabled), so "
+                "the agent would have no LLM path; retry once the controller has "
+                "finished starting"
+            )
+            logger.error("deploy %s: %s", req.name, msg)
+            return {"success": False, "error": msg, "steps": steps}
+        # Scope the key to exactly the models this agent is allowed to call;
+        # scoped_key_models adds the embedding alias.
+        key_models = [m for m in [req.model, *(req.fallback_models or [])] if m]
+        llm_key = await proxy.create_agent_key(req.name, models=key_models or None)
+        if llm_key is None:
+            llm_key = _mint_local_scoped_key(req, key_models)
             if llm_key is None:
-                # Key mint failed. Two distinct cases, handled differently:
-                #
-                # 1. Routing-only (db_url is None): LiteLLM has no Postgres, so
-                #    virtual keys are simply unavailable (e.g. an ARM box where
-                #    prisma can't start). This is an expected capability gap,
-                #    not a bug. taOS is single-user per instance, so we fall
-                #    back to the shared master key by default and warn loudly;
-                #    a hardened / multi-tenant operator sets
-                #    TAOS_DISABLE_AGENT_MASTER_KEY_FALLBACK=1 to refuse instead.
-                #
-                # 2. DB configured but mint failed (db_url is set): the proxy
-                #    HAS a key store but /key/generate broke (migration pending,
-                #    DB unreachable, master-key drift). That is a real bug. The
-                #    master key would mask it AND ship an unscoped agent, so we
-                #    always refuse here regardless of the env var, directing the
-                #    operator at the misbehaving DB.
-                db_url = getattr(proxy, "database_url", None)
-                if db_url is not None:
-                    db_host = db_url.split("@")[-1] if "@" in db_url else db_url
-                    msg = (
-                        "per-agent LiteLLM virtual key mint failed despite DB "
-                        f"configured at {db_host}. This is a LiteLLM/DB fault "
-                        "(migration pending, DB unreachable, or master-key "
-                        "drift), not a missing-DB capability gap, so the deploy "
-                        "is refused rather than silently using the shared "
-                        "master key. Fix the LiteLLM Postgres connection."
-                    )
-                    logger.error("deploy %s: %s", req.name, msg)
-                    return {"success": False, "error": msg, "steps": steps}
-
-                why = (
-                    "LiteLLM is running in routing-only mode (no Postgres "
-                    "DATABASE_URL configured)"
+                msg = (
+                    "per-agent LLM key could not be minted: the local key store "
+                    "refused (disk full, permission denied, or database locked), "
+                    "so the deploy is refused."
                 )
-                fallback_disabled = os.environ.get(
-                    "TAOS_DISABLE_AGENT_MASTER_KEY_FALLBACK", ""
-                ).strip().lower() in ("1", "true", "yes")
-                if fallback_disabled:
-                    msg = (
-                        f"per-agent LiteLLM virtual key could not be minted: {why}. "
-                        "The master-key fallback is disabled "
-                        "(TAOS_DISABLE_AGENT_MASTER_KEY_FALLBACK is set), so the "
-                        "deploy is refused. Configure a Postgres database for "
-                        "LiteLLM to issue per-agent scoped keys, or unset that "
-                        "variable on a single-user instance."
-                    )
-                    logger.error("deploy %s: %s", req.name, msg)
-                    return {"success": False, "error": msg, "steps": steps}
-
-                from tinyagentos.llm_proxy import get_litellm_master_key
-                llm_key = get_litellm_master_key(req.data_dir)
-                logger.warning(
-                    "deploy %s: %s; falling back to the shared LiteLLM master "
-                    "key. This agent has full LiteLLM admin access. Configure "
-                    "Postgres-backed virtual keys for per-agent isolation, or "
-                    "set TAOS_DISABLE_AGENT_MASTER_KEY_FALLBACK=1 to refuse "
-                    "instead.",
-                    req.name, why,
-                )
-                steps.append(
-                    "llm-key: per-agent virtual key unavailable, using shared "
-                    "master key (no per-agent isolation)"
-                )
-            from tinyagentos.llm_proxy import EMBEDDING_ALIAS
-            # Primary key for openclaw's litellm provider.
-            env["LITELLM_API_KEY"] = llm_key
-            # Compat shim — smolagents and other frameworks still expect OPENAI_API_KEY.
-            env["OPENAI_API_KEY"] = llm_key
-            # A local deploy reaches LiteLLM via the proxy device on the
-            # container's own 127.0.0.1; a remote worker has no proxy device, so
-            # it reaches the controller's LiteLLM over the network at taos_host
-            # (the controller's Tailscale IP) on the host's LiteLLM port.
-            if req.remote:
-                _llm_port = getattr(proxy, "port", None) or 7834
-                _llm_base = f"http://{req.taos_host}:{_llm_port}"
-            else:
-                _llm_base = proxy.url
-            env["OPENAI_BASE_URL"] = f"{_llm_base}/v1"
-            # Host-side embedding endpoint — same LiteLLM process,
-            # OpenAI-compatible /v1/embeddings. Framework-agnostic.
-            env["TAOS_EMBEDDING_URL"] = f"{_llm_base}/v1/embeddings"
-            # Stable alias the host LiteLLM routes to whichever
-            # concrete embedding model the backends actually have loaded.
-            env["TAOS_EMBEDDING_MODEL"] = EMBEDDING_ALIAS
+                logger.error("deploy %s: %s", req.name, msg)
+                return {"success": False, "error": msg, "steps": steps}
+            steps.append("llm-key: scoped key minted in the local key store")
+        # Primary key for openclaw's litellm provider (the env name is read by
+        # framework install scripts and baked into container units; kept).
+        env["LITELLM_API_KEY"] = llm_key
+        # Compat shim — smolagents and other frameworks still expect OPENAI_API_KEY.
+        env["OPENAI_API_KEY"] = llm_key
+        env["OPENAI_BASE_URL"] = f"{AGENT_LLM_BASE_URL}/v1"
+        # Embeddings: the same gateway, OpenAI-compatible /v1/embeddings.
+        env["TAOS_EMBEDDING_URL"] = f"{AGENT_LLM_BASE_URL}/v1/embeddings"
+        # Stable alias the gateway routes to whichever concrete embedding
+        # model the backends actually have loaded.
+        env["TAOS_EMBEDDING_MODEL"] = EMBEDDING_ALIAS
 
     # User memory (optional, permission-gated)
     if req.can_read_user_memory:
@@ -316,6 +357,8 @@ async def deploy_agent(req: DeployRequest) -> dict:
     env["TAOS_AGENT_NAME"] = req.name
     # Home is always /root inside the container (rootfs).
     env["TAOS_AGENT_HOME"] = "/root"
+    # Memory mode: "both" (default), "framework" (native only), "taosmd" (taOSmd only).
+    env["TAOS_MEMORY_MODE"] = req.memory_mode
 
     # Selected model name (always set; empty string when not configured).
     env["TAOS_MODEL"] = req.model or ""
@@ -324,12 +367,22 @@ async def deploy_agent(req: DeployRequest) -> dict:
 
     # Trace capture — local auth token + trace API URL.
     try:
-        local_token_path = req.data_dir / ".auth_local_token"
-        if local_token_path.exists():
-            env["TAOS_LOCAL_TOKEN"] = local_token_path.read_text().strip()
-    except Exception:
-        pass
+        from tinyagentos.auth import AuthManager
+        auth_mgr = AuthManager(req.data_dir)
+        agent_token = auth_mgr.mint_agent_local_token(req.name)
+        env["TAOS_LOCAL_TOKEN"] = agent_token
+    except Exception as exc:
+        logger.error("deploy %s: failed to mint agent local token: %s", req.name, exc)
+        return {
+            "success": False,
+            "error": f"failed to mint agent local token: {exc}",
+            "steps": steps,
+        }
     env["TAOS_TRACE_URL"] = f"http://{req.taos_host}:{req.taos_port}/api/trace"
+
+    # Registry JWT for the deployed agent (additive; TAOS_LOCAL_TOKEN unchanged).
+    if req.agent_token:
+        env["TAOS_AGENT_TOKEN"] = req.agent_token
 
     # Agent-bridge shared token (issue #672 — defense-in-depth auth guard).
     # Generate a per-deployment secret so only the controller (which knows
@@ -340,14 +393,10 @@ async def deploy_agent(req: DeployRequest) -> dict:
     # /root/.openclaw/openclaw.json and /root/.openclaw/env inside the container
     # from these env vars. Bridge URL is how the openclaw service phones home.
     env["TAOS_BRIDGE_URL"] = f"http://{req.taos_host}:{req.taos_port}"
-    # OPENAI_BASE_URL defaults to LiteLLM proxy if no llm_proxy in config. A
-    # remote deploy must target the controller over the network, not the
-    # container's own loopback (there is no proxy device on a worker).
+    # OPENAI_BASE_URL is the agent's own proxy-device address even with no
+    # llm_proxy in the config (remote deploys were refused above).
     if "OPENAI_BASE_URL" not in env:
-        if req.remote:
-            env["OPENAI_BASE_URL"] = f"http://{req.taos_host}:7834/v1"
-        else:
-            env["OPENAI_BASE_URL"] = "http://127.0.0.1:4000/v1"
+        env["OPENAI_BASE_URL"] = f"{AGENT_LLM_BASE_URL}/v1"
     if "OPENAI_API_KEY" not in env:
         env["OPENAI_API_KEY"] = ""
     if "LITELLM_API_KEY" not in env:
@@ -472,22 +521,48 @@ async def deploy_agent(req: DeployRequest) -> dict:
         # its own 127.0.0.1.
         #
         # Each tuple: (device_name, container_listen_port, host_connect_port).
-        # LiteLLM: the container-side URL is always tcp:127.0.0.1:4000 (baked
-        # into OPENAI_BASE_URL and openclaw.json via the proxy device above),
-        # but the host may run LiteLLM on any configured port (default 7834).
-        # The connect side tracks the live proxy port so the tunnel reaches the
-        # right host process regardless of whether the operator kept the legacy
-        # 4000 or migrated to 7834.
-        # Proxy devices map the container's 127.0.0.1 to host services. They
-        # only work for a LOCAL deploy; a remote worker reaches the controller
-        # directly over the network (taos_host is the controller's Tailscale IP
-        # for a remote deploy), so skip them.
+        # LLM: the container-side address is always tcp:127.0.0.1:4000 (baked
+        # into OPENAI_BASE_URL and openclaw.json); the host side is the LLM
+        # gateway's agent listener. The device keeps its historical
+        # ``taos-proxy-litellm`` name (renaming would mean re-adding it on
+        # every existing container). Proxy devices only work for a LOCAL
+        # deploy; remote deploys were refused above.
         if not req.remote:
-            llm_proxy_ref = (req.extra_config or {}).get("llm_proxy")
-            litellm_host_port = getattr(llm_proxy_ref, "port", None) or 7834
+            from tinyagentos import llm_gateway
+
+            # No llm_proxy in the config (embedded callers, tests): no key was
+            # minted and the verified port is unknown, so the device targets
+            # the configured listener port.
+            llm_host_port = gateway_port or llm_gateway.agent_port()
+            if llm_key:
+                # The gateway must be able to serve every model this key
+                # allows. With no LiteLLM to fall back to this no longer
+                # changes where the agent goes; it is reported so the user
+                # knows the agent will get model errors until it is fixed.
+                check = (req.extra_config or {}).get("llm_gateway_models_problem")
+                route_problem = None
+                if check is None:
+                    route_problem = "routability unknown (no check supplied)"
+                else:
+                    try:
+                        route_problem = await check(
+                            [m for m in [req.model, *(req.fallback_models or [])] if m] or ["default"]
+                        )
+                    except Exception as exc:  # noqa: BLE001 - reported, never fatal
+                        route_problem = f"routability check failed: {type(exc).__name__}"
+                if route_problem:
+                    logger.warning("deploy %s: the LLM gateway cannot serve its models yet: %s",
+                                   req.name, route_problem)
+                    steps.append(f"llm: warning: the gateway cannot serve its models yet: {route_problem}")
+                if not _mint_gateway_key_for(req, llm_key):
+                    logger.warning(
+                        "deploy %s: gateway key not minted from the key-store row; the "
+                        "gateway still accepts the plain key", req.name,
+                    )
+            steps.append("llm: proxy device on the LLM gateway")
             proxy_devices = [
-                ("taos-proxy-litellm", 4000, litellm_host_port),
-                ("taos-proxy-taos", req.taos_port, req.taos_port),
+                ("taos-proxy-litellm", AGENT_LLM_LISTEN_PORT, llm_host_port),
+                ("taos-proxy-taos", req.taos_port, agent_controller_port),
             ]
             for dev_name, listen_port, connect_port in proxy_devices:
                 res = await add_proxy_device(
@@ -669,7 +744,10 @@ async def deploy_agent(req: DeployRequest) -> dict:
         # sentinels so it never conflicts with a user-supplied template.  If
         # the file already exists (from the Store or hand-crafted), we splice
         # only our block in; everything outside the sentinels is preserved.
-        if req.framework in AGENTS_MD_PATHS:
+        #
+        # Skipped entirely when memory_mode='framework' because that mode
+        # explicitly opts out of taOSmd.
+        if req.framework in AGENTS_MD_PATHS and req.memory_mode != "framework":
             target_path = AGENTS_MD_PATHS[req.framework]
             try:
                 import taosmd as _taosmd
@@ -704,6 +782,138 @@ async def deploy_agent(req: DeployRequest) -> dict:
             except Exception:
                 logger.exception("%s: AGENTS.md injection failed", req.framework)
 
+        # Step 4b: Initialise a git repo inside the container for agent state
+        # versioning. The repo root is the agent home (/root), so its
+        # .gitignore is an ALLOWLIST (agent_git._STATE_PATHS): workspace,
+        # memory and the per-framework AGENTS.md are versioned and everything
+        # else — framework config carrying api keys, caches, shell history —
+        # stays out of history entirely.
+        versioning = True
+        versioning_error = None
+        try:
+            from tinyagentos.agent_git import (
+                git_init,
+                write_gitignore,
+                git_config_user,
+                git_add_commit,
+            )
+            await git_init(container_name)
+            await write_gitignore(container_name)
+            await git_config_user(container_name, req.name, f"{req.name}@taos.local")
+            await git_add_commit(container_name, f"chore: initial state for {req.name}")
+            steps.append("git_init")
+        except Exception as exc:
+            logger.warning("Deploy %s: git init failed: %s", req.name, exc)
+            versioning = False
+            versioning_error = str(exc)
+
+        # Step 4c: Install the auto-committer script and start it as a
+        # background loop inside the container. Prefer a systemd unit so it
+        # survives reboots; fall back to nohup when systemctl is absent.
+        # Every terminal failure below raises: the enclosing handler is what
+        # turns versioning off. A deploy result that says versioning=True while
+        # no committer ever starts is a lie no caller can detect.
+        if versioning:
+            try:
+                if not _COMMITTER_SCRIPT.exists():
+                    raise RuntimeError(
+                        f"committer script missing at {_COMMITTER_SCRIPT}"
+                    )
+                _mkdir_rc, _mkdir_out = await exec_in_container(
+                    container_name, ["mkdir", "-p", "/root/.taos"],
+                )
+                if _mkdir_rc != 0:
+                    raise RuntimeError(
+                        f"failed to create /root/.taos (rc={_mkdir_rc}): {_mkdir_out[-300:]}"
+                    )
+                _push_rc, _push_out = await push_file(
+                    container_name,
+                    str(_COMMITTER_SCRIPT),
+                    "/root/.taos/agent_committer.py",
+                )
+                if _push_rc != 0:
+                    raise RuntimeError(
+                        f"failed to push committer script (rc={_push_rc}): {_push_out[-300:]}"
+                    )
+                await exec_in_container(
+                    container_name, ["chmod", "+x", "/root/.taos/agent_committer.py"]
+                )
+                _has_systemd = await exec_in_container(
+                    container_name, ["bash", "-c", "command -v systemctl >/dev/null 2>&1 && echo yes || echo no"]
+                )
+                _installed = False
+                if _has_systemd[0] == 0 and _has_systemd[1].strip() == "yes":
+                    _unit = """\
+[Unit]
+Description=taOS Agent Auto-Committer
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/env python3 /root/.taos/agent_committer.py
+Restart=always
+RestartSec=5
+Environment=AGENT_STATE_REPO=/root
+Environment=COMMIT_INTERVAL=300
+
+[Install]
+WantedBy=multi-user.target
+"""
+                    import tempfile as _tf
+                    with _tf.NamedTemporaryFile("w", suffix=".service", delete=False) as _tfh:
+                        _tfh.write(_unit)
+                        _unit_path = _tfh.name
+                    try:
+                        _unit_rc, _unit_out = await push_file(
+                            container_name,
+                            _unit_path,
+                            "/etc/systemd/system/taos-agent-committer.service",
+                        )
+                    finally:
+                        os.unlink(_unit_path)
+                    if _unit_rc == 0:
+                        await exec_in_container(
+                            container_name,
+                            ["systemctl", "enable", "--now", "taos-agent-committer.service"],
+                        )
+                        _active = await exec_in_container(
+                            container_name, ["systemctl", "is-active", "taos-agent-committer.service"]
+                        )
+                        if _active[0] == 0 and _active[1].strip() == "active":
+                            steps.append("committer_installed")
+                            _installed = True
+                        else:
+                            # Not terminal: the nohup fallback below still gets
+                            # a turn, and only its failure disables versioning.
+                            logger.warning(
+                                "Deploy %s: committer systemd unit not active: %s",
+                                req.name, _active[1].strip(),
+                            )
+                    else:
+                        logger.warning(
+                            "Deploy %s: failed to push committer unit: %s",
+                            req.name, _unit_out[-200:],
+                        )
+                if not _installed:
+                    _nohup_rc, _nohup_out = await exec_in_container(
+                        container_name,
+                        [
+                            "bash", "-c",
+                            "nohup python3 /root/.taos/agent_committer.py "
+                            "> /root/.taos/committer.log 2>&1 &",
+                        ],
+                    )
+                    if _nohup_rc != 0:
+                        raise RuntimeError(
+                            f"nohup committer failed (rc={_nohup_rc}): {_nohup_out[-300:]}"
+                        )
+                    steps.append("committer_installed_nohup")
+            except Exception as exc:
+                logger.warning("Deploy %s: committer install failed: %s", req.name, exc)
+                versioning = False
+                versioning_error = str(exc)
+                steps.append("committer_failed")
+
         # Step 5: Get container IP
         code, output = await exec_in_container(container_name, ["hostname", "-I"])
         container_ip = output.strip().split()[0] if code == 0 and output.strip() else None
@@ -716,6 +926,8 @@ async def deploy_agent(req: DeployRequest) -> dict:
             "ip": container_ip,
             "llm_key": llm_key,
             "steps": steps,
+            "versioning": versioning,
+            "versioning_error": versioning_error,
         }
 
     except Exception as exc:
@@ -739,6 +951,11 @@ async def undeploy_agent(name: str, *, data_dir: Path | None = None, delete_stat
     result = await destroy_container(container_name)
     if delete_state and data_dir is not None:
         import shutil
+        # Delete the trace directory that was created for this agent
+        trace_dir = data_dir / "trace" / name
+        if trace_dir.exists():
+            shutil.rmtree(trace_dir, ignore_errors=True)
+        # Also delete workspaces and memory as before
         for sub in ("agent-workspaces", "agent-memory"):
             target = data_dir / sub / name
             if target.exists():

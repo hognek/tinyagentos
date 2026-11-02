@@ -16,6 +16,9 @@ export interface Agent {
   /** Current chat model, shown as an indicator line on the card when known. */
   model?: string;
   paused?: boolean;
+  /** Live container state is Frozen (incus pause). Set from
+   *  GET /api/agents/containers; the agent reads as paused. */
+  frozen?: boolean;
   on_worker_failure?: "pause" | "fallback" | "escalate-immediately";
   fallback_models?: string[];
   kv_cache_quant_k?: string;
@@ -26,6 +29,7 @@ export interface Agent {
   source_persona_id?: string | null;
   migrated_to_v2_personas?: boolean;
   framework_version_sha?: string | null;
+  memory_mode?: "both" | "framework" | "taosmd";
 }
 
 export interface DiskState {

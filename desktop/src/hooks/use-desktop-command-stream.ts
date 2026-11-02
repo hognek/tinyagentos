@@ -1,4 +1,5 @@
 import { useEffect } from "react";
+import { createSseConnection } from "@/lib/sse";
 
 /**
  * Subscribes to the controller's desktop-command SSE channel and re-dispatches
@@ -22,44 +23,73 @@ export const SCREENSHOT_FLASH_EVENT = "taos:screenshot-flash";
  * cannot read cross-origin iframes (the Browser's proxied page), so those
  * appear blank; the desktop chrome and native apps capture fully.
  */
+let captureInProgress = false;
+
 async function captureAndReport(requestId: string): Promise<void> {
-  let body: { request_id: string; image?: string; error?: string };
-  try {
-    // Prefer a live screen-capture grant (full fidelity incl. cross-origin
-    // iframes like the Browser's proxied page); fall back to DOM rasterisation
-    // (chrome + native apps only) when no grant is active.
-    const { hasScreenCapture, grabScreenFrame } = await import("@/lib/screen-capture");
-    let dataUrl: string | null = null;
-    if (hasScreenCapture()) {
-      dataUrl = await grabScreenFrame();
-    }
-    if (!dataUrl) {
-      const { domToPng } = await import("modern-screenshot");
-      // Full viewport: top bar + desktop + dock.
-      dataUrl = await domToPng(document.body, {
-        backgroundColor: getComputedStyle(document.body).backgroundColor || "#000",
-        // Skip the capture overlay/flash node itself.
-        filter: (node) =>
-          !(node instanceof HTMLElement && node.dataset.screenshotExclude === "true"),
+  if (captureInProgress) {
+    let body: { request_id: string; error: string } = { request_id: requestId, error: "capture already in progress" };
+    window.dispatchEvent(new CustomEvent(SCREENSHOT_FLASH_EVENT));
+    try {
+      await fetch("/api/desktop/screenshot-result", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
       });
+    } catch {
+      /* the agent side will time out and report it */
     }
-    body = { request_id: requestId, image: dataUrl };
-  } catch (e) {
-    body = { request_id: requestId, error: e instanceof Error ? e.message : "capture failed" };
+    return;
   }
-  // Flash AFTER the frame is captured so the white veil never leaks into a
-  // full-fidelity getDisplayMedia frame (that path captures the real composited
-  // screen, where an on-screen overlay is not excludable like the DOM-raster
-  // filter is). Still reads as a shutter: capture is sub-second.
-  window.dispatchEvent(new CustomEvent(SCREENSHOT_FLASH_EVENT));
+  captureInProgress = true;
+  let body: { request_id: string; image?: string; error?: string } = { request_id: requestId, error: "capture failed" };
   try {
-    await fetch("/api/desktop/screenshot-result", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
-  } catch {
-    /* the agent side will time out and report it */
+    try {
+      await Promise.race([
+        (async (): Promise<void> => {
+          // Prefer a live screen-capture grant (full fidelity incl. cross-origin
+          // iframes like the Browser's proxied page); fall back to DOM rasterisation
+          // (chrome + native apps only) when no grant is active.
+          const { hasScreenCapture, grabScreenFrame } = await import("@/lib/screen-capture");
+          let dataUrl: string | null = null;
+          if (hasScreenCapture()) {
+            dataUrl = await grabScreenFrame();
+          }
+          if (!dataUrl) {
+            const { domToPng } = await import("modern-screenshot");
+            // Full viewport: top bar + desktop + dock.
+            dataUrl = await domToPng(document.body, {
+              backgroundColor: getComputedStyle(document.body).backgroundColor || "#000",
+              // Skip the capture overlay/flash node itself.
+              filter: (node) =>
+                !(node instanceof HTMLElement && node.dataset.screenshotExclude === "true"),
+              timeout: 10000,
+            });
+          }
+          body = { request_id: requestId, image: dataUrl };
+        })(),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error("capture timed out")), 15000),
+        ),
+      ]);
+    } catch (e) {
+      body = { request_id: requestId, error: e instanceof Error ? e.message : "capture failed" };
+    }
+    // Flash AFTER the frame is captured so the white veil never leaks into a
+    // full-fidelity getDisplayMedia frame (that path captures the real composited
+    // screen, where an on-screen overlay is not excludable like the DOM-raster
+    // filter is). Still reads as a shutter: capture is sub-second.
+    window.dispatchEvent(new CustomEvent(SCREENSHOT_FLASH_EVENT));
+    try {
+      await fetch("/api/desktop/screenshot-result", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+    } catch {
+      /* the agent side will time out and report it */
+    }
+  } finally {
+    captureInProgress = false;
   }
 }
 
@@ -92,33 +122,28 @@ async function reportLayout(requestId: string): Promise<void> {
 
 export function useDesktopCommandStream(): void {
   useEffect(() => {
-    const es = new EventSource("/api/desktop/stream");
-    es.onmessage = (msg) => {
-      let cmd: { kind?: string; payload?: Record<string, unknown> } | null;
-      try {
-        cmd = JSON.parse(msg.data);
-      } catch {
-        return;
-      }
-      // JSON.parse can legally return null (or a non-object); guard before
-      // reading .kind so a stray payload can't throw and kill the listener.
-      if (!cmd || typeof cmd !== "object") return;
-      if (cmd.kind === "open-app") {
-        window.dispatchEvent(new CustomEvent("taos:open-app", { detail: cmd.payload ?? {} }));
-      } else if (cmd.kind === "window") {
-        window.dispatchEvent(new CustomEvent("taos:window", { detail: cmd.payload ?? {} }));
-      } else if (cmd.kind === "screenshot") {
-        const requestId = (cmd.payload?.request_id as string) ?? "";
-        if (requestId) void captureAndReport(requestId);
-      } else if (cmd.kind === "layout") {
-        const requestId = (cmd.payload?.request_id as string) ?? "";
-        if (requestId) void reportLayout(requestId);
-      }
-    };
-    es.onerror = () => {
-      // Transient errors: the browser reconnects automatically. On a hard close
-      // the effect's cleanup runs and a remount opens a fresh subscription.
-    };
-    return () => es.close();
+    return createSseConnection({
+      url: "/api/desktop/stream",
+      onMessage: (msg) => {
+        let cmd: { kind?: string; payload?: Record<string, unknown> } | null;
+        try {
+          cmd = JSON.parse(msg.data);
+        } catch {
+          return;
+        }
+        if (!cmd || typeof cmd !== "object") return;
+        if (cmd.kind === "open-app") {
+          window.dispatchEvent(new CustomEvent("taos:open-app", { detail: cmd.payload ?? {} }));
+        } else if (cmd.kind === "window") {
+          window.dispatchEvent(new CustomEvent("taos:window", { detail: cmd.payload ?? {} }));
+        } else if (cmd.kind === "screenshot") {
+          const requestId = (cmd.payload?.request_id as string) ?? "";
+          if (requestId) void captureAndReport(requestId);
+        } else if (cmd.kind === "layout") {
+          const requestId = (cmd.payload?.request_id as string) ?? "";
+          if (requestId) void reportLayout(requestId);
+        }
+      },
+    });
   }, []);
 }

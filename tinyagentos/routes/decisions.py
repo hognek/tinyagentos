@@ -20,6 +20,8 @@ from pydantic import BaseModel, Field, model_validator
 from tinyagentos.auth_context import CurrentUser
 from tinyagentos.decisions.decision_store import DECISION_TYPES, PRIORITIES
 from tinyagentos.device_auth import current_user_or_device
+from tinyagentos.events.bus import SystemEvent
+from tinyagentos.notification_labels import actor_label
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +32,36 @@ router = APIRouter()
 # deployed agents) can pick it up. @taOS-dev polls the API instead.
 _DEFAULT_BUS_URL = "http://127.0.0.1:7900"
 _ANSWER_THREAD = "decisions"
+
+# Decision metadata kinds that carry privileged grant authority.  The human
+# answer path must refuse these from device bearers (a phone is a notification
+# surface, not an approval channel), and the agent mirror path must refuse them
+# so an agent cannot self-approve a gate it created.  Keeping the list in one
+# place prevents drift between the two call sites and the applier functions.
+GATE_DECISION_KINDS = ("execution_gate", "delegation_gate", "app_grant", "collab_delegation_gate", "shell_command")
+
+# Server-stamped provenance marker for gate decisions (tsk-mul5pa).  The
+# public create path strips this key so an API caller can never self-stamp a
+# privileged gate; only the internal raisers (peer-inbox delegation dispatch,
+# execution-gate raiser, device-pairing raiser, app-grant flow, collab
+# delegation-gate raiser) set it.  Every
+# _apply_*_grant handler refuses to act when it is absent, so a caller-supplied
+# metadata.kind can never mint a grant on approval.
+SERVER_RAISED_KEY = "_server_raised"
+
+# Server-owned metadata kinds (tsk-mul5pa, Jay ruling 2026-09-02).  Only the
+# internal raisers may create a decision carrying one of these; the public
+# create path answers HTTP 400 whoever the caller is.  The human approving a
+# card sees the caller's free-text question, not the metadata that drives the
+# grant, so a privileged kind supplied over the wire is refused outright.
+SERVER_OWNED_KINDS = (
+    "execution_gate",
+    "delegation_gate",
+    "device_pairing",
+    "app_grant",
+    "project_create",
+    "collab_delegation_gate",
+)
 
 
 def _bus_url() -> str:
@@ -43,16 +75,19 @@ def _answer_text(decision: dict, value) -> str:
     return ", ".join(str(opts.get(v, v)) for v in vals)
 
 
-async def _route_answer_to_agent(decision: dict, value) -> None:
+async def _route_answer_to_agent(decision: dict, value, note: str | None = None) -> None:
     """Best-effort: post the recorded answer back to the asking agent on the
     A2A bus. Never raises; the answer is already persisted and the agent can
     also poll GET /api/decisions/{id}."""
     agent = (decision.get("from_agent") or "").strip()
     if not agent.startswith("@"):
         return
+    text = _answer_text(decision, value)
+    if note:
+        text = f"{text} (note: {note})"
     body = (
         f"{agent} decision {decision.get('id')} answered: "
-        f"{decision.get('question', '')} -> {_answer_text(decision, value)}"
+        f"{decision.get('question', '')} -> {text}"
     )
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
@@ -63,6 +98,90 @@ async def _route_answer_to_agent(decision: dict, value) -> None:
     except Exception:
         # Delivery is best-effort; do not fail the answer on a bus hiccup.
         pass
+
+
+async def _route_note_to_agent(decision: dict, note_text: str, source: str) -> None:
+    """Best-effort: post the note back to the asking agent on the A2A bus.
+    Never raises; the note is already persisted and the agent can also poll
+    GET /api/decisions/{id}."""
+    agent = (decision.get("from_agent") or "").strip()
+    if not agent.startswith("@"):
+        return
+    body = (
+        f"{agent} decision {decision.get('id')} noted: "
+        f"{decision.get('question', '')} -> {note_text}"
+    )
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            await client.post(
+                f"{_bus_url()}/a2a/send",
+                json={"from": "@taOS-decisions", "thread": _ANSWER_THREAD, "body": body},
+            )
+    except Exception:
+        pass
+
+
+async def _publish_answer_event(request: Request, decision: dict) -> None:
+    """Best-effort: push a ``decision.answered`` event to SSE clients so every open
+    surface (the chat thread that rendered the block, plus the Decisions app)
+    updates live without a refresh.
+
+    Published to the owner's ``user:<id>`` channel, NOT broadcast: the payload is
+    the full decision record and the list/get routes scope decisions per user, so
+    a broadcast would hand every connected user (and, via the replay buffer,
+    every late connector) other users' decision content. An ownerless decision
+    is skipped -- live update is best-effort and the apps refetch on focus.
+    It never runs consent side effects and never breaks the answer if the
+    emitter is absent (e.g. on hosts where the event bus has not been started)
+    or fails.
+    """
+    bus = getattr(request.app.state, "event_bus", None)
+    if bus is None:
+        return
+    payload = dict(decision) if isinstance(decision, dict) else {"id": decision.get("id")}
+    payload["decision_id"] = payload.get("id")
+    owner = str(payload.get("user_id") or "").strip()
+    if not owner:
+        return
+    try:
+        await bus.publish_to(f"user:{owner}", SystemEvent(
+            kind="decision.answered",
+            source="decisions",
+            targets=["user"],
+            payload=payload,
+        ))
+    except Exception:
+        logger.warning(
+            "decision.answered SSE broadcast failed for %s",
+            decision.get("id"),
+            exc_info=True,
+        )
+
+
+async def _publish_note_event(request: Request, decision: dict) -> None:
+    """Best-effort: push a ``decision.note`` event to SSE clients so open
+    Decisions windows refresh live when a note is added."""
+    bus = getattr(request.app.state, "event_bus", None)
+    if bus is None:
+        return
+    payload = dict(decision) if isinstance(decision, dict) else {"id": decision.get("id")}
+    payload["decision_id"] = payload.get("id")
+    owner = str(payload.get("user_id") or "").strip()
+    if not owner:
+        return
+    try:
+        await bus.publish_to(f"user:{owner}", SystemEvent(
+            kind="decision.note",
+            source="decisions",
+            targets=["user"],
+            payload=payload,
+        ))
+    except Exception:
+        logger.warning(
+            "decision.note SSE broadcast failed for %s",
+            decision.get("id"),
+            exc_info=True,
+        )
 
 
 class OptionIn(BaseModel):
@@ -119,8 +238,21 @@ class DecisionIn(BaseModel):
 
 class AnswerIn(BaseModel):
     value: object
+    other_value: str | None = None
+    note: str | None = None
     answered_by: str = ""
     source: str = "in_app"
+
+
+class NoteIn(BaseModel):
+    text: str
+    source: str = "in_app"
+
+
+class WithdrawIn(BaseModel):
+    # Defaults to "" so a missing reason lands on the route's own 400 rather
+    # than a 422: an empty and an absent reason are the same refusal.
+    reason: str = ""
 
 
 @dataclass
@@ -217,6 +349,11 @@ async def create_decision(
         return JSONResponse({"error": f"priority must be one of {PRIORITIES}"}, status_code=400)
     if body.type in ("single_select", "multi_select") and not body.options:
         return JSONResponse({"error": "select types require options"}, status_code=400)
+    if isinstance(body.metadata, dict) and body.metadata.get("kind") in SERVER_OWNED_KINDS:
+        return JSONResponse(
+            {"error": f"metadata.kind {body.metadata['kind']!r} is server-owned and cannot be set via the API"},
+            status_code=400,
+        )
 
     actor = await _resolve_decision_actor(request, body.project_id, agent_cid)
     # Agent identity is authoritative; a human may set from_agent in the body.
@@ -238,6 +375,11 @@ async def create_decision(
         elif parent.get("from_agent") != from_agent:
             return JSONResponse({"error": "parent_decision_id not found"}, status_code=400)
 
+    # tsk-mul5pa: an API caller cannot stamp server provenance.  Strip the
+    # marker before persisting so the _apply_*_grant handlers refuse any gate
+    # decision whose metadata was supplied over the wire.
+    metadata = dict(body.metadata) if isinstance(body.metadata, dict) else {}
+    metadata.pop(SERVER_RAISED_KEY, None)
     decision = await store.create(
         from_agent=from_agent,
         question=body.question,
@@ -251,7 +393,7 @@ async def create_decision(
         parent_decision_id=parent_id,
         checkpoint_ref=body.checkpoint_ref,
         timeline_id=body.timeline_id,
-        metadata=body.metadata,
+        metadata=metadata,
     )
 
     # Mark the parent superseded only after the replacement is persisted.
@@ -262,11 +404,30 @@ async def create_decision(
     if notifs is not None:
         # Best effort: a notification failure must not fail the queued decision.
         try:
+            raw_options = [o.model_dump() for o in body.options]
+            capped = [
+                {"label": o.get("label", "")[:40], "value": o.get("value", o.get("label", ""))}
+                for o in raw_options[:4]
+            ]
             await notifs.add(
                 title="Decision needed",
-                message=f"{from_agent} needs a decision: {body.question[:120]}",
+                message=(
+                    f"{await actor_label(request.app.state, from_agent)} needs a decision: "
+                    f"{body.question[:120]}"
+                ),
                 level="warning" if body.priority == "blocking" else "info",
                 source="decisions",
+                data={
+                    "decision_type": body.type,
+                    "options": capped,
+                    "decision_id": decision["id"],
+                    "kind": "decision",
+                    "url": f"/decisions/{decision['id']}",
+                    "priority": body.priority,
+                    "from_agent": from_agent,
+                },
+                # Only the decider's bell and push devices, never a broadcast.
+                user_id=actor.decider_user_id,
             )
         except Exception:
             pass
@@ -279,12 +440,31 @@ async def list_decisions(
     status: str | None = None,
     project_id: str | None = None,
     limit: int = 200,
-    user: CurrentUser = Depends(current_user_or_device),
 ):
+    # tsk-f75p3z: a registry JWT is accepted here (it used to 401), resolved
+    # like _authorize_task_actor: a session wins, otherwise the Bearer must
+    # carry decisions_write.  An agent sees ONLY the decisions it raised in its
+    # granted projects (the GET /api/decisions/agent set), never the user's
+    # inbox.  Device bearers keep the current_user_or_device path below.
+    from tinyagentos.agent_token_auth import registry_agent_caller
+
+    agent_cid = await registry_agent_caller(request, "decisions_write")
+    if agent_cid is not None:
+        items = await _agent_own_decisions(
+            request, agent_cid, status=status, project_id=project_id
+        )
+        return {"items": items[: max(1, min(int(limit), 500))]}
+
+    user = await current_user_or_device(request)
     store = request.app.state.decision_store
     # Non-admins see only their own decisions; admins see all.
     uid = None if user.is_admin else user.user_id
-    items = await store.list(status=status, project_id=project_id, user_id=uid, limit=limit)
+    # Only forward project_id when the caller specified one; an absent query
+    # param means "no project filter", which is the store's default (_UNSET).
+    kwargs: dict[str, object] = {"status": status, "user_id": uid, "limit": limit}
+    if project_id is not None:
+        kwargs["project_id"] = project_id
+    items = await store.list(**kwargs)
     return {"items": items}
 
 
@@ -295,14 +475,36 @@ async def list_decisions(
 async def list_decisions_as_agent(request: Request):
     """Agent-facing list: filter by from_agent (the asking agent).  Only
     returns decisions whose project the agent holds an active decisions_write
-    grant for; a global (null-project) grant shows all.  The store layer
-    enforces the from_agent binding so there is no cross-agent leakage."""
-    from datetime import datetime, timezone
-    from tinyagentos.agent_token_auth import check_agent_scope, _grant_unexpired
+    grant for.  A global (null-project) grant covers null-project decisions,
+    matching _resolve_decision_actor's posting rule; each per-project grant
+    covers that project.  An agent holding both sees the union.  The store
+    layer enforces the from_agent binding so there is no cross-agent leakage.
+
+    LIMIT INTERACTION: each granted scope (null project or one project) is
+    queried with the project filter INSIDE the store query, and the merged
+    result is capped at 500 newest first, so the limit applies AFTER scoping
+    (issue #2194) however many grants the agent holds."""
+    from tinyagentos.agent_token_auth import check_agent_scope
 
     canonical_id = await check_agent_scope(request, "decisions_write")
     if canonical_id is None:
         return JSONResponse({"error": "agent identity not found"}, status_code=401)
+    return {"items": await _agent_own_decisions(request, canonical_id)}
+
+
+async def _agent_own_decisions(
+    request: Request,
+    canonical_id: str,
+    status: str | None = None,
+    project_id: str | None = None,
+) -> list[dict]:
+    """The decisions *canonical_id* raised, limited to the projects it holds an
+    active decisions_write grant for (rules in list_decisions_as_agent).
+    Shared by GET /api/decisions/agent and the registry-JWT path of
+    GET /api/decisions.  A *project_id* narrows the scope inside the store
+    query, so the row limit applies after that filter."""
+    from datetime import datetime, timezone
+    from tinyagentos.agent_token_auth import _grant_unexpired
 
     # Collect project IDs the agent has active decisions_write grants for.
     grants_store = request.app.state.agent_grants
@@ -315,12 +517,25 @@ async def list_decisions_as_agent(request: Request):
     }
 
     store = request.app.state.decision_store
-    items = await store.list(from_agent=canonical_id, limit=500)
-    # A global (null-project) grant shows all; otherwise filter to decisions
-    # whose project_id is in the allowed set.
-    if None not in allowed_projects:
-        items = [d for d in items if d.get("project_id") in allowed_projects]
-    return {"items": items}
+    # A global (null-project) grant covers null-project decisions, matching
+    # _resolve_decision_actor's posting rule; each per-project grant covers
+    # that project.  The allowed set is the union of both.  A requested
+    # project_id narrows the set to that one project (or nothing when not
+    # granted).
+    if project_id is not None:
+        allowed_projects &= {project_id}
+    if not allowed_projects:
+        return []
+    # Push the project filter into the store query so the limit applies after
+    # scoping (issue #2194).  Each allowed scope (None means IS NULL) is queried
+    # on its own, then the results are merged newest first and capped.
+    items: list[dict] = []
+    for scope in allowed_projects:
+        items.extend(
+            await store.list(from_agent=canonical_id, project_id=scope, status=status, limit=500)
+        )
+    items.sort(key=lambda d: d.get("created_at") or 0, reverse=True)
+    return items[:500]
 
 
 @router.get("/api/decisions/{decision_id}")
@@ -395,7 +610,15 @@ async def decision_history(decision_id: str, request: Request, user: CurrentUser
 
 
 @router.post("/api/decisions/{decision_id}/answer")
-async def answer_decision(decision_id: str, body: AnswerIn, request: Request, user: CurrentUser = Depends(current_user_or_device)):
+async def answer_decision(
+    decision_id: str, body: AnswerIn, request: Request, user: CurrentUser = Depends(current_user_or_device)
+):
+    """Record an answer for a pending decision.
+
+    For ``multi_select`` decisions, an empty list is rejected with 400: an
+    answer must contain at least one selected option so that a decision cannot
+    silently transition to answered while carrying no choice.
+    """
     store = request.app.state.decision_store
     existing = await store.get(decision_id)
     # Authorization check: humans can answer decisions they own or admins; agents are
@@ -403,30 +626,66 @@ async def answer_decision(decision_id: str, body: AnswerIn, request: Request, us
     if existing is None or (not user.is_admin and existing["user_id"] != user.user_id):
         return JSONResponse({"error": "not found"}, status_code=404)
 
-    # For select types, the answer must reference the declared options so a
-    # stale or malformed client cannot record an arbitrary value.
+    # Device bearers must not answer gate-kind decisions: the phone is a
+    # notification surface, not an approval channel for privileged grants.
+    # INVARIANT (c) in device_auth.py: request.state.user_id is None on this
+    # path, so a falsy user_id means the caller authenticated as a device.
+    if not getattr(request.state, "user_id", None):
+        meta = existing.get("metadata") or {}
+        gate_kind = meta.get("kind") if isinstance(meta, dict) else None
+        if gate_kind in GATE_DECISION_KINDS:
+            return JSONResponse(
+                {"error": "gate decisions cannot be answered by a device bearer"},
+                status_code=409,
+            )
+
+    # For select types, the answer may reference the declared options or use
+    # the free-text Other path.  A stale or malformed client cannot record an
+    # arbitrary value: explicit option values are still validated against the
+    # declared list so a typo is rejected; the free-text path is accepted only
+    # when flagged via other_value.
     dtype = existing.get("type")
     if dtype in ("single_select", "multi_select"):
-        valid = {
-            o.get("value")
-            for o in (existing.get("options") or [])
-            if o.get("value") is not None
-        }
-        if valid:
-            try:
-                if dtype == "single_select":
-                    if body.value not in valid:
-                        return JSONResponse({"error": "answer is not one of the options"}, status_code=400)
-                else:
-                    vals = body.value if isinstance(body.value, list) else None
-                    if vals is None or any(v not in valid for v in vals):
-                        return JSONResponse({"error": "answer must be a subset of the options"}, status_code=400)
-            except TypeError:
-                # A list, dict, or other non-hashable/iterable value in the
-                # answer body can hit set membership or any() with a TypeError
-                # (e.g. a list value for single_select, or non-iterable for
-                # multi_select).  Fail closed: 400, not 500.
-                return JSONResponse({"error": "invalid answer value shape"}, status_code=400)
+        if body.other_value is not None:
+            # Other / free-text path: validate any explicit option values but
+            # accept the free-text value as-is.
+            if dtype == "single_select":
+                if body.value is not None and isinstance(body.value, str) and body.value.strip():
+                    return JSONResponse(
+                        {"error": "cannot combine value with other_value"},
+                        status_code=400,
+                    )
+            else:
+                vals = body.value if isinstance(body.value, list) else None
+                if vals is None:
+                    return JSONResponse({"error": "invalid answer value shape"}, status_code=400)
+                valid = {
+                    o.get("value")
+                    for o in (existing.get("options") or [])
+                    if o.get("value") is not None
+                }
+                if not vals and not (body.other_value or "").strip():
+                    return JSONResponse({"error": "answer requires at least one option or other_value"}, status_code=400)
+                if valid and any(v not in valid for v in vals):
+                    return JSONResponse({"error": "answer must be a subset of the options"}, status_code=400)
+        else:
+            # Option-only path: existing strict validation.
+            valid = {
+                o.get("value")
+                for o in (existing.get("options") or [])
+                if o.get("value") is not None
+            }
+            if valid:
+                try:
+                    if dtype == "single_select":
+                        if body.value not in valid:
+                            return JSONResponse({"error": "answer is not one of the options"}, status_code=400)
+                    else:
+                        vals = body.value if isinstance(body.value, list) else None
+                        if not vals or any(v not in valid for v in vals):
+                            return JSONResponse({"error": "answer must be a subset of the options"}, status_code=400)
+                except TypeError:
+                    return JSONResponse({"error": "invalid answer value shape"}, status_code=400)
 
     # Source is derived server-side from the authenticated route, never trusted
     # from the request body.  The human path always records in_app; the agent
@@ -440,18 +699,208 @@ async def answer_decision(decision_id: str, body: AnswerIn, request: Request, us
         )
     source = "in_app"
     answered_by = body.answered_by or user.user_id or "user"
-    updated = await store.answer(decision_id, body.value, answered_by, source=source)
+    dtype = existing.get("type")
+    if dtype == "single_select" and body.other_value is not None:
+        stored_value = body.other_value.strip()
+    elif dtype == "multi_select" and body.other_value is not None:
+        vals = list(body.value) if isinstance(body.value, list) else []
+        stored_value = [*vals, body.other_value.strip()]
+    else:
+        stored_value = body.value
+    updated = await store.answer(
+        decision_id, stored_value, answered_by, source=source,
+        other_value=body.other_value, note=body.note,
+    )
     if updated is None:
         return JSONResponse({"error": "already answered or not pending"}, status_code=409)
+    # Broadcast a live event so open chat threads and the Decisions app resolve
+    # the card in place. Best-effort: never break the recorded answer on a
+    # notification hiccup.
+    await _publish_answer_event(request, updated)
     # Each kind-specific handler runs its side effect and returns True if it
     # already routed a reply to the asking agent (a more informative,
     # kind-specific message). Only route the generic answer when none did, so
     # a gated decision does not send the agent two messages.
-    routed_app = await _apply_app_grant(request, updated, body.value)
-    routed_exec = await _apply_execution_grant(request, updated, body.value)
-    routed_deleg = await _apply_delegation_grant(request, updated, body.value)
-    if not (routed_app or routed_exec or routed_deleg):
-        await _route_answer_to_agent(updated, body.value)
+    routed_app = await _apply_app_grant(request, updated, stored_value)
+    routed_exec = await _apply_execution_grant(request, updated, stored_value)
+    routed_deleg = await _apply_delegation_grant(request, updated, stored_value)
+    routed_pair = await _apply_device_pairing_grant(request, updated, stored_value)
+    routed_project_create = await _apply_project_create_grant(request, updated, stored_value)
+    routed_collab = await _apply_collab_delegation_grant(request, updated, stored_value)
+    routed_shell = await _apply_shell_command_grant(request, updated, stored_value)
+    if not (routed_app or routed_exec or routed_deleg or routed_pair or routed_project_create
+            or routed_collab or routed_shell):
+        await _route_answer_to_agent(updated, stored_value, note=body.note)
+    return updated
+
+
+async def _apply_shell_command_grant(request: Request, decision: dict, value) -> bool:
+    """Side effect for a shell_command Decision (the taOS Agent's Claude Code
+    shell profile): the decision's metadata carries {kind: "shell_command",
+    program, user_id}. Approving it adds an allow rule for that program to the
+    user's profile, denying adds a deny rule. Mirrors ``_apply_execution_grant``:
+    the answer is already persisted, so a settings-store hiccup must not fail
+    the answer. There is no asking agent on the bus to route a reply to."""
+    meta = decision.get("metadata") or {}
+    if meta.get("kind") != "shell_command":
+        return False
+    if meta.get(SERVER_RAISED_KEY) is not True:
+        logger.warning(
+            "gate decision %s refused: missing server provenance (kind=%r)",
+            decision.get("id"), meta.get("kind"),
+        )
+        return False
+    store = getattr(request.app.state, "desktop_settings", None)
+    program = meta.get("program")
+    user_id = meta.get("user_id")
+    if store is None or not program or not user_id:
+        return True
+    from tinyagentos.taos_agent_shell_profile import set_rule
+    try:
+        await set_rule(store, user_id, program, "allow" if value == "approve" else "deny")
+    except Exception:
+        logger.warning(
+            "shell profile rule write failed for %s (decision %s)",
+            program, decision.get("id"), exc_info=True,
+        )
+    return True
+
+
+@router.post("/api/decisions/{decision_id}/note")
+async def add_note_to_decision(
+    decision_id: str,
+    body: NoteIn,
+    request: Request,
+    user: CurrentUser = Depends(current_user_or_device),
+):
+    """Append a note to a decision without changing its state.
+
+    A note is commentary only -- it carries no grant, so a device bearer may
+    post one on ANY decision including gate-kind ones.  The phone is a
+    notification surface, not an approval channel, but annotation is safe on
+    every decision kind.  Do NOT copy the answer_decision 409 here; the two
+    paths have different security properties.
+    """
+    store = request.app.state.decision_store
+    existing = await store.get(decision_id)
+    if existing is None or (not user.is_admin and existing["user_id"] != user.user_id):
+        return JSONResponse({"error": "not found"}, status_code=404)
+
+    text = body.text.strip()
+    if not text:
+        return JSONResponse({"error": "text must not be empty"}, status_code=400)
+
+    updated = await store.add_note(decision_id, text, user.user_id or "user", source=body.source)
+    if updated is None:
+        return JSONResponse({"error": "not found"}, status_code=404)
+
+    await _publish_note_event(request, updated)
+    await _route_note_to_agent(updated, text, body.source)
+    return updated
+
+
+async def _publish_withdraw_event(request: Request, decision: dict) -> None:
+    """Best-effort: push a ``decision.withdrawn`` event to the owner's channel so
+    open Decisions windows drop the card from the pending inbox live."""
+    bus = getattr(request.app.state, "event_bus", None)
+    if bus is None:
+        return
+    payload = dict(decision) if isinstance(decision, dict) else {"id": decision.get("id")}
+    payload["decision_id"] = payload.get("id")
+    owner = str(payload.get("user_id") or "").strip()
+    if not owner:
+        return
+    try:
+        await bus.publish_to(f"user:{owner}", SystemEvent(
+            kind="decision.withdrawn",
+            source="decisions",
+            targets=["user"],
+            payload=payload,
+        ))
+    except Exception:
+        logger.warning(
+            "decision.withdrawn SSE broadcast failed for %s",
+            decision.get("id"),
+            exc_info=True,
+        )
+
+
+@router.post("/api/decisions/{decision_id}/withdraw")
+async def withdraw_decision(
+    decision_id: str,
+    body: WithdrawIn,
+    request: Request,
+    agent_cid: str | None = Depends(_authenticate_request),
+):
+    """Asker-side withdraw of a decision that went moot before it was answered
+    (tsk-5dulr5).
+
+    Only the ORIGINAL asker may withdraw: on the agent path (registry JWT with
+    decisions_write on the decision's own project) the authenticated canonical
+    id must equal ``from_agent``; on the session path the caller must own the
+    decision or be an admin. Every refusal collapses to 404 so the route is not
+    an existence oracle (same rule as answer/agent). Device bearers are not on
+    this route's allowlist and never reach it.
+
+    A non-empty reason is required (400) and stored on the record. Allowed only
+    from ``pending``; answered/superseded/withdrawn are terminal (409). The row
+    is never deleted: it leaves the pending inbox and stays in history under
+    ``status=withdrawn``. Each withdraw leaves a forensic governance audit
+    entry, like a driver-token mint.
+    """
+    store = request.app.state.decision_store
+    existing = await store.get(decision_id)
+    if existing is None:
+        return JSONResponse({"error": "not found"}, status_code=404)
+
+    if agent_cid is not None:
+        from tinyagentos.agent_token_auth import (
+            check_agent_scope_for_project,
+            PROJECT_SCOPE_MISMATCH_DETAIL,
+        )
+        try:
+            cid = await check_agent_scope_for_project(
+                request, "decisions_write", existing.get("project_id")
+            )
+        except HTTPException as exc:
+            if exc.status_code == 403 and exc.detail == PROJECT_SCOPE_MISMATCH_DETAIL:
+                return JSONResponse({"error": "not found"}, status_code=404)
+            raise
+        if cid is None or existing.get("from_agent") != cid:
+            return JSONResponse({"error": "not found"}, status_code=404)
+        actor = cid
+        via = "agent"
+    else:
+        uid = getattr(request.state, "user_id", None)
+        if not uid:
+            raise HTTPException(status_code=401, detail="authentication required")
+        is_admin = bool(getattr(request.state, "is_admin", False))
+        if not is_admin and existing.get("user_id") != uid:
+            return JSONResponse({"error": "not found"}, status_code=404)
+        actor = uid
+        via = "session"
+
+    reason = body.reason.strip()
+    if not reason:
+        return JSONResponse({"error": "reason must not be empty"}, status_code=400)
+
+    updated = await store.withdraw(decision_id, reason, actor)
+    if updated is None:
+        return JSONResponse({"error": "already answered or not pending"}, status_code=409)
+
+    from tinyagentos.routes.agent_registry import _audit_governance
+    await _audit_governance(
+        request,
+        action="decision-withdraw",
+        canonical_id=existing.get("from_agent") or "",
+        actor_user_id=actor,
+        before_status="pending",
+        after_status="withdrawn",
+        decision_id=decision_id,
+        reason=reason,
+        via=via,
+    )
+    await _publish_withdraw_event(request, updated)
     return updated
 
 
@@ -464,6 +913,12 @@ async def _apply_execution_grant(request: Request, decision: dict, value) -> boo
     Mirrors ``_apply_app_grant``: the answer is already persisted, so a grant-
     store hiccup must not fail the answer."""
     meta = decision.get("metadata") or {}
+    if meta.get(SERVER_RAISED_KEY) is not True:
+        logger.warning(
+            "gate decision %s refused: missing server provenance (kind=%r)",
+            decision.get("id"), meta.get("kind"),
+        )
+        return False
     if meta.get("kind") != "execution_gate":
         return False
     policies = getattr(request.app.state, "execution_policies", None)
@@ -499,6 +954,81 @@ async def _apply_execution_grant(request: Request, decision: dict, value) -> boo
     return True
 
 
+async def _apply_device_pairing_grant(request: Request, decision: dict, value) -> bool:
+    """Side effect for a device_pairing Decision (taOS S4e): the decision's
+    metadata carries {kind: "device_pairing", pair_request_id}. Approving it
+    mints the device via DeviceStore.register (bound to the user the Decision
+    was addressed to -- F1) and atomically transitions THAT pair request to
+    accepted (F2); denying transitions it to denied. Expiry is enforced here,
+    at approve time, not merely hidden from the poll (F6).
+
+    Mirrors ``_apply_app_grant``: the answer is already persisted, so a store
+    hiccup must not fail the answer. Returns True when the decision was a
+    device_pairing one (there is no asking agent to route a reply to -- the
+    requesting device learns the outcome by polling its pair request).
+
+    Double-mint safety (F5): the Decisions store's ``answer`` is itself atomic
+    (a second answer 409s before any applier runs), so this applier runs at
+    most once per decision, and creation makes exactly one decision per pair
+    request. Belt-and-braces on top: if the pair request's conditional
+    pending->accepted UPDATE reports the row was already decided, the freshly
+    minted device is revoked rather than left dangling."""
+    meta = decision.get("metadata") or {}
+    if meta.get(SERVER_RAISED_KEY) is not True:
+        logger.warning(
+            "gate decision %s refused: missing server provenance (kind=%r)",
+            decision.get("id"), meta.get("kind"),
+        )
+        return False
+    if meta.get("kind") != "device_pairing":
+        return False
+    store = getattr(request.app.state, "device_pair_requests", None)
+    pair_request_id = meta.get("pair_request_id")
+    if store is None or not pair_request_id:
+        return False
+    decided_by = decision.get("user_id") or "user"
+    try:
+        record = await store.get(pair_request_id)
+        if record is None:
+            return True
+        if value != "approve":
+            await store.set_decision(pair_request_id, "denied", decided_by=decided_by)
+            return True
+        from tinyagentos.device_pair_requests_store import _live_status
+        if _live_status(record) == "expired":
+            # F6: an approval of an already-expired request persists the expiry
+            # instead of minting.
+            await store.set_decision(pair_request_id, "expired", decided_by=decided_by)
+            return True
+        device_store = getattr(request.app.state, "device_store", None)
+        if device_store is None:
+            logger.warning(
+                "device pairing approve: device_store missing (decision %s)",
+                decision.get("id"),
+            )
+            return True
+        # F1: the device is bound to the user the Decision was addressed to,
+        # never to anything the unauthenticated creator supplied.
+        device = await device_store.register(
+            user_id=decided_by,
+            platform=record.get("platform") or "",
+            display_name=record.get("display_name") or "",
+        )
+        updated = await store.set_decision(
+            pair_request_id, "accepted",
+            device_id=device["device_id"], decided_by=decided_by,
+        )
+        if updated is None:
+            # Lost a (should-be-impossible) race: request already decided.
+            # Revoke the fresh mint so no orphan credential survives.
+            await device_store.revoke(device["device_id"])
+    except Exception:
+        logger.warning(
+            "device pairing grant failed for decision %s", decision.get("id"), exc_info=True,
+        )
+    return True
+
+
 async def _apply_delegation_grant(request: Request, decision: dict, value) -> bool:
     """Side effect for a delegation-gate Decision (#161 gated delegation): the
     decision's metadata carries {kind: "delegation_gate", from_agent, to_agent,
@@ -509,6 +1039,12 @@ async def _apply_delegation_grant(request: Request, decision: dict, value) -> bo
     ``_apply_execution_grant``: the answer is already persisted, so a
     grant-store or delegation-completion hiccup must not fail the answer."""
     meta = decision.get("metadata") or {}
+    if meta.get(SERVER_RAISED_KEY) is not True:
+        logger.warning(
+            "gate decision %s refused: missing server provenance (kind=%r)",
+            decision.get("id"), meta.get("kind"),
+        )
+        return False
     if meta.get("kind") != "delegation_gate":
         return False
     policies = getattr(request.app.state, "execution_policies", None)
@@ -556,6 +1092,109 @@ async def _apply_delegation_grant(request: Request, decision: dict, value) -> bo
     else:
         reply = "delegation approved, but assigning the task failed - please retry"
     await _route_answer_to_agent(decision, reply)
+    return True
+
+
+async def _deliver_delegation_invite(
+    request: Request,
+    meta: dict,
+    invite_id: str,
+) -> None:
+    """Best-effort: deliver a minted delegation invite_id to the requester
+    over the peer channel so their agent runner can redeem it.
+
+    Never raises — the invite is already minted and persisted on this side,
+    so a delivery failure must not roll it back.
+    """
+    contact_id = meta.get("contact_id", "")
+    agent_slug = meta.get("agent_slug", "")
+    project_id = meta.get("project_id", "")
+
+    if not contact_id or not invite_id:
+        return
+
+    contacts_store = getattr(request.app.state, "contacts_store", None)
+    if contacts_store is None:
+        return
+
+    try:
+        from tinyagentos.peer import send_envelope
+
+        body: dict = {
+            "invite_id": invite_id,
+            "agent_slug": agent_slug,
+            "project_id": project_id,
+        }
+        delivered, err = await send_envelope(
+            contacts_store,
+            to_contact_id=contact_id,
+            kind="delegation_status",
+            body=body,
+        )
+        if not delivered:
+            logger.warning(
+                "delegation_status delivery failed for decision invite %s: %s",
+                invite_id, err,
+            )
+    except Exception:
+        logger.warning(
+            "delegation_status delivery error for invite %s", invite_id, exc_info=True,
+        )
+
+
+async def _apply_collab_delegation_grant(request: Request, decision: dict, value) -> bool:
+    """Side effect for a cross-user collab delegation-gate Decision (D1): the
+    decision's metadata carries {kind: "collab_delegation_gate", contact_id,
+    agent_slug, display_name, granted_scopes, denied_scopes, project_id}.
+    Approving it mints the sponsored project invite via
+    ``complete_delegation_approval`` — this is the manual approval path that
+    previously had NO caller, so a delegation request reached a Decisions card
+    but nothing ever happened on approval.  Denying just routes the answer.
+    Mirrors ``_apply_delegation_grant``: the answer is already persisted, so a
+    mint hiccup must not fail the answer."""
+    meta = decision.get("metadata") or {}
+    if meta.get(SERVER_RAISED_KEY) is not True:
+        logger.warning(
+            "gate decision %s refused: missing server provenance (kind=%r)",
+            decision.get("id"), meta.get("kind"),
+        )
+        return False
+    if meta.get("kind") != "collab_delegation_gate":
+        return False
+    approved = value == "approve"
+    completed = False
+    invite_id = None
+    if approved:
+        try:
+            from tinyagentos.delegation_handler import complete_delegation_approval
+
+            result = await complete_delegation_approval(
+                request, decision_metadata=meta
+            )
+            completed = result.get("status") == "approved"
+            if completed:
+                invite_id = result.get("invite_id")
+        except Exception:
+            logger.warning(
+                "collab delegation approval failed for decision %s",
+                decision.get("id"), exc_info=True,
+            )
+    # The collab delegation decision's from_agent is a hub contact id (e.g.
+    # "hub:sponsor"), not an "@agent" handle, so _route_answer_to_agent is a
+    # no-op here; the mint result is delivered over the peer channel.  Keep the
+    # reply routing call for symmetry/consistency with the other gate handlers.
+    if not approved:
+        reply = "delegation denied"
+    elif completed:
+        reply = "delegation approved - the agent invite has been minted"
+    else:
+        reply = "delegation approved, but minting the invite failed - please retry"
+    await _route_answer_to_agent(decision, reply)
+    # Deliver the invite_id to the requester over the peer channel so their
+    # agent runner can redeem it.  Best-effort: the invite is already minted
+    # and persisted; a delivery failure does not roll back the mint.
+    if completed and invite_id:
+        await _deliver_delegation_invite(request, meta, invite_id)
     return True
 
 
@@ -619,7 +1258,7 @@ async def answer_decision_as_agent(
     # card from the owner's inbox without the owner ever seeing it.
     meta = (existing.get("metadata") or {})
     gate_kind = meta.get("kind") if isinstance(meta, dict) else None
-    if gate_kind in ("execution_gate", "delegation_gate", "app_grant"):
+    if gate_kind in GATE_DECISION_KINDS:
         return JSONResponse(
             {"error": "gate decisions cannot be answered by the asking agent"},
             status_code=409,
@@ -628,37 +1267,72 @@ async def answer_decision_as_agent(
     # Validate select-type answers against declared options (same as human path).
     dtype = existing.get("type")
     if dtype in ("single_select", "multi_select"):
-        valid = {
-            o.get("value")
-            for o in (existing.get("options") or [])
-            if o.get("value") is not None
-        }
-        if valid:
-            try:
-                if dtype == "single_select":
-                    if body.value not in valid:
-                        return JSONResponse({"error": "answer is not one of the options"}, status_code=400)
-                else:
-                    vals = body.value if isinstance(body.value, list) else None
-                    if vals is None or any(v not in valid for v in vals):
-                        return JSONResponse({"error": "answer must be a subset of the options"}, status_code=400)
-            except TypeError:
-                return JSONResponse({"error": "invalid answer value shape"}, status_code=400)
+        if body.other_value is not None:
+            if dtype == "single_select":
+                if body.value is not None and isinstance(body.value, str) and body.value.strip():
+                    return JSONResponse(
+                        {"error": "cannot combine value with other_value"},
+                        status_code=400,
+                    )
+            else:
+                vals = body.value if isinstance(body.value, list) else None
+                if vals is None:
+                    return JSONResponse({"error": "invalid answer value shape"}, status_code=400)
+                valid = {
+                    o.get("value")
+                    for o in (existing.get("options") or [])
+                    if o.get("value") is not None
+                }
+                if not vals and not (body.other_value or "").strip():
+                    return JSONResponse({"error": "answer requires at least one option or other_value"}, status_code=400)
+                if valid and any(v not in valid for v in vals):
+                    return JSONResponse({"error": "answer must be a subset of the options"}, status_code=400)
+        else:
+            valid = {
+                o.get("value")
+                for o in (existing.get("options") or [])
+                if o.get("value") is not None
+            }
+            if valid:
+                try:
+                    if dtype == "single_select":
+                        if body.value not in valid:
+                            return JSONResponse({"error": "answer is not one of the options"}, status_code=400)
+                    else:
+                        vals = body.value if isinstance(body.value, list) else None
+                        if not vals or any(v not in valid for v in vals):
+                            return JSONResponse({"error": "answer must be a subset of the options"}, status_code=400)
+                except TypeError:
+                    return JSONResponse({"error": "invalid answer value shape"}, status_code=400)
 
     # Agent mirrors are always from chat; record the canonical agent id as the
     # mirroring actor (not "user") so the audit trail is complete.
     source = "mirrored_from_chat"
     answered_by = canonical_id
-    updated = await store.answer(decision_id, body.value, answered_by, source=source)
+    dtype = existing.get("type")
+    if dtype == "single_select" and body.other_value is not None:
+        stored_value = body.other_value.strip()
+    elif dtype == "multi_select" and body.other_value is not None:
+        vals = list(body.value) if isinstance(body.value, list) else []
+        stored_value = [*vals, body.other_value.strip()]
+    else:
+        stored_value = body.value
+    updated = await store.answer(
+        decision_id, stored_value, answered_by, source=source,
+        other_value=body.other_value, note=body.note,
+    )
     if updated is None:
         return JSONResponse({"error": "already answered or not pending"}, status_code=409)
+
+    # Broadcast live so open surfaces (chat + Decisions app) resolve in place.
+    await _publish_answer_event(request, updated)
 
     # Route the answer to the A2A bus so the asking agent can pick it up.
     # Consent side effects (app/execution/delegation grants) are intentionally
     # NOT run on the agent mirror path: an agent must not be able to create a
     # privileged decision and then self-approve the consent via its own mirror
     # endpoint.  Only the human answer path runs consent side effects.
-    await _route_answer_to_agent(updated, body.value)
+    await _route_answer_to_agent(updated, stored_value, note=body.note)
     return updated
 
 
@@ -671,6 +1345,12 @@ async def _apply_app_grant(request: Request, decision: dict, value) -> bool:
     not fail the answer. Returns False: app grants do not route an agent reply,
     so the caller sends the generic answer."""
     meta = decision.get("metadata") or {}
+    if meta.get(SERVER_RAISED_KEY) is not True:
+        logger.warning(
+            "gate decision %s refused: missing server provenance (kind=%r)",
+            decision.get("id"), meta.get("kind"),
+        )
+        return False
     if meta.get("kind") != "app_grant":
         return False
     grants = getattr(request.app.state, "app_grants", None)
@@ -696,3 +1376,196 @@ async def _apply_app_grant(request: Request, decision: dict, value) -> bool:
             app_id, decision.get("id"), exc_info=True,
         )
     return False
+
+
+async def _apply_project_create_grant(request: Request, decision: dict, value) -> bool:
+    """Side effect for a project_create Decision: on approve, create the project
+    and make the requester the lead member. On deny, mark the linked auth
+    request as refused. Best-effort: the answer is already persisted, so a
+    project-store hiccup must not fail the answer. Returns True when the
+    decision was a project_create one so the caller skips the generic agent
+    reply routing."""
+    meta = decision.get("metadata") or {}
+    if meta.get(SERVER_RAISED_KEY) is not True:
+        logger.warning(
+            "project_create decision %s refused: missing server provenance",
+            decision.get("id"),
+        )
+        return False
+    if meta.get("kind") != "project_create":
+        return False
+
+    auth_request_id = meta.get("auth_request_id")
+    if not auth_request_id:
+        return False
+
+    auth_store = getattr(request.app.state, "auth_requests", None)
+    if auth_store is None:
+        return False
+
+    auth_record = await auth_store.get(auth_request_id)
+    if auth_record is None or auth_record.get("status") != "pending":
+        return False
+
+    approved = value == "approve"
+
+    if approved:
+        pstore = getattr(request.app.state, "project_store", None)
+        if pstore is None:
+            logger.warning("project_create: project_store missing for decision %s", decision.get("id"))
+            return False
+
+        requested_name = meta.get("requested_name", "")
+        requested_slug = meta.get("requested_slug", "")
+        from_agent = meta.get("from_agent", "")
+
+        project = None
+        try:
+            project = await pstore.create_project_with_lead(
+                name=requested_name,
+                slug=requested_slug,
+                created_by=from_agent,
+                member_id=from_agent,
+                user_id=decision.get("user_id") or "",
+            )
+        except Exception:
+            logger.warning(
+                "project_create project creation failed for decision %s",
+                decision.get("id"), exc_info=True,
+            )
+            try:
+                await auth_store.set_decision(
+                    auth_request_id,
+                    "refused",
+                    decided_by=decision.get("user_id") or "",
+                )
+            except Exception:
+                logger.warning(
+                    "project_create refusal after project failure failed for decision %s",
+                    decision.get("id"), exc_info=True,
+                )
+            await _route_answer_to_agent(
+                decision,
+                f"project creation failed - auth request {auth_request_id} refused",
+            )
+            return True
+
+        granted = False
+        try:
+            grants_store = getattr(request.app.state, "agent_grants", None)
+            if grants_store is not None:
+                await grants_store.add_grant(
+                    from_agent, "project_tasks", tier="once", project_id=project["id"]
+                )
+            granted = True
+        except Exception:
+            logger.warning(
+                "project_create grant write failed for decision %s",
+                decision.get("id"), exc_info=True,
+            )
+
+        if not granted:
+            try:
+                await pstore.set_status(project["id"], "deleted")
+            except Exception:
+                logger.warning(
+                    "project_create project cleanup failed for decision %s",
+                    decision.get("id"), exc_info=True,
+                )
+            try:
+                await auth_store.set_decision(
+                    auth_request_id,
+                    "refused",
+                    decided_by=decision.get("user_id") or "",
+                )
+            except Exception:
+                logger.warning(
+                    "project_create refusal after grant failure failed for decision %s",
+                    decision.get("id"), exc_info=True,
+                )
+            await _route_answer_to_agent(
+                decision,
+                f"project creation approved, but saving the grant failed - auth request {auth_request_id} refused",
+            )
+            return True
+
+        try:
+            accepted = await auth_store.set_decision(
+                auth_request_id,
+                "accepted",
+                canonical_id=from_agent,
+                granted_scopes=["project_tasks"],
+                decided_by=decision.get("user_id") or "",
+            )
+        except Exception:
+            logger.warning(
+                "project_create acceptance failed for decision %s",
+                decision.get("id"), exc_info=True,
+            )
+            accepted = None
+
+        if not accepted:
+            try:
+                await pstore.set_status(project["id"], "deleted")
+            except Exception:
+                logger.warning(
+                    "project_create project cleanup failed for decision %s",
+                    decision.get("id"), exc_info=True,
+                )
+            grants_store = getattr(request.app.state, "agent_grants", None)
+            if grants_store is not None:
+                try:
+                    await grants_store.revoke_grant(
+                        from_agent, "project_tasks", project_id=project["id"]
+                    )
+                except Exception:
+                    logger.warning(
+                        "project_create grant revoke failed for decision %s",
+                        decision.get("id"), exc_info=True,
+                    )
+            try:
+                await auth_store.set_decision(
+                    auth_request_id,
+                    "refused",
+                    decided_by=decision.get("user_id") or "",
+                )
+            except Exception:
+                logger.warning(
+                    "project_create refusal after acceptance failure failed for decision %s",
+                    decision.get("id"), exc_info=True,
+                )
+            await _route_answer_to_agent(
+                decision,
+                f"project creation approved, but acceptance failed - auth request {auth_request_id} refused",
+            )
+            return True
+
+        # Project created and accepted: ensure its A2A channel (taOS #2115).
+        # Best-effort, like the other creation paths; ensure is idempotent.
+        try:
+            from tinyagentos.projects.a2a import ensure_a2a_channel
+
+            await ensure_a2a_channel(
+                request.app.state.chat_channels,
+                pstore,
+                project["id"],
+                config=getattr(request.app.state, "config", None),
+            )
+        except Exception:
+            logger.warning(
+                "a2a ensure failed for project_create decision %s", decision.get("id"), exc_info=True
+            )
+    else:
+        try:
+            await auth_store.set_decision(
+                auth_request_id,
+                "refused",
+                decided_by=decision.get("user_id") or "",
+            )
+        except Exception:
+            logger.warning(
+                "project_create refusal failed for decision %s",
+                decision.get("id"), exc_info=True,
+            )
+
+    return True

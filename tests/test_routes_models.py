@@ -12,6 +12,7 @@ from tinyagentos.routes.models import (
     get_downloaded_models,
 )
 from tinyagentos.vram_reservation import VramReservationManager
+from taos_test_csrf import csrf_event_hooks
 
 
 class TestDefaultModelsDir:
@@ -54,6 +55,11 @@ def catalog_with_models(tmp_path):
              "requires": {"backends": [
                  {"id": "rkllama", "targets": ["rockchip"], "min_ram_mb": 2048},
              ]}},
+            {"id": "multi", "name": "Multi-file HF", "format": "safetensors",
+             "size_mb": 500, "download_url": "https://huggingface.co/a/b/resolve/main/model-00001-of-00002.safetensors",
+             "hf_repo": "a/b", "hf_revision": "main", "multi_file": True,
+             "include_patterns": ["*.safetensors", "*.json"],
+             "backend": ["transformers"]},
         ],
         "hardware_tiers": {"arm-npu-16gb": {"recommended": "npu", "fallback": "small"}},
         "install": {"method": "download"},
@@ -102,7 +108,7 @@ async def models_client(models_app):
     _rec = models_app.state.auth.find_user("admin")
     _token = models_app.state.auth.create_session(user_id=_rec["id"] if _rec else "", long_lived=True)
     transport = ASGITransport(app=models_app)
-    async with AsyncClient(transport=transport, base_url="http://test", cookies={"taos_session": _token}) as c:
+    async with AsyncClient(transport=transport, base_url="http://test", cookies={"taos_session": _token}, event_hooks=csrf_event_hooks()) as c:
         yield c
     await store.close()
     await models_app.state.qmd_client.close()
@@ -127,9 +133,9 @@ class TestModelsAPI:
         resp = await models_client.get("/api/models")
         data = resp.json()
         test_model = next(m for m in data["models"] if m["id"] == "test-model")
-        assert len(test_model["variants"]) == 2
+        assert len(test_model["variants"]) == 3
         assert test_model["variants"][0]["id"] == "small"
-        assert test_model["variants"][1]["id"] == "npu"
+        assert test_model["variants"][2]["id"] == "multi"
 
     async def test_model_compatibility_field(self, models_client):
         resp = await models_client.get("/api/models")
@@ -145,7 +151,7 @@ class TestModelsAPI:
         data = resp.json()
         assert data["id"] == "test-model"
         assert data["name"] == "Test Model"
-        assert len(data["variants"]) == 2
+        assert len(data["variants"]) == 3
         assert "capabilities" in data
         assert "chat" in data["capabilities"]
 
@@ -299,6 +305,27 @@ class TestModelDownload:
         task = models_app.state.download_manager.get_progress("test-model-small")
         assert task is not None
         assert task.url == "https://example.com/small.gguf"
+
+    async def test_multi_file_variant_routes_through_hf_multi_installer(self, models_app, models_client):
+        with patch(
+            "tinyagentos.installers.hf_multi_installer.HFMultiInstaller.install",
+            new=AsyncMock(return_value={"success": True, "app_id": "test-model"}),
+        ) as mock_install:
+            resp = await models_client.post(
+                "/api/models/download",
+                json={"app_id": "test-model", "variant_id": "multi"},
+            )
+        assert resp.status_code == 200
+        data = resp.json()
+        download_id = data["download_id"]
+        assert download_id == "test-model-multi"
+        mock_install.assert_awaited_once()
+        assert mock_install.await_args.args[0] == "test-model"
+        assert mock_install.await_args.kwargs.get("variant", {}).get("id") == "multi"
+
+        task = models_app.state.download_manager.get_progress(download_id)
+        await models_app.state.download_manager._running[download_id]
+        assert task.status == "complete"
 
     async def test_rkllama_variant_routes_through_installer(self, models_app, models_client):
         with patch(
@@ -560,7 +587,7 @@ async def _make_auth_client(app):
     _rec = app.state.auth.find_user("admin")
     _token = app.state.auth.create_session(user_id=_rec["id"] if _rec else "", long_lived=True)
     transport = ASGITransport(app=app)
-    return AsyncClient(transport=transport, base_url="http://test", cookies={"taos_session": _token})
+    return AsyncClient(transport=transport, base_url="http://test", cookies={"taos_session": _token}, event_hooks=csrf_event_hooks())
 
 
 @pytest.mark.asyncio
@@ -602,6 +629,52 @@ class TestLoadedModelsImageBackends:
 
         assert resp.status_code == 200
         assert resp.json()["loaded"] == []
+
+
+@pytest.fixture
+def app_with_llama_swap_backend(tmp_path):
+    config = {
+        "server": {"host": "0.0.0.0", "port": 6969},
+        "backends": [
+            {"name": "swap", "type": "llama-swap", "url": "http://localhost:8080", "priority": 1}
+        ],
+        "qmd": {"url": "http://localhost:7832"},
+        "agents": [],
+        "metrics": {"poll_interval": 30, "retention_days": 30},
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    (tmp_path / ".setup_complete").touch()
+    return create_app(data_dir=tmp_path)
+
+
+@pytest.mark.asyncio
+@pytest.mark.guards("tinyagentos.routes.models:loaded_models",
+                    replace=[('if m.get("state") == "stopping":', "if False:")])
+async def test_llama_swap_loaded_models_come_from_running(app_with_llama_swap_backend):
+    """llama-swap: /running (not /v1/models) is what is in memory. Body shape
+    as llama-swap v261 returns it; "stopping" is on its way out."""
+    app = app_with_llama_swap_backend
+    running = MagicMock(status_code=200)
+    running.json.return_value = {"running": [
+        {"model": "qwen-chat", "state": "ready", "cmd": "llama-server", "proxy": "",
+         "ttl": 300, "name": "Qwen chat", "description": ""},
+        {"model": "old", "state": "stopping"},
+        {"state": "ready"},
+    ]}
+
+    async with await _make_auth_client(app) as c:
+        with patch.object(app.state, "http_client") as mock_http:
+            mock_http.get = AsyncMock(return_value=running)
+            resp = await c.get("/api/models/loaded")
+            urls = [call.args[0] for call in mock_http.get.call_args_list]
+    await app.state.metrics.close()
+    await app.state.qmd_client.close()
+    await app.state.http_client.aclose()
+
+    assert resp.status_code == 200
+    assert urls == ["http://localhost:8080/running"]
+    assert [(e["name"], e["backend"], e["backend_type"]) for e in resp.json()["loaded"]] == [
+        ("qwen-chat", "swap", "llama-swap")]
 
 
 @pytest.mark.asyncio

@@ -10,9 +10,13 @@ import {
   AlertCircle,
   History,
   ShieldQuestion,
+  KeyRound,
 } from "lucide-react";
 import { Button, Textarea } from "@/components/ui";
 import { ConsentActions } from "@/components/ConsentActions";
+import { useRefreshOnFocus } from "@/hooks/use-refresh-on-focus";
+import { useOsEvents } from "@/hooks/use-os-events";
+import { GateGrantDetails } from "@/components/GateGrantDetails";
 
 type DecisionType =
   | "single_select"
@@ -20,7 +24,7 @@ type DecisionType =
   | "approve_deny"
   | "free_text";
 
-type DecisionStatus = "pending" | "answered" | "expired" | "superseded";
+type DecisionStatus = "pending" | "answered" | "expired" | "superseded" | "withdrawn";
 
 interface DecisionOption {
   label: string;
@@ -33,6 +37,17 @@ interface DecisionAnswer {
   value: string | string[];
   answered_by?: string;
   answered_at?: number;
+  source?: string;
+  other_value?: string | null;
+  note?: string | null;
+}
+
+interface DecisionNote {
+  id: string;
+  text: string;
+  author: string;
+  source: string;
+  created_at: number | string;
 }
 
 interface Decision {
@@ -52,6 +67,13 @@ interface Decision {
   // original. When set, the supersession lineage can be walked via the history
   // endpoint.
   parent_decision_id?: string | null;
+  notes?: DecisionNote[];
+  // Set when the asker withdrew the decision as moot before it was answered.
+  withdraw_reason?: string | null;
+  withdrawn_at?: number | null;
+  withdrawn_by?: string | null;
+  // Grant-bearing metadata for a server-raised gate decision (tsk-mul5pa).
+  metadata?: Record<string, unknown> | null;
 }
 
 // A pending external-agent access request (consent loop). Surfaced here as an
@@ -65,6 +87,22 @@ interface AuthRequest {
   reason?: string;
   created_ts?: string;
   project_id?: string;
+  duration_secs?: number;
+  human_duration?: string;
+}
+
+// A pending scope request from an ALREADY-REGISTERED agent asking for more
+// scopes on its own identity (GET /api/agents/scope-requests). A different
+// collection from AuthRequest: approving adds grants to the existing
+// canonical_id and mints nothing.
+interface ScopeRequest {
+  id: string;
+  canonical_id: string;
+  agent_display_name?: string;
+  requested_scopes: string[];
+  project_id?: string | null;
+  reason?: string;
+  created_ts?: string;
 }
 
 // created_at is stored as an epoch-seconds REAL on the backend, but the API
@@ -166,20 +204,28 @@ function OptionRow({
 function DecisionCard({
   decision,
   onAnswer,
+  onAddNote,
 }: {
   decision: Decision;
-  onAnswer: (id: string, value: string | string[]) => Promise<void>;
+  onAnswer: (id: string, value: string | string[], otherValue?: string, note?: string) => Promise<void>;
+  onAddNote?: (id: string, text: string) => Promise<void>;
 }) {
   const [multi, setMulti] = useState<string[]>([]);
+  const [singleSelected, setSingleSelected] = useState<string | null>(null);
+  const [otherSelected, setOtherSelected] = useState(false);
   const [text, setText] = useState("");
+  const [otherText, setOtherText] = useState("");
+  const [note, setNote] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [noteText, setNoteText] = useState("");
+  const [noteSubmitting, setNoteSubmitting] = useState(false);
 
   async function submit(value: string | string[]) {
     setError(null);
     setSubmitting(true);
     try {
-      await onAnswer(decision.id, value);
+      await onAnswer(decision.id, value, otherText.trim() || undefined, note.trim() || undefined);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Could not record answer.");
     } finally {
@@ -187,7 +233,25 @@ function DecisionCard({
     }
   }
 
+  async function submitNote() {
+    if (!onAddNote || !noteText.trim() || noteSubmitting) return;
+    setError(null);
+    setNoteSubmitting(true);
+    try {
+      await onAddNote(decision.id, noteText.trim());
+      setNoteText("");
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Could not add note.");
+    } finally {
+      setNoteSubmitting(false);
+    }
+  }
+
   function toggleMulti(value: string) {
+    if (value === "__other__") {
+      setOtherSelected((prev) => !prev);
+      return;
+    }
     setMulti((prev) =>
       prev.includes(value) ? prev.filter((v) => v !== value) : [...prev, value],
     );
@@ -211,15 +275,28 @@ function DecisionCard({
 
       <div className="flex flex-col gap-1">
         <p className="text-sm font-semibold text-shell-text">{decision.question}</p>
-        {decision.context && (
-          <p className="text-xs leading-relaxed text-shell-text-secondary">
-            {decision.context}
-          </p>
-        )}
-        <span className="mt-0.5 text-[11px] uppercase tracking-wide text-shell-text-tertiary">
-          {TYPE_LABEL[decision.type]}
-        </span>
-      </div>
+      <GateGrantDetails metadata={decision.metadata} />
+      {decision.context && (
+        <p className="text-xs leading-relaxed text-shell-text-secondary">
+          {decision.context}
+        </p>
+      )}
+      {(decision.notes || []).length > 0 && (
+        <div className="flex flex-col gap-1 border-l border-shell-border pl-3">
+          {(decision.notes || []).map((n) => (
+            <div key={n.id} className="flex flex-col gap-0.5 text-xs">
+              <span className="text-shell-text-secondary">{n.text}</span>
+              <span className="text-shell-text-tertiary">
+                {n.author} · {relativeTime(n.created_at)}
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
+      <span className="mt-0.5 text-[11px] uppercase tracking-wide text-shell-text-tertiary">
+        {TYPE_LABEL[decision.type]}
+      </span>
+    </div>
 
       {decision.type === "single_select" && (
         <div className="flex flex-col gap-2">
@@ -227,11 +304,49 @@ function DecisionCard({
             <OptionRow
               key={opt.value}
               option={opt}
-              selected={false}
+              selected={singleSelected === opt.value}
               disabled={submitting}
-              onClick={() => submit(opt.value)}
+              onClick={() => setSingleSelected(opt.value)}
             />
           ))}
+          <OptionRow
+            option={{label: "Other", value: "__other__"}}
+            selected={singleSelected === "__other__"}
+            disabled={submitting}
+            onClick={() => setSingleSelected("__other__")}
+          />
+          {singleSelected === "__other__" && (
+            <Textarea
+              value={otherText}
+              onChange={(e) => setOtherText(e.target.value)}
+              placeholder="Type your answer..."
+              rows={2}
+              maxLength={20000}
+              aria-label="Other answer"
+              className="resize-none bg-shell-surface border-shell-border text-shell-text placeholder:text-shell-text-tertiary"
+            />
+          )}
+          <input
+            type="text"
+            value={note}
+            onChange={(e) => setNote(e.target.value)}
+            placeholder="Add a note (optional)"
+            maxLength={500}
+            aria-label="Answer note"
+            className="bg-shell-surface border-shell-border text-shell-text placeholder:text-shell-text-tertiary rounded-md px-3 py-2 text-sm"
+          />
+          {singleSelected && (
+            <div className="flex justify-end">
+              <Button
+                type="button"
+                disabled={submitting || (singleSelected === "__other__" && otherText.trim().length === 0)}
+                onClick={() => submit(singleSelected === "__other__" ? "" : singleSelected)}
+                className="min-w-[100px]"
+              >
+                {submitting ? "Saving..." : "Submit"}
+              </Button>
+            </div>
+          )}
         </div>
       )}
 
@@ -246,10 +361,36 @@ function DecisionCard({
               onClick={() => toggleMulti(opt.value)}
             />
           ))}
+          <OptionRow
+            option={{label: "Other", value: "__other__"}}
+            selected={otherSelected}
+            disabled={submitting}
+            onClick={() => toggleMulti("__other__")}
+          />
+          {otherSelected && (
+            <Textarea
+              value={otherText}
+              onChange={(e) => setOtherText(e.target.value)}
+              placeholder="Type your other answer..."
+              rows={2}
+              maxLength={20000}
+              aria-label="Other answer"
+              className="resize-none bg-shell-surface border-shell-border text-shell-text placeholder:text-shell-text-tertiary"
+            />
+          )}
+          <input
+            type="text"
+            value={note}
+            onChange={(e) => setNote(e.target.value)}
+            placeholder="Add a note (optional)"
+            maxLength={500}
+            aria-label="Answer note"
+            className="bg-shell-surface border-shell-border text-shell-text placeholder:text-shell-text-tertiary rounded-md px-3 py-2 text-sm"
+          />
           <div className="flex justify-end">
             <Button
               type="button"
-              disabled={submitting || multi.length === 0}
+              disabled={submitting || (multi.length === 0 && !otherSelected)}
               onClick={() => submit(multi)}
               className="min-w-[100px]"
             >
@@ -316,6 +457,29 @@ function DecisionCard({
           {error}
         </div>
       )}
+      {onAddNote && (
+        <div className="flex gap-2">
+          <input
+            type="text"
+            value={noteText}
+            onChange={(e) => setNoteText(e.target.value)}
+            placeholder="Add a note..."
+            maxLength={500}
+            aria-label="Note text"
+            className="flex-1 bg-shell-surface border-shell-border text-shell-text placeholder:text-shell-text-tertiary rounded-md px-3 py-2 text-sm"
+            onKeyDown={(e) => {
+              if (e.key === "Enter") submitNote();
+            }}
+          />
+          <Button
+            type="button"
+            disabled={noteSubmitting || !noteText.trim()}
+            onClick={submitNote}
+          >
+            {noteSubmitting ? "Adding..." : "Add note"}
+          </Button>
+        </div>
+      )}
     </li>
   );
 }
@@ -337,7 +501,11 @@ function answerLabel(decision: Decision): string {
     const opt = decision.options.find((o) => o.value === v);
     return opt ? opt.label : v;
   });
-  return labels.join(", ");
+  let text = labels.join(", ");
+  if (decision.answer?.note) {
+    text = `${text} (${decision.answer.note})`;
+  }
+  return text;
 }
 
 /** Expandable supersession lineage for a revised decision. Fetches the chain
@@ -412,7 +580,11 @@ function HistoryTrail({ decisionId }: { decisionId: string }) {
                     {d.question}
                   </span>
                   <span className="pl-4 text-shell-text-tertiary">
-                    {d.status === "superseded" ? "superseded" : answerLabel(d)}
+                    {d.status === "superseded"
+                      ? "superseded"
+                      : d.status === "withdrawn"
+                        ? "withdrawn"
+                        : answerLabel(d)}
                     {" · "}
                     {relativeTime(d.answer?.answered_at ?? d.created_at)}
                   </span>
@@ -430,6 +602,7 @@ function HistoryTrail({ decisionId }: { decisionId: string }) {
 }
 
 function AnsweredCard({ decision }: { decision: Decision }) {
+  const notes = decision.notes || [];
   return (
     <li className="flex flex-col gap-2 rounded-xl border border-shell-border bg-shell-surface p-4">
       <div className="flex flex-wrap items-center gap-2">
@@ -442,16 +615,40 @@ function AnsweredCard({ decision }: { decision: Decision }) {
         <span className="ml-auto text-xs text-shell-text-tertiary">
           {decision.answer?.answered_at
             ? relativeTime(decision.answer.answered_at)
-            : relativeTime(decision.created_at)}
+            : decision.withdrawn_at
+              ? relativeTime(decision.withdrawn_at)
+              : relativeTime(decision.created_at)}
         </span>
       </div>
       <p className="text-sm font-medium text-shell-text">{decision.question}</p>
-      <div className="flex items-center gap-2 text-sm">
-        <CheckCircle2 size={15} className="shrink-0 text-accent" />
-        <span className="text-shell-text-secondary">
-          {decision.status === "superseded" ? "Superseded" : answerLabel(decision)}
-        </span>
-      </div>
+      {decision.status === "withdrawn" ? (
+        <div className="flex items-start gap-2 text-sm">
+          <X size={15} className="mt-0.5 shrink-0 text-shell-text-tertiary" aria-hidden="true" />
+          <span className="text-shell-text-secondary">
+            Withdrawn by {decision.withdrawn_by || decision.from_agent}
+            {decision.withdraw_reason ? `: ${decision.withdraw_reason}` : ""}
+          </span>
+        </div>
+      ) : (
+        <div className="flex items-center gap-2 text-sm">
+          <CheckCircle2 size={15} className="shrink-0 text-accent" />
+          <span className="text-shell-text-secondary">
+            {decision.status === "superseded" ? "Superseded" : answerLabel(decision)}
+          </span>
+        </div>
+      )}
+      {notes.length > 0 && (
+        <div className="flex flex-col gap-1.5 border-l border-shell-border pl-3">
+          {notes.map((n) => (
+            <div key={n.id} className="flex flex-col gap-0.5 text-xs">
+              <span className="text-shell-text-secondary">{n.text}</span>
+              <span className="text-shell-text-tertiary">
+                {n.author} · {relativeTime(n.created_at)}
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
       {decision.parent_decision_id && <HistoryTrail decisionId={decision.id} />}
     </li>
   );
@@ -495,23 +692,130 @@ function AuthRequestCard({
         requestId={req.id}
         scopes={req.requested_scopes}
         requestedProjectId={req.project_id}
+        humanDuration={req.human_duration}
         onResolved={onResolved}
       />
     </li>
   );
 }
 
-type TabKey = "pending" | "answered";
+function ScopeRequestCard({
+  req,
+  onResolved,
+}: {
+  req: ScopeRequest;
+  onResolved: () => void;
+}) {
+  // Every requested scope starts ticked; unticking narrows the grant. The
+  // backend enforces narrow-not-widen, so only a subset can ever be sent.
+  const [granted, setGranted] = useState<string[]>(req.requested_scopes);
+  function toggle(scope: string) {
+    setGranted((cur) =>
+      cur.includes(scope)
+        ? cur.filter((s) => s !== scope)
+        : req.requested_scopes.filter((s) => s === scope || cur.includes(s)),
+    );
+  }
+  const display = req.agent_display_name?.trim();
+  return (
+    <li className="flex flex-col gap-2 rounded-xl border border-shell-border bg-shell-bg-deep p-4">
+      <div className="flex flex-wrap items-center gap-2">
+        <span className="inline-flex items-center gap-1 rounded-full bg-amber-500/10 px-2 py-0.5 text-xs font-medium text-amber-400">
+          <KeyRound size={11} className="shrink-0" />
+          Scope request
+        </span>
+        {/* The agent-supplied project_id is only what was ASKED for. The
+            binding that will actually apply is shown by ConsentActions below:
+            a global-capable grant lands OS-wide regardless (#3452). */}
+        <span className="rounded-full bg-shell-surface px-2 py-0.5 text-xs text-shell-text-secondary">
+          {req.project_id ? (
+            <>
+              Requested project <code>{req.project_id}</code>
+            </>
+          ) : (
+            "No project requested"
+          )}
+        </span>
+        {req.created_ts && (
+          <span className="ml-auto inline-flex items-center gap-1 text-xs text-shell-text-tertiary">
+            <Clock size={11} className="shrink-0" />
+            {relativeTime(req.created_ts)}
+          </span>
+        )}
+      </div>
+      <p className="text-sm font-medium text-shell-text break-all">
+        {display && display !== req.canonical_id && <span className="mr-1.5">{display}</span>}
+        <code className="text-xs text-shell-text-secondary">{req.canonical_id}</code>
+      </p>
+      {req.reason && (
+        <p className="text-xs italic text-shell-text-secondary">"{req.reason}"</p>
+      )}
+      <fieldset className="flex flex-wrap gap-2">
+        <legend className="sr-only">Scopes to grant</legend>
+        {req.requested_scopes.map((s) => (
+          <label
+            key={s}
+            className="inline-flex items-center gap-1 rounded bg-shell-surface px-2 py-0.5 text-[11px] font-mono text-shell-text-secondary"
+          >
+            <input
+              type="checkbox"
+              checked={granted.includes(s)}
+              onChange={() => toggle(s)}
+              aria-label={`Grant ${s}`}
+            />
+            {s}
+          </label>
+        ))}
+      </fieldset>
+      <ConsentActions
+        requestId={req.id}
+        source="agent_scope_requests"
+        canonicalId={req.canonical_id}
+        scopes={req.requested_scopes}
+        grantedScopes={granted}
+        requestedProjectId={req.project_id ?? undefined}
+        denyReasonRequired
+        showEffectiveBinding
+        onResolved={onResolved}
+      />
+    </li>
+  );
+}
+
+type TabKey = "pending" | "answered" | "withdrawn";
 
 export function DecisionsApp({ windowId: _windowId }: { windowId: string }) {
   const [tab, setTab] = useState<TabKey>("pending");
   const [pending, setPending] = useState<Decision[]>([]);
   const [answered, setAnswered] = useState<Decision[]>([]);
+  const [withdrawn, setWithdrawn] = useState<Decision[]>([]);
   const [authRequests, setAuthRequests] = useState<AuthRequest[]>([]);
+  const [scopeRequests, setScopeRequests] = useState<ScopeRequest[]>([]);
   const [loading, setLoading] = useState(true);
+  const latestSeq = useRef(0);
 
   const load = useCallback(async (opts?: { silent?: boolean }) => {
+    const seq = ++latestSeq.current;
     if (!opts?.silent) setLoading(true);
+    // Pending agent scope requests (tsk-6ghcrv) load on their own task, started
+    // before the Promise.all below: a 403 (caller owns no agents) or a network
+    // error here must not blank the decisions inbox, and a failed decisions
+    // load must not stop this list from loading either.
+    void (async () => {
+      try {
+        const sRes = await fetch("/api/agents/scope-requests?status=pending", {
+          credentials: "include",
+        });
+        if (sRes.ok) {
+          const data = await sRes.json();
+          const reqs = data?.requests;
+          if (seq === latestSeq.current)
+            setScopeRequests(Array.isArray(reqs) ? (reqs as ScopeRequest[]) : []);
+        }
+      } catch {
+        // Best-effort: keep the last scope-request list in place.
+      }
+    })();
     try {
       const [pRes, aRes, rRes] = await Promise.all([
         fetch("/api/decisions?status=pending", { credentials: "include" }),
@@ -520,16 +824,40 @@ export function DecisionsApp({ windowId: _windowId }: { windowId: string }) {
       ]);
       // Only overwrite a list when its request actually succeeded; a transient
       // failure must not blank out decisions the user can still act on.
-      if (pRes.ok) setPending(asDecisionList(await pRes.json()));
-      if (aRes.ok) setAnswered(asDecisionList(await aRes.json()));
+      // The seq re-check must sit AFTER each awaited json() parse — a newer
+      // load can start while a body is still streaming, and a check placed
+      // before the await would let the stale body land anyway.
+      if (pRes.ok) {
+        const next = asDecisionList(await pRes.json());
+        if (seq === latestSeq.current) setPending(next);
+      }
+      if (aRes.ok) {
+        const next = asDecisionList(await aRes.json());
+        if (seq === latestSeq.current) setAnswered(next);
+      }
       if (rRes.ok) {
         const data = await rRes.json();
         const reqs = (data?.requests ?? data ?? []) as AuthRequest[];
-        setAuthRequests(Array.isArray(reqs) ? reqs : []);
+        if (seq === latestSeq.current) setAuthRequests(Array.isArray(reqs) ? reqs : []);
+      }
+      // Withdrawn decisions (tsk-5dulr5) load on their own, outside the
+      // Promise.all above, so a failure here never blanks the pending inbox.
+      try {
+        const wRes = await fetch("/api/decisions?status=withdrawn", { credentials: "include" });
+        if (wRes.ok) {
+          const next = asDecisionList(await wRes.json());
+          if (seq === latestSeq.current) setWithdrawn(next);
+        }
+      } catch {
+        // Best-effort: keep the last withdrawn list in place.
       }
     } catch {
       // Network error: keep whatever was last loaded in place.
     } finally {
+      // Deliberately NOT seq-guarded: loading tracks this non-silent call's
+      // own lifecycle. Only the mount load is non-silent; if a silent focus
+      // refresh outraces it, a guarded clear would leave "Loading..." stuck
+      // forever with data already on screen.
       if (!opts?.silent) setLoading(false);
     }
   }, []);
@@ -538,12 +866,24 @@ export function DecisionsApp({ windowId: _windowId }: { windowId: string }) {
     load();
   }, [load]);
 
+  // Silent: a background refresh must not swap the decisions the user is
+  // reading for the loading placeholder.
+  const refreshSilently = useCallback(() => load({ silent: true }), [load]);
+  useRefreshOnFocus(refreshSilently);
+
+  const { stale } = useOsEvents(["decision.answered", "decision.note", "decision.withdrawn"], () => {
+    void refreshSilently();
+  });
+
   const answer = useCallback(
-    async (id: string, value: string | string[]) => {
+    async (id: string, value: string | string[], otherValue?: string, note?: string) => {
+      const body: Record<string, unknown> = { value };
+      if (otherValue !== undefined) body.other_value = otherValue;
+      if (note !== undefined) body.note = note;
       const res = await fetch(`/api/decisions/${id}/answer`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ value }),
+        body: JSON.stringify(body),
       });
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
@@ -552,14 +892,31 @@ export function DecisionsApp({ windowId: _windowId }: { windowId: string }) {
           typeof detail === "string" ? detail : "Could not record answer.",
         );
       }
-      // Silent refresh: avoid flashing the full-screen Loading state and the
-      // list re-mount on every answer.
       await load({ silent: true });
     },
     [load],
   );
 
-  const list = tab === "pending" ? pending : answered;
+  const addNote = useCallback(
+    async (id: string, text: string) => {
+      const res = await fetch(`/api/decisions/${id}/note`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text }),
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        const detail = data?.detail;
+        throw new Error(
+          typeof detail === "string" ? detail : "Could not add note.",
+        );
+      }
+      await load({ silent: true });
+    },
+    [load],
+  );
+
+  const list = tab === "pending" ? pending : tab === "answered" ? answered : withdrawn;
 
   return (
     <div className="flex h-full flex-col overflow-hidden bg-shell-bg">
@@ -567,6 +924,9 @@ export function DecisionsApp({ windowId: _windowId }: { windowId: string }) {
       <div className="flex items-center gap-2 border-b border-shell-border px-5 py-4">
         <Inbox size={18} className="text-accent" />
         <h1 className="text-base font-semibold text-shell-text">Decisions</h1>
+        {stale && (
+          <span className="text-[11px] text-shell-text-tertiary" aria-label="live updates paused">paused</span>
+        )}
         {pending.length > 0 && (
           <span className="ml-1 inline-flex h-5 min-w-[20px] items-center justify-center rounded-full bg-accent px-1.5 text-xs font-semibold text-shell-bg">
             {pending.length}
@@ -576,7 +936,7 @@ export function DecisionsApp({ windowId: _windowId }: { windowId: string }) {
 
       {/* Tabs */}
       <div className="flex items-center gap-1 border-b border-shell-border px-5 py-2.5">
-        {(["pending", "answered"] as const).map((t) => (
+        {(["pending", "answered", "withdrawn"] as const).map((t) => (
           <button
             key={t}
             type="button"
@@ -591,7 +951,9 @@ export function DecisionsApp({ windowId: _windowId }: { windowId: string }) {
           >
             {t === "pending"
               ? `Pending${pending.length ? ` (${pending.length})` : ""}`
-              : "Archive"}
+              : t === "answered"
+                ? "Archive"
+                : "Withdrawn"}
           </button>
         ))}
       </div>
@@ -617,6 +979,26 @@ export function DecisionsApp({ windowId: _windowId }: { windowId: string }) {
             </ul>
           </section>
         )}
+        {/* Pending agent scope requests (tsk-6ghcrv): an existing agent asking
+            for more scopes on its own identity. Approve can grant a subset;
+            deny requires a reason. */}
+        {tab === "pending" && scopeRequests.length > 0 && (
+          <section className="mb-4 flex flex-col gap-2" aria-label="Scope requests">
+            <h2 className="flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wide text-shell-text-tertiary">
+              <KeyRound size={13} className="shrink-0 text-amber-400" />
+              Scope requests ({scopeRequests.length})
+            </h2>
+            <ul className="flex flex-col gap-2">
+              {scopeRequests.map((req) => (
+                <ScopeRequestCard
+                  key={req.id}
+                  req={req}
+                  onResolved={() => load({ silent: true })}
+                />
+              ))}
+            </ul>
+          </section>
+        )}
         {loading ? (
           <p className="text-sm text-shell-text-tertiary">Loading...</p>
         ) : list.length === 0 ? (
@@ -625,14 +1007,16 @@ export function DecisionsApp({ windowId: _windowId }: { windowId: string }) {
             <p className="text-sm text-shell-text-secondary">
               {tab === "pending"
                 ? "No decisions waiting on you."
-                : "No answered decisions yet."}
+                : tab === "answered"
+                  ? "No answered decisions yet."
+                  : "No withdrawn decisions."}
             </p>
           </div>
         ) : (
           <ul className="flex flex-col gap-3">
             {list.map((d) =>
               tab === "pending" ? (
-                <DecisionCard key={d.id} decision={d} onAnswer={answer} />
+                <DecisionCard key={d.id} decision={d} onAnswer={answer} onAddNote={addNote} />
               ) : (
                 <AnsweredCard key={d.id} decision={d} />
               ),

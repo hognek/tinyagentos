@@ -15,6 +15,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+from tinyagentos.routes.decisions import SERVER_RAISED_KEY
 
 from tinyagentos.auth_context import CurrentUser, current_user
 from tinyagentos.userspace.capabilities import (
@@ -68,6 +69,7 @@ def app_grant_decision_payload(app_id: str, capabilities: list[str]) -> dict:
             {"label": describe_capability(c), "value": c} for c in capabilities
         ],
         "metadata": {
+            SERVER_RAISED_KEY: True,
             "kind": "app_grant",
             "app_id": app_id,
             "capabilities": list(capabilities),
@@ -214,11 +216,28 @@ async def request_app_consent(
     if notifs is not None:
         # Best effort: a notification failure must not fail the queued decision.
         try:
+            raw_options = [
+                {"label": str(o.get("label", o.get("value", ""))), "value": str(o.get("value", o.get("label", "")))}
+                for o in (decision.get("options") or [])
+            ]
+            capped = [
+                {"label": o["label"][:40], "value": o["value"]}
+                for o in raw_options[:4]
+            ]
             await notifs.add(
                 title="Permission needed",
                 message=f"{app_id} is requesting permissions",
                 level="warning",
                 source="decisions",
+                data={
+                    "decision_type": "multi_select",
+                    "options": capped,
+                    "decision_id": decision["id"],
+                    "kind": "decision",
+                    "url": f"/decisions/{decision['id']}",
+                    "priority": "blocking",
+                    "from_agent": decision.get("from_agent", "@taos-app-install"),
+                },
             )
         except Exception:
             pass

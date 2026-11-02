@@ -171,9 +171,10 @@ workspace-isolation section below draws that boundary.
 - Code-based pairing precedent: cluster pairing stores `sha256(code)` only,
   compares with `hmac.compare_digest`, expires pending entries after 15
   minutes, caps failed attempts at 5, enforces single-use by DELETE-on-claim,
-  and rate-limits the unauthenticated claim endpoint per client IP (fixed
-  window, 20 per 10s). (`tinyagentos/cluster/pairing_store.py`,
-  `tinyagentos/routes/cluster.py`)
+  and rate-limits the unauthenticated claim endpoint per client IP (moving
+  window, at most 20 in any 10s span, 429 with `Retry-After`).
+  (`tinyagentos/cluster/pairing_store.py`, `tinyagentos/routes/cluster.py`,
+  `tinyagentos/rate_limit.py`)
 - Address knowledge: `controller_callback_host` resolves, in order, an
   operator override, the Tailscale IP (`tailscale ip -4`), then
   `app.state.controller_lan_ip`. `taosnet/mesh.py::mesh_status()` reports
@@ -415,10 +416,10 @@ agent with a stored token can re-discover addresses without a new invite).
   },
   "controller": {
     "endpoints": [
-      {"kind": "lan",   "url": "http://192.168.1.20:6969",  "priority": 1},
-      {"kind": "lan",   "url": "http://10.0.40.5:6969",     "priority": 2},
-      {"kind": "mesh",  "url": "http://100.64.0.7:6969",    "priority": 3},
-      {"kind": "relay", "url": "https://jay.taos.my",        "priority": 4}
+      {"kind": "relay", "url": "https://jay.taos.my",        "priority": 1},
+      {"kind": "lan",   "url": "http://192.168.1.20:6969",  "priority": 2},
+      {"kind": "lan",   "url": "http://10.0.40.5:6969",     "priority": 3},
+      {"kind": "mesh",  "url": "http://100.64.0.7:6969",    "priority": 4}
     ],
     "health_path": "/api/health",
     "registry_pubkey_path": "/api/agents/registry/pubkey"
@@ -464,10 +465,11 @@ Field sourcing:
 - `mesh` endpoint: `mesh_status().node_ip` when joined. Included because the
   remote machine may already be on the same tailnet (Jay's laptop is); a
   non-mesh machine simply fails the probe and moves on.
-- `relay` endpoint: present only when account-linked + mesh joined. The
-  public relay hostname is not currently persisted by
-  `mesh_credentials.py` (it stores account_id/host_id/tailnet_name); the
-  join ready payload or an account call must supply it (open question 6).
+- `relay` endpoint: present when `TAOS_CONTROLLER_RELAY_URL` is configured
+  with an `https://` URL. The relay is emitted at
+  priority 1, ahead of LAN and mesh endpoints. An `http://` relay URL or a
+  public `TAOS_CONTROLLER_CALLBACK_HOST` is omitted with a logged warning
+  rather than advertised in cleartext.
 - `apis`: exactly the agent-JWT-reachable surface from
   `auth_middleware._AGENT_TASK_ROUTES` and `_A2A_BUS_*_PATHS`. Note the raw
   bus (:7900) is deliberately NOT in the bundle: it is unauthenticated and
@@ -514,7 +516,8 @@ gates even that.
    member list.
 
 Failure modes: wrong PIN (403, attempts increment), expired (410), already
-redeemed (409), rate-limited (429), all with actionable bodies. The agent-side
+redeemed (409), rate-limited (429 with `Retry-After`), all with actionable
+bodies. The agent-side
 instruction text shown in the dialog covers "if the URL is unreachable, ask
 the operator for the local network link".
 
@@ -524,8 +527,8 @@ Members panel (`desktop/src/apps/ProjectsApp/ProjectMembers.tsx`):
 
 - An "Invite external agent" action beside the existing add-member control.
 - Mint dialog: scope checkboxes (default checked: `project_tasks`,
-  `a2a_send`, `a2a_receive`; unchecked: `memory_read`, `memory_write`;
-  `files_*` and `tools_execute` not offered in v1). `project_tasks` is shown
+  `a2a_send`, `a2a_receive`; unchecked: `files_read`, `files_write`;
+  `memory_read`, `memory_write` were removed from the grantable vocabulary (no route enforces them; agent tokens are refused on `/api/memory/*` and `/api/user-memory/*` by auth_middleware). `project_tasks` is shown
   checked and DISABLED with a "required for project invites" hint, so the
   operator cannot mint a project invite that would not confer membership. The
   harness name is NOT set here: it is declared by the connecting agent at
