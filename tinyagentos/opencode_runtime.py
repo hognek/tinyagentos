@@ -143,6 +143,17 @@ class OpenCodeServerConfig:
     model_ids: list[str]
     """Model IDs to expose under the ``litellm`` provider, e.g. ``["gpt-4o"]``."""
 
+    github_token: str | None = None
+    """Short-lived GitHub token to expose to the agent as ``GITHUB_TOKEN``.
+
+    Set at session start from the agent's granted GitHub access and refreshed
+    in place (via :meth:`OpenCodeServer.set_github_token`) before the token
+    expires during long sessions. The running server's process env cannot be
+    mutated after spawn, so the fresh value is also written to a 0600
+    credential file in the agent's home that the PR-ops skill re-exports
+    before `git push` / `gh pr create`.
+    """
+
     binary: str = "opencode"
     """Path or name of the opencode binary."""
 
@@ -199,6 +210,49 @@ class OpenCodeServer:
             logger.debug("opencode_runtime: could not chmod %s", config_path)
         logger.debug("opencode_runtime: wrote config to %s", config_path)
 
+    # ------------------------------------------------------- github token env
+
+    def _github_token_file(self) -> Path:
+        """Path of the agent GitHub token credential file inside the server home."""
+        return Path(self._cfg.home) / ".taos-github-token"
+
+    def _write_github_token_file(self) -> None:
+        """Write the current token to a 0600 credential file in the agent home.
+
+        A long-lived server's process env is fixed at spawn, so once the
+        short-lived token rotates during a session the running process cannot
+        see the new value through ``GITHUB_TOKEN``. The PR-ops skill tells the
+        agent to ``export GITHUB_TOKEN="$(cat $HOME/.taos-github-token)"``
+        before ``git push`` / ``gh pr create`` so it always uses the freshest
+        token even over a multi-hour session. Best-effort: failures only log.
+        """
+        token = self._cfg.github_token
+        if not token:
+            return
+        path = self._github_token_file()
+        try:
+            path.write_text(token + "\n", encoding="utf-8")
+            os.chmod(path, 0o600)
+        except OSError:
+            logger.debug("opencode_runtime: could not write github token file %s", path)
+
+    def set_github_token(self, token: str | None) -> None:
+        """Refresh the agent's GitHub token for a long-running session.
+
+        Updates the in-memory config and rewrites the 0600 credential file so
+        the agent picks up the new value before the old token expires. The
+        running server's process env is untouched (it is immutable after
+        spawn); the credential file is the rotation channel.
+        """
+        self._cfg.github_token = token
+        if token:
+            self._write_github_token_file()
+        else:
+            try:
+                self._github_token_file().unlink(missing_ok=True)
+            except OSError:
+                logger.debug("opencode_runtime: could not remove github token file")
+
     # ---------------------------------------------------------------- lifecycle
 
     @property
@@ -241,6 +295,14 @@ class OpenCodeServer:
         }
         if self._cfg.server_password:
             env["OPENCODE_SERVER_PASSWORD"] = self._cfg.server_password
+        if self._cfg.github_token:
+            # Expose the agent's granted GitHub token to the server and every
+            # shell command it spawns (git push / gh pr create). ``GH_TOKEN``
+            # takes precedence in the ``gh`` CLI, but ``GITHUB_TOKEN`` is the
+            # conventional name git tooling reads; set both.
+            env["GITHUB_TOKEN"] = self._cfg.github_token
+            env["GH_TOKEN"] = self._cfg.github_token
+            self._write_github_token_file()
 
         # Redirect output to a log file rather than PIPE: a long-lived server
         # with an unread PIPE deadlocks once the OS buffer fills, and we still

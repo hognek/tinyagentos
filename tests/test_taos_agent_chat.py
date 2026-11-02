@@ -654,3 +654,180 @@ async def test_chat_normal_stream_no_spurious_error(client, app, monkeypatch):
     assert len(delta_items) == 1
     assert delta_items[0]["delta"] == "pong"
     assert items[-1] == {"done": True}
+
+
+# ---------------------------------------------------------------------------
+# ensure_taos_opencode_server: GitHub token injection + refresh
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_ensure_server_injects_github_token_into_config(tmp_path, monkeypatch):
+    """When app.state exposes secrets/config/http_client and a token is
+    resolvable, the freshly built server config carries it as github_token."""
+    import tinyagentos.taos_agent_runtime as rt
+
+    spawned_cfgs: list = []
+    refresh_calls: list = []
+
+    class _FakeServer:
+        def __init__(self, cfg):
+            spawned_cfgs.append(cfg)
+            self._cfg = cfg
+
+        async def ensure_running(self, **kwargs):
+            pass
+
+        async def stop(self):
+            pass
+
+        @property
+        def base_url(self):
+            return f"http://127.0.0.1:{self._cfg.port}"
+
+        def is_running(self):
+            return True
+
+        def set_github_token(self, token):
+            refresh_calls.append(token)
+
+    monkeypatch.setattr(rt, "OpenCodeServer", _FakeServer)
+    resolve_mock = AsyncMock(return_value="ghs_runtime_token")
+    monkeypatch.setattr(rt, "_resolve_taos_github_token", resolve_mock)
+
+    mock_proxy = MagicMock()
+    mock_proxy.create_agent_key = AsyncMock(return_value="sk-test")
+    mock_proxy.is_running.return_value = True
+
+    state = SimpleNamespace(
+        data_dir=tmp_path,
+        llm_proxy=mock_proxy,
+        secrets=AsyncMock(),
+        config=MagicMock(),
+        http_client=AsyncMock(),
+        taos_opencode_password=None,
+        taos_opencode_server=None,
+        taos_opencode_model=None,
+        taos_opencode_session_id=None,
+    )
+
+    await rt.ensure_taos_opencode_server(state, "gpt-4o")
+
+    assert len(spawned_cfgs) == 1
+    assert spawned_cfgs[0].github_token == "ghs_runtime_token"
+    # A fresh server gets the token pushed once after construction.
+    assert refresh_calls == ["ghs_runtime_token"]
+    # env injection path used the resolved token.
+    resolve_mock.assert_awaited_once_with(state)
+
+
+@pytest.mark.asyncio
+async def test_ensure_server_refreshes_token_on_existing_server(tmp_path, monkeypatch):
+    """A long-lived server gets set_github_token called every call so the
+    short-lived token is rotated before expiry (the env is fixed at spawn;
+    the credential file is the rotation channel)."""
+    import tinyagentos.taos_agent_runtime as rt
+
+    refresh_calls: list = []
+
+    class _FakeServer:
+        def __init__(self, cfg):
+            self._cfg = cfg
+
+        async def ensure_running(self, **kwargs):
+            pass
+
+        async def stop(self):
+            pass
+
+        @property
+        def base_url(self):
+            return f"http://127.0.0.1:{self._cfg.port}"
+
+        def is_running(self):
+            return True
+
+        def set_github_token(self, token):
+            refresh_calls.append(token)
+
+    server = _FakeServer(MagicMock())
+    monkeypatch.setattr(rt, "OpenCodeServer", _FakeServer)
+
+    mock_proxy = MagicMock()
+    mock_proxy.create_agent_key = AsyncMock(return_value="sk-test")
+    mock_proxy.is_running.return_value = True
+
+    tokens = iter(["ghs_first", "ghs_refreshed"])
+
+    async def _fake_resolve(app_state):
+        return next(tokens)
+
+    monkeypatch.setattr(rt, "_resolve_taos_github_token", _fake_resolve)
+
+    state = SimpleNamespace(
+        data_dir=tmp_path,
+        llm_proxy=mock_proxy,
+        secrets=AsyncMock(),
+        config=MagicMock(),
+        http_client=AsyncMock(),
+        taos_opencode_password=None,
+        taos_opencode_server=server,
+        taos_opencode_model="gpt-4o",
+        taos_opencode_session_id=None,
+    )
+
+    await rt.ensure_taos_opencode_server(state, "gpt-4o")
+    await rt.ensure_taos_opencode_server(state, "gpt-4o")
+
+    # The server exists (not rebuilt): each call refreshed the token.
+    assert refresh_calls == ["ghs_first", "ghs_refreshed"]
+    # keep the fake server's config usable if a future test asserts on it
+    assert server._cfg is not None
+
+
+@pytest.mark.asyncio
+async def test_ensure_server_without_secrets_omits_token(tmp_path, monkeypatch):
+    """When app.state lacks the secrets store (early tests, degraded wiring),
+    no token is resolved and the server config has github_token=None."""
+    import tinyagentos.taos_agent_runtime as rt
+
+    spawned_cfgs: list = []
+
+    class _FakeServer:
+        def __init__(self, cfg):
+            spawned_cfgs.append(cfg)
+            self._cfg = cfg
+
+        async def ensure_running(self, **kwargs):
+            pass
+
+        async def stop(self):
+            pass
+
+        @property
+        def base_url(self):
+            return f"http://127.0.0.1:{self._cfg.port}"
+
+        def is_running(self):
+            return True
+
+    monkeypatch.setattr(rt, "OpenCodeServer", _FakeServer)
+    # _resolve_taos_github_token is left real: without a secrets store on
+    # app.state its getattr guards return None, so this also exercises the
+    # degraded-wiring path of the helper.
+    mock_proxy = MagicMock()
+    mock_proxy.create_agent_key = AsyncMock(return_value="sk-test")
+    mock_proxy.is_running.return_value = True
+
+    state = SimpleNamespace(
+        data_dir=tmp_path,
+        llm_proxy=mock_proxy,
+        taos_opencode_password=None,
+        taos_opencode_server=None,
+        taos_opencode_model=None,
+        taos_opencode_session_id=None,
+    )
+
+    await rt.ensure_taos_opencode_server(state, "gpt-4o")
+
+    assert len(spawned_cfgs) == 1
+    assert spawned_cfgs[0].github_token is None

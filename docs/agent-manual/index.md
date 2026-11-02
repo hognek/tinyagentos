@@ -20,3 +20,12 @@ Run `python3 scripts/build-agent-manual.py` to compile these into `docs/taos-age
 | `09-os-control.md` | Driving the desktop: open_app / arrange_windows tools |
 | `10-image-prompting.md` | Writing good prompts for the generate_image tool |
 | `11-files-api.md` | Project Files REST API for agents: upload (multipart), list, fetch, and the one-write principle |
+
+## Standalone skill docs (not compiled into the always-on manual)
+
+These are on-demand skills the agent loads when a task needs them, so they do
+not bloat every session's context window. Reference them from this index.
+
+| File | When the agent should load it |
+|---|---|
+| `../agent-skill-github-prs.md` | The agent is asked to open a pull request: clone → branch → commit → push → `gh pr create`, using its granted short-lived `GITHUB_TOKEN` (rotated via `$HOME/.taos-github-token`) |

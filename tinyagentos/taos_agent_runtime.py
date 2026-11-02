@@ -18,6 +18,27 @@ logger = logging.getLogger(__name__)
 TAOS_OPENCODE_PORT = 4188  # local-only port for the taOS agent opencode server
 
 
+async def _resolve_taos_github_token(app_state) -> str | None:
+    """Fetch the taOS agent's granted GitHub token, if any.
+
+    Returns ``None`` (silently) whenever the pieces needed to mint one are not
+    wired — no GitHub App configured, no ``secrets`` store on ``app.state``, or
+    the ``taos-agent`` has no GitHub grants. The lookup is expiry-aware via the
+    lifetime cache in :mod:`tinyagentos.github_token`, so calling this on every
+    turn transparently returns a **fresh** token whenever the cached one falls
+    inside the 5-minute refresh window — no opencode restart required.
+    """
+    secrets_store = getattr(app_state, "secrets", None)
+    config = getattr(app_state, "config", None)
+    http_client = getattr(app_state, "http_client", None)
+    if secrets_store is None or config is None or http_client is None:
+        return None
+    from tinyagentos.github_token import inject_agent_token
+    return await inject_agent_token(
+        "taos-agent", {}, secrets_store, config, http_client
+    )
+
+
 async def ensure_taos_opencode_server(app_state, model: str) -> OpenCodeServer:
     """Lazily create and start the taOS agent opencode server.
 
@@ -73,6 +94,13 @@ async def ensure_taos_opencode_server(app_state, model: str) -> OpenCodeServer:
         app_state.taos_opencode_server = None
         app_state.taos_opencode_session_id = None
         existing = None
+
+    # Resolve the agent's granted GitHub token once per call. This is the
+    # expiry-aware refresh: driving the lifetime cache, repeated calls over a
+    # long session hand back a fresh token exactly when the previous one is
+    # about to expire (see _resolve_taos_github_token). Returns None when the
+    # agent has no grant or the GitHub App is unconfigured.
+    github_token = await _resolve_taos_github_token(app_state)
 
     if existing is None:
         # Read the taos_agent prefs once: the permitted set (to scope the key)
@@ -141,6 +169,7 @@ async def ensure_taos_opencode_server(app_state, model: str) -> OpenCodeServer:
             litellm_base_url=f"http://127.0.0.1:{llm_proxy.port if llm_proxy is not None else 7834}/v1",
             litellm_key=litellm_key,
             model_ids=permitted_models,
+            github_token=github_token,
         )
         server = OpenCodeServer(cfg)
         app_state.taos_opencode_server = server
@@ -150,6 +179,17 @@ async def ensure_taos_opencode_server(app_state, model: str) -> OpenCodeServer:
             app_state.taos_opencode_session_id = None
 
     server = app_state.taos_opencode_server
+    # Long-lived server already running: refresh its token in place. The
+    # running process env is immutable after spawn, so the fresh short-lived
+    # value lands in the 0600 credential file the PR-ops skill has the agent
+    # re-export before git push / gh pr create. No-op when the server has no
+    # token setter (tests) or no token was resolvable.
+    refresh = getattr(server, "set_github_token", None)
+    if refresh is not None:
+        try:
+            refresh(github_token)
+        except Exception:
+            logger.debug("taos_agent_runtime: github token refresh failed", exc_info=True)
     # Generous deadline: opencode's first run on a fresh home performs a one-time
     # SQLite migration that can take a couple of minutes; a short deadline would
     # spuriously time out the very first taOS-agent chat.

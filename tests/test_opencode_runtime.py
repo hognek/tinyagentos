@@ -572,3 +572,118 @@ async def test_drive_turn_rejects_non_positive_timeout():
             model_id="gpt-4o",
             turn_timeout=0,
         )
+
+
+# ---------------------------------------------------------------------------
+# GitHub token env injection + credential file
+# ---------------------------------------------------------------------------
+
+class _FakeProcTok:
+    returncode = None
+    pid = 999
+
+    async def wait(self):
+        return None
+
+
+@pytest.mark.asyncio
+async def test_ensure_running_injects_github_token_env(tmp_path, monkeypatch):
+    """ensure_running passes GITHUB_TOKEN + GH_TOKEN into the server env when
+    the config carries a github_token, and writes the 0600 credential file."""
+    import os
+
+    from tinyagentos.opencode_runtime import OpenCodeServer, OpenCodeServerConfig
+
+    cfg = OpenCodeServerConfig(
+        home=str(tmp_path),
+        port=5901,
+        server_password=None,
+        litellm_base_url="http://127.0.0.1:4000/v1",
+        litellm_key="sk-test",
+        model_ids=["m1"],
+        github_token="ghs_env_injected",
+    )
+    server = OpenCodeServer(cfg)
+
+    captured_env: dict = {}
+
+    async def fake_create_subprocess(*args, **kwargs):
+        captured_env.update(kwargs.get("env", {}))
+        return _FakeProcTok()
+
+    async def fake_health(self_inner):
+        return True
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess)
+    monkeypatch.setattr(OpenCodeServer, "_health_check", fake_health)
+
+    await server.ensure_running()
+
+    assert captured_env.get("GITHUB_TOKEN") == "ghs_env_injected"
+    assert captured_env.get("GH_TOKEN") == "ghs_env_injected"
+    # The credential file is the rotation channel for long sessions.
+    cred_file = tmp_path / ".taos-github-token"
+    assert cred_file.exists()
+    assert cred_file.read_text() == "ghs_env_injected\n"
+    assert oct(os.stat(cred_file).st_mode & 0o777) == "0o600"
+
+
+@pytest.mark.asyncio
+async def test_ensure_running_omits_github_token_when_not_set(tmp_path, monkeypatch):
+    """When no token is configured, the env is left without GITHUB_TOKEN."""
+    from tinyagentos.opencode_runtime import OpenCodeServer, OpenCodeServerConfig
+
+    cfg = OpenCodeServerConfig(
+        home=str(tmp_path),
+        port=5902,
+        server_password=None,
+        litellm_base_url="http://127.0.0.1:4000/v1",
+        litellm_key="sk-test",
+        model_ids=["m1"],
+    )
+    server = OpenCodeServer(cfg)
+
+    captured_env: dict = {}
+
+    async def fake_create_subprocess(*args, **kwargs):
+        captured_env.update(kwargs.get("env", {}))
+        return _FakeProcTok()
+
+    async def fake_health(self_inner):
+        return True
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess)
+    monkeypatch.setattr(OpenCodeServer, "_health_check", fake_health)
+
+    await server.ensure_running()
+
+    assert "GITHUB_TOKEN" not in captured_env
+    assert "GH_TOKEN" not in captured_env
+    assert not (tmp_path / ".taos-github-token").exists()
+
+
+def test_set_github_token_refreshes_credential_file(tmp_path):
+    """set_github_token rewrites the credential file for a rotation, and removes
+    it when the token is cleared."""
+    import os
+
+    from tinyagentos.opencode_runtime import OpenCodeServer, OpenCodeServerConfig
+
+    cfg = OpenCodeServerConfig(
+        home=str(tmp_path),
+        port=5903,
+        server_password=None,
+        litellm_base_url="http://127.0.0.1:4000/v1",
+        litellm_key="sk-test",
+        model_ids=["m1"],
+        github_token="ghs_initial",
+    )
+    server = OpenCodeServer(cfg)
+    cred_file = tmp_path / ".taos-github-token"
+
+    server.set_github_token("ghs_refreshed")
+    assert cred_file.read_text() == "ghs_refreshed\n"
+    assert oct(os.stat(cred_file).st_mode & 0o777) == "0o600"
+
+    server.set_github_token(None)
+    assert not cred_file.exists()

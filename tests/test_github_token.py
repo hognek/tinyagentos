@@ -190,3 +190,70 @@ class TestGetAgentGitHubToken:
 
         assert token == "ghs_agent_token"
         http_client.post.assert_called_once()
+
+
+class TestInjectAgentToken:
+    """Tests for inject_agent_token() — the env-injection wrapper the agent
+    runtime uses to expose the granted short-lived GitHub token."""
+
+    @pytest.mark.asyncio
+    async def test_injects_token_into_env(self, monkeypatch):
+        """A minted token lands in GITHUB_TOKEN and GH_TOKEN; it is returned."""
+        from tinyagentos.github_token import inject_agent_token
+
+        async def _fake_get(agent_name, secrets_store, config, http_client):
+            return "ghs_env_token"
+
+        monkeypatch.setattr(
+            "tinyagentos.github_token.get_agent_github_token", _fake_get
+        )
+
+        env: dict = {"PATH": "/usr/bin"}
+        token = await inject_agent_token(
+            "test-agent", env, AsyncMock(), MagicMock(), AsyncMock(),
+        )
+
+        assert token == "ghs_env_token"
+        assert env["GITHUB_TOKEN"] == "ghs_env_token"
+        assert env["GH_TOKEN"] == "ghs_env_token"
+        assert env["PATH"] == "/usr/bin"  # other keys untouched
+
+    @pytest.mark.asyncio
+    async def test_no_grant_leaves_env_unchanged(self, monkeypatch):
+        """A None lookup (no grant) leaves the env dict unmodified and returns None."""
+        from tinyagentos.github_token import inject_agent_token
+
+        async def _fake_get(agent_name, secrets_store, config, http_client):
+            return None
+
+        monkeypatch.setattr(
+            "tinyagentos.github_token.get_agent_github_token", _fake_get
+        )
+
+        env: dict = {"PATH": "/usr/bin"}
+        token = await inject_agent_token(
+            "test-agent", env, AsyncMock(), MagicMock(), AsyncMock(),
+        )
+
+        assert token is None
+        assert env == {"PATH": "/usr/bin"}
+
+    @pytest.mark.asyncio
+    async def test_mint_failure_degrades_not_raises(self, monkeypatch):
+        """A mint exception is swallowed: leaves env unchanged, returns None."""
+        from tinyagentos.github_token import inject_agent_token
+
+        async def _fake_get(agent_name, secrets_store, config, http_client):
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(
+            "tinyagentos.github_token.get_agent_github_token", _fake_get
+        )
+
+        env: dict = {"PATH": "/usr/bin"}
+        token = await inject_agent_token(
+            "test-agent", env, AsyncMock(), MagicMock(), AsyncMock(),
+        )
+
+        assert token is None
+        assert env == {"PATH": "/usr/bin"}

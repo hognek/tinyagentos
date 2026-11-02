@@ -171,3 +171,42 @@ async def get_agent_github_token(
             return token
 
     return None
+
+
+async def inject_agent_token(
+    agent_name: str,
+    env_dict: dict,
+    secrets_store: SecretsStore,
+    config: AppConfig,
+    http_client: httpx.AsyncClient,
+) -> str | None:
+    """Fetch a short-lived GitHub token for *agent_name* and inject it into
+    *env_dict* as ``GITHUB_TOKEN`` (and ``GH_TOKEN``, which the ``gh`` CLI
+    prefers).
+
+    This is the expiry-aware wrapper the agent runtime calls at session
+    start and again on later turns. Because :func:`get_agent_github_token`
+    rides the lifetime-aware cache in :func:`mint_installation_token`, a
+    repeated call over a long session transparently returns a **fresh**
+    token whenever the cached one falls inside the 5-minute refresh window
+    — no agent process restart is needed to pick up the rotation.
+
+    Never leaves *env_dict* half-set and never raises: an agent with no
+    grant, an unconfigured GitHub App, or a transient mint failure simply
+    runs without a token (``GITHUB_TOKEN`` stays unset), which matches the
+    current behaviour of an agent that has never been granted GitHub access.
+
+    Returns the injected token, or ``None`` if none could be obtained.
+    """
+    try:
+        token = await get_agent_github_token(
+            agent_name, secrets_store, config, http_client
+        )
+    except Exception:  # noqa: BLE001 - degrade, never break agent startup
+        logger.exception("Could not fetch GitHub token for agent %s", agent_name)
+        return None
+
+    if token:
+        env_dict["GITHUB_TOKEN"] = token
+        env_dict["GH_TOKEN"] = token
+    return token

@@ -581,7 +581,7 @@ async def deploy_agent(req: DeployRequest) -> dict:
             logger.info(f"Installing dependencies in {container_name}")
             code, output = await exec_in_container(
                 container_name,
-                ["bash", "-c", "apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends python3 python3-pip python3-venv python3-dev git curl wget ca-certificates gnupg build-essential nodejs npm"],
+                ["bash", "-c", "apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends python3 python3-pip python3-venv python3-dev git curl wget ca-certificates gnupg build-essential nodejs npm gh"],
                 timeout=900,
             )
             if code != 0:
